@@ -128,16 +128,22 @@ def main():
     runner = '''void WiFiScan::RunPwnfriendScan(uint8_t scan_mode, uint16_t color) {
   (void)scan_mode; (void)color;
   startPcap("pwnfriend");
-  esp_wifi_init(&cfg2);
+  // Mirror Marauder's beacon-attack TX init EXACTLY. The AP config
+  // (esp_wifi_set_config) is REQUIRED: without it the AP iface never fully
+  // comes up and esp_wifi_80211_tx(WIFI_IF_AP) silently radiates nothing
+  // (verified on-air: 0 frames). Promiscuous rx is layered on so the friend
+  // still sniffs peers while broadcasting.
+  ap_config.ap.ssid_hidden = 1;
+  ap_config.ap.beacon_interval = 10000;
+  ap_config.ap.ssid_len = 0;
+  packets_sent = 0;
+  esp_wifi_init(&cfg);
   #ifdef HAS_IDF_3
     esp_wifi_set_country(&country);
-    esp_event_loop_create_default();
   #endif
-  // AP mode + promiscuous: AP is the interface Marauder's own beacon TX uses
-  // (esp_wifi_80211_tx on WIFI_IF_AP actually radiates; STA-mode TX silently
-  // dropped frames), and promiscuous rx still fires for sniffing peers.
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
   esp_wifi_set_mode(WIFI_MODE_AP);
+  esp_wifi_set_config(WIFI_IF_AP, &ap_config);
   esp_wifi_start();
   this->setMac();
   esp_wifi_set_promiscuous(true);
