@@ -215,7 +215,9 @@ def main():
       if (!pwnfriend_obj.configureFromArgs(&cmd_args)) {
         Serial.println(F("PWNFRIEND_ERR bad -id (need 64 hex)"));
       } else {
-        this->startScanFromCLI(WIFI_SCAN_PWNFRIEND, TFT_PINK, "Pwnfriend");
+        Serial.print(F("Starting pwnfriend. Stop with "));
+        Serial.println(STOPSCAN_CMD);
+        wifi_scan_obj.StartScan(WIFI_SCAN_PWNFRIEND, TFT_MAGENTA);
       }
     }
 '''
