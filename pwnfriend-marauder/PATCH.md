@@ -57,27 +57,31 @@ Right after `WiFiScan::RunPwnScan`, add:
 
 ```cpp
 void WiFiScan::RunPwnfriendScan(uint8_t scan_mode, uint16_t color) {
+  (void)scan_mode; (void)color;
   startPcap("pwnfriend");
-  this->setLEDMode(MODE_SNIFF);
-
-  #ifdef HAS_SCREEN
-    this->setupScanDisplayArea(TFT_WHITE, color);
-    this->prepareScanStage(TFT_GREEN, TFT_BLACK);
-  #endif
-
   esp_wifi_init(&cfg2);
   #ifdef HAS_IDF_3
     esp_wifi_set_country(&country);
     esp_event_loop_create_default();
   #endif
-  // STA mode gives us both promiscuous rx (to sniff peers) and a usable
-  // interface for esp_wifi_80211_tx (to broadcast the friend beacon).
-  this->setWiFiMode(WIFI_MODE_STA, beaconSnifferCallback);
+  // Mirrors RunPwnScan's inline setup, but STA mode instead of NULL: STA gives
+  // both promiscuous rx (to sniff peers) and a live interface for
+  // esp_wifi_80211_tx (to broadcast the friend beacon).
+  esp_wifi_set_storage(WIFI_STORAGE_RAM);
+  esp_wifi_set_mode(WIFI_MODE_STA);
+  esp_wifi_start();
+  this->setMac();
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_filter(&filt);
+  esp_wifi_set_promiscuous_rx_cb(&beaconSnifferCallback);
   this->changeChannel(this->set_channel);
   this->wifi_initialized = true;
   initTime = millis();
 }
 ```
+
+(Names like `filt`, `cfg2`, `setMac`, `beaconSnifferCallback` come straight from the
+fork's own `RunPwnScan`, so they resolve wherever that does.)
 
 ---
 
