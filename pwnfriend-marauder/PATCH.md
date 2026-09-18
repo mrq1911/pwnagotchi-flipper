@@ -64,11 +64,11 @@ void WiFiScan::RunPwnfriendScan(uint8_t scan_mode, uint16_t color) {
     esp_wifi_set_country(&country);
     esp_event_loop_create_default();
   #endif
-  // Mirrors RunPwnScan's inline setup, but STA mode instead of NULL: STA gives
-  // both promiscuous rx (to sniff peers) and a live interface for
-  // esp_wifi_80211_tx (to broadcast the friend beacon).
+  // AP mode + promiscuous: AP is the interface Marauder's own beacon TX uses
+  // (esp_wifi_80211_tx on WIFI_IF_AP actually radiates; STA-mode TX silently
+  // dropped frames), and promiscuous rx still fires for sniffing peers.
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
-  esp_wifi_set_mode(WIFI_MODE_STA);
+  esp_wifi_set_mode(WIFI_MODE_AP);
   esp_wifi_start();
   this->setMac();
   esp_wifi_set_promiscuous(true);

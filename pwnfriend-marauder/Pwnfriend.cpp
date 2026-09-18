@@ -203,9 +203,10 @@ void Pwnfriend::broadcast() {
     // Refresh the timestamp field in the JSON each burst.
     rebuild();
 
-    // A few copies per burst — beacons are cheap and lossy.
+    // A few copies per burst — beacons are cheap and lossy. TX on the AP
+    // interface: STA-mode tx did not actually radiate (verified on-air).
     for (int i = 0; i < 3; i++) {
-        esp_wifi_80211_tx(WIFI_IF_STA, _frame, _frame_len, false);
+        esp_wifi_80211_tx(WIFI_IF_AP, _frame, _frame_len, false);
         _sent++;
     }
 
