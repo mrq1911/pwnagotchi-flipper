@@ -36,17 +36,12 @@ jobs:
       fail-fast: false
       matrix:
         board:
-          # Feberis Pro — ESP32-S3-WROOM.
+          # Feberis Pro — CLASSIC ESP32 (chip_id 0, confirmed from the official
+          # FEBERIS_PRO bootloader). Bootloader lives at 0x1000, not 0x0.
           - name: feberis-pro
             flag: BPMCIRCUITS_FEBERIS_PRO
-            chip: esp32s3
-            fqbn: "esp32:esp32:esp32s3:PartitionScheme=min_spiffs,FlashSize=4M"
-            boot_addr: "0x0"
-          # Known-good baseline: official Flipper Wi-Fi Dev Board (ESP32-S2).
-          - name: flipper-devboard-s2
-            flag: MARAUDER_FLIPPER
-            chip: esp32s2
-            fqbn: "esp32:esp32:esp32s2:PartitionScheme=min_spiffs,FlashSize=4M,PSRAM=enabled"
+            chip: esp32
+            fqbn: "esp32:esp32:esp32:PartitionScheme=min_spiffs,FlashSize=4M"
             boot_addr: "0x1000"
     steps:
       - name: Checkout pwnfriend (this repo)
