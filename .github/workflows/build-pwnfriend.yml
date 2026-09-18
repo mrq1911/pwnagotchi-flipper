@@ -2,15 +2,12 @@
 # can be flashed once and drive both the Marauder GUI and the pwnfriend app.
 #
 # It clones a Marauder fork, runs pwnfriend-marauder/apply_pwnfriend.py to add
-# the command, then builds with the same toolchain/libraries the Feberis fork's
-# own nightly uses (arduino-test-compile + pinned libs). The resulting .bin is
-# uploaded as an artifact you flash with ESP Flasher / a web flasher.
+# the command, then builds with arduino-cli using the same pinned libraries the
+# Feberis fork's nightly uses. Outputs both the separate bins and a single merged
+# image you flash with ESP Flasher / a web flasher.
 #
-# NOTE: This is adapted from bpmcircuits/ESP32Marauder_FEBERIS .github nightly.
-# The Feberis Pro's exact chip (S3 vs classic ESP32) is not documented, so its
-# matrix entry is a best guess — confirm your chip via ESP Flasher and adjust
-# `fqbn`/`idf_ver`/`flag` if the Feberis build fails. The S2 devboard entry is
-# known-good and proves the pipeline.
+# The Feberis Pro is an ESP32-S3 (ESP32-S3-WROOM). The S2 devboard entry is a
+# known-good baseline that proves the pipeline.
 
 name: build-pwnfriend
 
@@ -28,6 +25,10 @@ on:
       - pwnfriend-marauder/**
       - .github/workflows/build-pwnfriend.yml
 
+env:
+  ESP32_CORE_VER: "2.0.11"
+  ARDUINO_DIRECTORIES_USER: ${{ github.workspace }}/sketchbook
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -35,23 +36,22 @@ jobs:
       fail-fast: false
       matrix:
         board:
-          # Known-good baseline: the official Flipper Wi-Fi Dev Board (ESP32-S2).
-          - name: flipper-devboard-s2
-            flag: MARAUDER_FLIPPER
-            fqbn: "esp32:esp32:esp32s2:PartitionScheme=min_spiffs,FlashSize=4M,PSRAM=enabled"
-            idf_ver: "2.0.11"
-            nimble_ver: "1.3.8"
-          # Feberis Pro — best guess (has BT, so not S2). Confirm chip & adjust.
+          # Feberis Pro — ESP32-S3-WROOM.
           - name: feberis-pro
             flag: BPMCIRCUITS_FEBERIS_PRO
+            chip: esp32s3
             fqbn: "esp32:esp32:esp32s3:PartitionScheme=min_spiffs,FlashSize=4M"
-            idf_ver: "2.0.11"
-            nimble_ver: "1.3.8"
+            boot_addr: "0x0"
+          # Known-good baseline: official Flipper Wi-Fi Dev Board (ESP32-S2).
+          - name: flipper-devboard-s2
+            flag: MARAUDER_FLIPPER
+            chip: esp32s2
+            fqbn: "esp32:esp32:esp32s2:PartitionScheme=min_spiffs,FlashSize=4M,PSRAM=enabled"
+            boot_addr: "0x1000"
     steps:
       - name: Checkout pwnfriend (this repo)
         uses: actions/checkout@v4
-        with:
-          path: pwnfriend
+        with: { path: pwnfriend }
 
       - name: Checkout Marauder fork
         uses: actions/checkout@v4
@@ -63,77 +63,85 @@ jobs:
       - name: Add the pwnfriend command
         run: python3 pwnfriend/pwnfriend-marauder/apply_pwnfriend.py marauder
 
-      - name: Install Arduino CLI
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-          echo "$PWD/bin" >> $GITHUB_PATH
+      # Pinned libraries, straight into the sketchbook so arduino-cli finds them.
+      - uses: actions/checkout@v4
+        with: { repository: marian-craciunescu/ESP32Ping, ref: "1.6", path: sketchbook/libraries/ESP32Ping }
+      - uses: actions/checkout@v4
+        with: { repository: ESP32Async/AsyncTCP, ref: v3.4.8, path: sketchbook/libraries/AsyncTCP }
+      - uses: actions/checkout@v4
+        with: { repository: stevemarple/MicroNMEA, ref: v2.0.6, path: sketchbook/libraries/MicroNMEA }
+      - uses: actions/checkout@v4
+        with: { repository: ESP32Async/ESPAsyncWebServer, ref: v3.8.1, path: sketchbook/libraries/ESPAsyncWebServer }
+      - uses: actions/checkout@v4
+        with: { repository: Bodmer/TFT_eSPI, ref: V2.5.34, path: sketchbook/libraries/TFT_eSPI }
+      - uses: actions/checkout@v4
+        with: { repository: PaulStoffregen/XPT2046_Touchscreen, ref: v1.4, path: sketchbook/libraries/XPT2046_Touchscreen }
+      - uses: actions/checkout@v4
+        with: { repository: lvgl/lv_arduino, ref: 3.0.0, path: sketchbook/libraries/lv_arduino }
+      - uses: actions/checkout@v4
+        with: { repository: Bodmer/JPEGDecoder, ref: 1.8.0, path: sketchbook/libraries/JPEGDecoder }
+      - uses: actions/checkout@v4
+        with: { repository: h2zero/NimBLE-Arduino, ref: "1.3.8", path: sketchbook/libraries/NimBLE-Arduino }
+      - uses: actions/checkout@v4
+        with: { repository: adafruit/Adafruit_NeoPixel, ref: 1.12.0, path: sketchbook/libraries/Adafruit_NeoPixel }
+      - uses: actions/checkout@v4
+        with: { repository: bblanchon/ArduinoJson, ref: v6.18.2, path: sketchbook/libraries/ArduinoJson }
+      - uses: actions/checkout@v4
+        with: { repository: ivanseidel/LinkedList, ref: v1.3.3, path: sketchbook/libraries/LinkedList }
+      - uses: actions/checkout@v4
+        with: { repository: plerup/espsoftwareserial, ref: 8.1.0, path: sketchbook/libraries/EspSoftwareSerial }
+      - uses: actions/checkout@v4
+        with: { repository: adafruit/Adafruit_BusIO, ref: 1.15.0, path: sketchbook/libraries/Adafruit_BusIO }
+      - uses: actions/checkout@v4
+        with: { repository: adafruit/Adafruit_MAX1704X, ref: 1.0.2, path: sketchbook/libraries/Adafruit_MAX1704X }
 
-      # Pinned libraries, mirroring the fork's nightly build.
-      - uses: actions/checkout@v4
-        with: { repository: marian-craciunescu/ESP32Ping, ref: "1.6", path: marauder/CustomESP32Ping }
-      - uses: actions/checkout@v4
-        with: { repository: ESP32Async/AsyncTCP, ref: v3.4.8, path: marauder/CustomAsyncTCP }
-      - uses: actions/checkout@v4
-        with: { repository: stevemarple/MicroNMEA, ref: v2.0.6, path: marauder/CustomMicroNMEA }
-      - uses: actions/checkout@v4
-        with: { repository: ESP32Async/ESPAsyncWebServer, ref: v3.8.1, path: marauder/CustomESPAsyncWebServer }
-      - uses: actions/checkout@v4
-        with: { repository: Bodmer/TFT_eSPI, ref: V2.5.34, path: marauder/CustomTFT_eSPI }
-      - uses: actions/checkout@v4
-        with: { repository: PaulStoffregen/XPT2046_Touchscreen, ref: v1.4, path: marauder/CustomXPT2046_Touchscreen }
-      - uses: actions/checkout@v4
-        with: { repository: lvgl/lv_arduino, ref: 3.0.0, path: marauder/Customlv_arduino }
-      - uses: actions/checkout@v4
-        with: { repository: Bodmer/JPEGDecoder, ref: 1.8.0, path: marauder/CustomJPEGDecoder }
-      - uses: actions/checkout@v4
-        with: { repository: h2zero/NimBLE-Arduino, ref: "${{ matrix.board.nimble_ver }}", path: marauder/CustomNimBLE-Arduino }
-      - uses: actions/checkout@v4
-        with: { repository: adafruit/Adafruit_NeoPixel, ref: 1.12.0, path: marauder/CustomAdafruit_NeoPixel }
-      - uses: actions/checkout@v4
-        with: { repository: bblanchon/ArduinoJson, ref: v6.18.2, path: marauder/CustomArduinoJson }
-      - uses: actions/checkout@v4
-        with: { repository: ivanseidel/LinkedList, ref: v1.3.3, path: marauder/CustomLinkedList }
-      - uses: actions/checkout@v4
-        with: { repository: plerup/espsoftwareserial, ref: 8.1.0, path: marauder/CustomEspSoftwareSerial }
-      - uses: actions/checkout@v4
-        with: { repository: adafruit/Adafruit_BusIO, ref: 1.15.0, path: marauder/CustomAdafruit_BusIO }
-      - uses: actions/checkout@v4
-        with: { repository: adafruit/Adafruit_MAX1704X, ref: 1.0.2, path: marauder/CustomAdafruit_MAX1704X }
-
-      - name: Configure TFT_eSPI
-        working-directory: marauder
+      - name: Install arduino-cli + ESP32 core
         run: |
-          rm -f CustomTFT_eSPI/User_Setup_Select.h
-          cp User*.h CustomTFT_eSPI/ || true
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s -- -b "$HOME/bin"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/bin:$PATH"
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://github.com/espressif/arduino-esp32/releases/download/${ESP32_CORE_VER}/package_esp32_dev_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@${ESP32_CORE_VER}
+          pip install --quiet esptool
 
-      - name: Patch platform.txt for -zmuldefs (idf 2.0.11)
+      - name: Work around Marauder multiple-definition link error
         run: |
-          for i in $(find ~/.arduino15/packages/esp32/hardware/esp32/ -name platform.txt 2>/dev/null); do
-            sed -i 's/compiler.c.elf.libs.esp32s3=/compiler.c.elf.libs.esp32s3=-zmuldefs /' "$i" || true
-            sed -i 's/compiler.c.elf.libs.esp32s2=/compiler.c.elf.libs.esp32s2=-zmuldefs /' "$i" || true
-            sed -i 's/compiler.c.elf.libs.esp32=/compiler.c.elf.libs.esp32=-zmuldefs /' "$i" || true
+          for f in $(find ~/.arduino15/packages/esp32/hardware/esp32 -name platform.txt); do
+            sed -i 's/compiler.c.elf.libs.${{ matrix.board.chip }}=/compiler.c.elf.libs.${{ matrix.board.chip }}=-zmuldefs /' "$f" || true
           done
-        continue-on-error: true
 
-      - name: Build (${{ matrix.board.name }})
-        uses: ArminJo/arduino-test-compile@v3.3.0
-        with:
-          sketch-names: esp32_marauder.ino
-          arduino-board-fqbn: ${{ matrix.board.fqbn }}
-          extra-arduino-cli-args: "--warnings none --build-property compiler.cpp.extra_flags='-D${{ matrix.board.flag }}'"
-          arduino-platform: esp32:esp32@${{ matrix.board.idf_ver }}
-          platform-url: https://github.com/espressif/arduino-esp32/releases/download/${{ matrix.board.idf_ver }}/package_esp32_dev_index.json
-          sketch-directory: marauder/esp32_marauder
-
-      - name: Collect firmware
+      - name: Compile
         run: |
+          export PATH="$HOME/bin:$PATH"
+          arduino-cli compile \
+            --fqbn "${{ matrix.board.fqbn }}" \
+            --libraries "${ARDUINO_DIRECTORIES_USER}/libraries" \
+            --build-property "compiler.cpp.extra_flags=-D${{ matrix.board.flag }}" \
+            --export-binaries \
+            --warnings none \
+            marauder/esp32_marauder
+
+      - name: Merge into a single flashable image
+        run: |
+          export PATH="$HOME/bin:$PATH"
+          BUILD=$(find marauder/esp32_marauder/build -maxdepth 1 -type d -name "esp32.esp32.*" | head -1)
+          echo "build dir: $BUILD"
+          BOOT_APP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/${ESP32_CORE_VER}/tools/partitions -name boot_app0.bin | head -1)
           mkdir -p out
-          find marauder -name "esp32_marauder.ino*.bin" -exec cp {} out/ \;
+          cp "$BUILD"/esp32_marauder.ino*.bin out/ || true
+          esptool --chip ${{ matrix.board.chip }} merge_bin -o out/pwnfriend-${{ matrix.board.name }}-merged.bin \
+            ${{ matrix.board.boot_addr }} "$BUILD/esp32_marauder.ino.bootloader.bin" \
+            0x8000 "$BUILD/esp32_marauder.ino.partitions.bin" \
+            0xe000 "$BOOT_APP0" \
+            0x10000 "$BUILD/esp32_marauder.ino.bin"
           ls -la out
 
-      - name: Upload firmware artifact
+      - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
           name: pwnfriend-${{ matrix.board.name }}
           path: out/*.bin
-          if-no-files-found: warn
+          if-no-files-found: error
