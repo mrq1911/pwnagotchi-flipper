@@ -1,0 +1,80 @@
+// Pwnfriend — pwngrid advertisement broadcaster for ESP32 Marauder.
+//
+// Turns the Flipper's Wi-Fi board into a social pwngrid peer: it broadcasts a
+// Pwnagotchi-compatible beacon (source MAC de:ad:be:ef:de:ad, JSON persona in
+// vendor IE 222) so a nearby Pwnagotchi detects it, greets it, and — thanks to a
+// stable identity — counts encounters and befriends it over time.
+//
+// This is a self-contained module. It only reaches into Marauder for the raw
+// 802.11 TX primitive; everything else (frame building, persona, channel hop,
+// peer reporting) lives here to keep the fork's merge surface tiny. See
+// PATCH.md for the handful of insertion points into WiFiScan.
+//
+// Wire format reference: ../doc/PwnfriendProtocol.md
+
+#pragma once
+
+#include <Arduino.h>
+#include <esp_wifi.h>
+#include <LinkedList.h>
+
+// Provided by Marauder (declared in WiFiScan.h). Redeclared here so the module
+// compiles even if included before that header.
+extern "C" esp_err_t esp_wifi_80211_tx(wifi_interface_t ifx, const void* buffer,
+                                       int len, bool en_sys_seq);
+
+class Pwnfriend {
+  public:
+    Pwnfriend();
+
+    // Parse a `pwnfriend ...` CLI line (already tokenised by Marauder's
+    // CommandLine into argv/argc) and load it into the live persona. Missing
+    // args keep their previous / default value. Returns false only on a
+    // malformed identity.
+    bool configureFromArgs(LinkedList<String>* args);
+
+    // Rebuild the beacon frame from the current persona. Call after any persona
+    // change. Cheap; also called lazily by broadcast().
+    void rebuild();
+
+    // Hop to the next broadcast channel (or the pinned one) and transmit the
+    // persona beacon a few times. Call this on a timer from WiFiScan::main().
+    void broadcast();
+
+    // Emit one PWNFRIEND_PEER line for a sniffed Pwnagotchi beacon. `payload`
+    // is the raw 802.11 frame, `rssi`/`channel` come from the rx metadata.
+    void reportPeer(const uint8_t* payload, int length, int rssi, int channel);
+
+    // True once a persona has been loaded (so broadcast() has something to send).
+    bool ready() const { return _ready; }
+
+    void reset();
+
+  private:
+    void buildJson(char* out, size_t out_len);
+
+    // Persona
+    char     _name[33];
+    char     _identity[65];   // 64 hex + NUL
+    const char* _face;        // UTF-8 glyph
+    uint32_t _pwnd_run;
+    uint32_t _pwnd_tot;
+    uint32_t _uptime;
+    uint32_t _epoch;
+    bool     _deauth_policy;
+    uint8_t  _session_id[6];  // Addr3, stable per persona
+
+    // Channel hopping
+    int      _pinned_channel;  // -1 => hop
+    uint8_t  _hop_idx;
+
+    // Prebuilt frame
+    uint8_t  _frame[300];
+    int      _frame_len;
+    bool     _ready;
+
+    uint32_t _sent;
+};
+
+// Map a face index (matching flipagotchi's enum PwnagotchiFace) to a glyph.
+const char* pwnfriend_face_glyph(int idx);

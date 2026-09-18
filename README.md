@@ -5,14 +5,27 @@ This program will interface the pwnagotchi with the flipper. This will be accomp
 <img src="doc/attachments/PwnInAction.gif" width="256" height="160"/>
 
 ## Layout
-This project is broken down into two parts: flipagotchi and pwnzero
 ```
 pwnagotchi-flipper
- |--> flipagotchi/
- |--> pwnzero/
+ |--> flipagotchi/         Flipper-side app: renders a wired pwnagotchi's screen
+ |--> pwnzero/             pwnagotchi-side plugin that feeds flipagotchi over UART
+ |--> pwnfriend/           Flipper-side app: a social pwngrid peer (see below)
+ |--> pwnfriend-marauder/  ESP32 Marauder fork bits that broadcast the friend beacon
 ```
 - flipagotchi is the Flipper-side application
 - pwnzero is the pwnagotchi-side application
+
+## Pwnfriend: give your lonely pwnagotchi a friend
+A pwnagotchi gets sad when no other units are around. Marauder can already detect a
+pwnagotchi's beacons, but it never answers — so your unit stays lonely. `pwnfriend` makes
+the Flipper's ESP32 board broadcast a pwngrid-compatible advertisement so your pwnagotchi
+detects a peer, says "Hello!", and (thanks to a stable, growing identity) befriends it
+over time. The Flipper keeps a little persona that levels up the longer it runs and the
+more units it meets.
+
+See [`pwnfriend/README.md`](pwnfriend/README.md), the Marauder patch in
+[`pwnfriend-marauder/PATCH.md`](pwnfriend-marauder/PATCH.md), and the wire format in
+[`doc/PwnfriendProtocol.md`](doc/PwnfriendProtocol.md).
 
 ## Setup
 ### Flipagotchi Setup (Flipper side)
