@@ -22,7 +22,7 @@ on:
         default: bpmcircuits/ESP32Marauder_FEBERIS
       marauder_ref:
         description: git ref of that fork
-        default: main
+        default: feberis
   push:
     paths:
       - pwnfriend-marauder/**
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.marauder_repo || 'bpmcircuits/ESP32Marauder_FEBERIS' }}
-          ref: ${{ github.event.inputs.marauder_ref || 'main' }}
+          ref: ${{ github.event.inputs.marauder_ref || 'feberis' }}
           path: marauder
 
       - name: Add the pwnfriend command
