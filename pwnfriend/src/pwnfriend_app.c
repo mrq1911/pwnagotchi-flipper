@@ -7,8 +7,10 @@
 #include <notification/notification_messages.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "../include/pwnfriend.h"
+#include "../include/cities.h"
 #include "../include/persona.h"
 #include "../include/peers.h"
 #include "../include/face.h"
@@ -64,7 +66,7 @@ typedef enum {
     StatPageMood = 0, // the pwnagotchi voice line (default)
     StatPageCounts, // "ate N shakes!"
     StatPageSocial, // "met N friends!"
-    StatPageGps, // "I'm here!" (full coords live on the Stats screen)
+    StatPageGps, // nearest major city ("Near Prague"); full coords on the Stats screen
     StatPageCount,
 } StatPage;
 
@@ -134,6 +136,7 @@ typedef struct {
     bool gps_seen;
     char last_lat[16];
     char last_lon[16];
+    char gps_place[32]; // nearest major city, e.g. "Near Prague" (reverse-geocoded offline)
 
     // ESP32-link watchdog: warn when the board stops answering (unplugged, rear
     // switch off ESP32, wrong firmware). All in tick_secs, written under the lock.
@@ -412,6 +415,44 @@ static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
     return i;
 }
 
+// Parse a decimal-degree string ("50.0784950" / "-14.42") to double without atof
+// (avoids any %f/newlib-nano float-formatting dependency). Returns 1e9 on empty.
+static float parse_deg(const char* s) {
+    if(!s || !s[0]) return 1e9f;
+    float sign = 1.0f, v = 0.0f;
+    const char* p = s;
+    if(*p == '-') { sign = -1.0f; p++; } else if(*p == '+') { p++; }
+    while(*p >= '0' && *p <= '9') { v = v * 10.0f + (float)(*p - '0'); p++; }
+    if(*p == '.') {
+        p++;
+        float f = 0.1f;
+        while(*p >= '0' && *p <= '9') { v += (float)(*p - '0') * f; f *= 0.1f; p++; }
+    }
+    return sign * v;
+}
+
+// Reverse-geocode the last GPS fix to the nearest major city (offline, from CITIES[])
+// and format model->gps_place, e.g. "In Prague" / "Near Rio de Janeiro". Cheap: one
+// pass over ~1.2k cities with a cos(lat)-weighted equirectangular distance.
+static void pwnfriend_update_place(PwnfriendModel* model) {
+    float lat = parse_deg(model->last_lat), lon = parse_deg(model->last_lon);
+    if(lat >= 1e8f || lon >= 1e8f) { model->gps_place[0] = '\0'; return; }
+    float coslat = cosf(lat * 3.14159265f / 180.0f);
+    float best = 1e18f;
+    int bi = -1;
+    for(int i = 0; i < CITIES_N; i++) {
+        float dlat = lat - CITIES[i].lat;
+        float dlon = (lon - CITIES[i].lon) * coslat;
+        float d2 = dlat * dlat + dlon * dlon;
+        if(d2 < best) { best = d2; bi = i; }
+    }
+    if(bi < 0) { model->gps_place[0] = '\0'; return; }
+    float km = sqrtf(best) * 111.0f; // ~111 km per degree of latitude
+    snprintf(
+        model->gps_place, sizeof(model->gps_place), "%s %s", km < 25.0f ? "In" : "Near",
+        CITIES[bi].name);
+}
+
 static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
     char bssid[18] = {0};
     char ssid[33] = {0};
@@ -470,6 +511,7 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
                 model->last_lat[sizeof(model->last_lat) - 1] = '\0';
                 strncpy(model->last_lon, lon, sizeof(model->last_lon) - 1);
                 model->last_lon[sizeof(model->last_lon) - 1] = '\0';
+                pwnfriend_update_place(model); // nearest major city, offline
             }
         },
         true);
@@ -525,6 +567,7 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
                 model->last_lat[sizeof(model->last_lat) - 1] = '\0';
                 strncpy(model->last_lon, lon, sizeof(model->last_lon) - 1);
                 model->last_lon[sizeof(model->last_lon) - 1] = '\0';
+                pwnfriend_update_place(model); // nearest major city, offline
             }
         },
         true);
@@ -701,7 +744,12 @@ static void pwnfriend_populate(PwnfriendModel* model) {
                     pwn->message, "Met %lu friends!", (unsigned long)p->s.friends_met);
             break;
         case StatPageGps:
-            furi_string_set(pwn->message, model->gps_seen ? "I'm here!" : "No GPS...");
+            if(model->gps_seen && model->gps_place[0])
+                furi_string_set(pwn->message, model->gps_place); // "Near Prague"
+            else if(model->gps_seen)
+                furi_string_set(pwn->message, "I'm here!");
+            else
+                furi_string_set(pwn->message, "No GPS...");
             break;
         case StatPageMood:
         default:
@@ -1570,6 +1618,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->gps_seen = false;
             model->last_lat[0] = '\0';
             model->last_lon[0] = '\0';
+            model->gps_place[0] = '\0';
             model->last_rx_secs = 0;
             model->advertising_since = 0; // advertising starts now (tick 0) -> grace runs
             model->link_down = false;
