@@ -14,5 +14,4 @@
 // How often (seconds) we persist the persona to SD.
 #define PWNFRIEND_SAVE_SECS 30
 
-#define FLIPPER_SCREEN_WIDTH 128
-#define FLIPPER_SCREEN_HEIGHT 64
+// FLIPPER_SCREEN_WIDTH / _HEIGHT come from pwn_constants.h (via pwnagotchi.h).

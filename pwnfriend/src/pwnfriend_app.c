@@ -12,6 +12,7 @@
 #include "../include/persona.h"
 #include "../include/peers.h"
 #include "../include/face.h"
+#include "../include/pwnagotchi.h"
 
 typedef enum {
     WorkerEventStop = (1 << 0),
@@ -28,6 +29,7 @@ typedef struct {
     uint32_t last_adv_sent;
     uint32_t adv_sent_count; // last "sent=" from the ESP32
     uint8_t adv_channel; // last channel it reported broadcasting on
+    Pwnagotchi* pwn; // flipagotchi renderer state, repopulated each draw
 } PwnfriendModel;
 
 typedef struct {
@@ -171,73 +173,81 @@ static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
 // Drawing
 // ---------------------------------------------------------------------------
 
+// Map the persona + detected peers onto the flipagotchi Pwnagotchi struct so we
+// render exactly like a real pwnagotchi screen (CH / APS / UP / PWND / message /
+// friend slot). Repopulated each draw so it's always current.
+static void pwnfriend_populate(PwnfriendModel* model) {
+    Persona* p = model->persona;
+    Pwnagotchi* pwn = model->pwn;
+
+    furi_string_set(pwn->hostname, p->s.name);
+    pwn->face = (enum PwnagotchiFace)persona_face(p);
+    pwn->mode = PwnMode_Ai;
+
+    // CH: the channel we're broadcasting on (or * when paused).
+    if(model->advertising && model->adv_channel) {
+        furi_string_printf(pwn->channel, "%u", (unsigned)model->adv_channel);
+    } else {
+        furi_string_set(pwn->channel, "*");
+    }
+
+    // APS: units currently in range.
+    uint32_t active = 0;
+    for(int i = 0; i < MAX_PEERS; i++) {
+        if(model->peers.items[i].used) active++;
+    }
+    furi_string_printf(pwn->apStat, "%lu", (unsigned long)active);
+
+    // UP: cumulative uptime as hh:mm:ss.
+    uint32_t up = (uint32_t)p->s.total_uptime;
+    furi_string_printf(
+        pwn->uptime,
+        "%02lu:%02lu:%02lu",
+        (unsigned long)(up / 3600),
+        (unsigned long)((up % 3600) / 60),
+        (unsigned long)(up % 60));
+
+    // PWND: friends met, this session (lifetime) — the friend's social score.
+    furi_string_printf(
+        pwn->handshakes,
+        "%lu (%lu)",
+        (unsigned long)p->friends_session,
+        (unsigned long)p->s.friends_met);
+
+    // Message: level + mood, or a paused hint.
+    if(model->advertising) {
+        furi_string_printf(
+            pwn->message,
+            "Lv%lu %s",
+            (unsigned long)persona_level(p),
+            persona_mood_label(p));
+    } else {
+        furi_string_set(pwn->message, "paused - OK to greet");
+    }
+
+    // Friend slot: the closest (strongest) unit, with signal bars.
+    Peer* best = NULL;
+    for(int i = 0; i < MAX_PEERS; i++) {
+        Peer* pe = &model->peers.items[i];
+        if(!pe->used) continue;
+        if(!best || pe->rssi > best->rssi) best = pe;
+    }
+    if(best) {
+        int bars = peers_rssi_bars(best->rssi);
+        furi_string_reset(pwn->friendStat);
+        for(int b = 0; b < bars; b++) furi_string_cat_str(pwn->friendStat, "|");
+        for(int b = bars; b < 4; b++) furi_string_cat_str(pwn->friendStat, ".");
+        furi_string_cat_printf(pwn->friendStat, " %s %d", best->name, best->pwnd_tot);
+    } else {
+        furi_string_set(pwn->friendStat, "");
+    }
+}
+
 static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
     PwnfriendModel* model = ctx;
-    Persona* p = model->persona;
-
     canvas_clear(canvas);
-
-    // Face on the left.
-    face_draw(canvas, persona_face(p), 0, 2);
-
-    // Name + level, top right of the face.
-    canvas_set_font(canvas, FontPrimary);
-    char header[28];
-    snprintf(header, sizeof(header), "%s", p->s.name);
-    canvas_draw_str(canvas, 40, 11, header);
-
-    canvas_set_font(canvas, FontSecondary);
-    char lvl[16];
-    snprintf(lvl, sizeof(lvl), "Lv %lu", (unsigned long)persona_level(p));
-    canvas_draw_str_aligned(canvas, 127, 4, AlignRight, AlignTop, lvl);
-
-    // Mood + friends met.
-    canvas_draw_str(canvas, 40, 22, persona_mood_label(p));
-    char met[24];
-    snprintf(
-        met,
-        sizeof(met),
-        "met %lu (+%lu)",
-        (unsigned long)p->s.friends_met,
-        (unsigned long)p->friends_session);
-    canvas_draw_str(canvas, 40, 32, met);
-
-    // Status line under the head area.
-    canvas_draw_line(canvas, 0, 35, 127, 35);
-    char status[40];
-    if(model->advertising) {
-        snprintf(
-            status, sizeof(status), "saying hi... ch%u", (unsigned)model->adv_channel);
-    } else {
-        snprintf(status, sizeof(status), "paused - press OK to greet");
-    }
-    canvas_draw_str(canvas, 0, 45, status);
-
-    // Detected pwnagotchis.
-    int y = 55;
-    int shown = 0;
-    for(int i = 0; i < MAX_PEERS && shown < 2; i++) {
-        if(!model->peers.items[i].used) continue;
-        Peer* pe = &model->peers.items[i];
-        int bars = peers_rssi_bars(pe->rssi);
-        char row[40];
-        snprintf(
-            row,
-            sizeof(row),
-            "%.*s%.*s %s %d",
-            bars,
-            "||||",
-            4 - bars,
-            "....",
-            pe->name,
-            pe->pwnd_tot);
-        canvas_draw_str(canvas, 0, y, row);
-        y += 9;
-        shown++;
-    }
-    if(shown == 0) {
-        canvas_draw_str(canvas, 0, 55, "no units heard yet");
-    }
+    pwnfriend_populate(model);
+    pwnagotchi_draw_all(model->pwn, canvas);
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +388,6 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
     app->notification = furi_record_open(RECORD_NOTIFICATION);
 
     app->view_dispatcher = view_dispatcher_alloc();
-    view_dispatcher_enable_queue(app->view_dispatcher);
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
 
     app->view = view_alloc();
@@ -391,6 +400,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
         PwnfriendModel * model,
         {
             model->persona = persona_alloc();
+            model->pwn = pwnagotchi_alloc();
             peers_init(&model->peers);
             model->tick_secs = 0;
             model->advertising = false;
@@ -444,7 +454,13 @@ static void pwnfriend_app_free(PwnfriendApp* app) {
 
     view_dispatcher_remove_view(app->view_dispatcher, 0);
     with_view_model(
-        app->view, PwnfriendModel * model, { persona_free(model->persona); }, false);
+        app->view,
+        PwnfriendModel * model,
+        {
+            persona_free(model->persona);
+            pwnagotchi_free(model->pwn);
+        },
+        false);
     view_free(app->view);
     view_dispatcher_free(app->view_dispatcher);
 
