@@ -45,6 +45,18 @@ class Pwnfriend {
     // is the raw 802.11 frame, `rssi`/`channel` come from the rx metadata.
     void reportPeer(const uint8_t* payload, int length, int rssi, int channel);
 
+    // Capture path (called from the pwnfriend rx callback on DATA frames).
+    // Detects a crackable EAPOL M2 handshake or an RSN PMKID (M1) and, once per
+    // BSSID this session, emits a PWNFRIEND_PWND line. Streams every EAPOL frame
+    // to the Flipper as PWNFRIEND_HS <hex> for the pcap. `payload` is the raw
+    // 802.11 frame, `length` is rx_ctrl.sig_len. Returns true if the frame was
+    // EAPOL (so the caller should append it to the pcap too).
+    bool reportHandshake(const uint8_t* payload, int length, int rssi, int channel);
+
+    // Recon: dedup a non-pwngrid beacon into one PWNFRIEND_AP line per BSSID.
+    // Returns true the first time a BSSID is stored (append the beacon then).
+    bool reportAP(const uint8_t* payload, int length, int rssi, int channel);
+
     // True once a persona has been loaded (so broadcast() has something to send).
     bool ready() const { return _ready; }
 
@@ -74,6 +86,25 @@ class Pwnfriend {
     bool     _ready;
 
     uint32_t _sent;
+
+    // Per-session capture bookkeeping (cleared in configureFromArgs()).
+    struct ReconAP { uint8_t bssid[6]; char ssid[33]; uint8_t channel; };
+    static const int MAX_RECON = 64;
+    static const int MAX_PWND  = 64;
+    ReconAP  _recon[MAX_RECON];
+    int      _n_recon;
+    uint8_t  _pwnd_seen[MAX_PWND][6];
+    int      _n_pwnd_seen;
+
+    int  reconIndex(const uint8_t* bssid) const;   // -1 if unseen
+    bool markPwnd(const uint8_t* bssid);           // true if newly counted
+    void emitPwnd(const uint8_t* bssid, const char* ssid,
+                  const char* type, int channel, int rssi);
+    void deauthAP(const uint8_t* bssid);
+    // Emit one PWNFRIEND_HS <lowercase-hex> line for a raw 802.11 frame. The
+    // Flipper reassembles these into a pcap (raw binary would trip the CLI's
+    // CR/XON handling, so we stream hex).
+    void streamFrameHex(const uint8_t* frame, int length);
 };
 
 // Map a face index (matching flipagotchi's enum PwnagotchiFace) to a glyph.

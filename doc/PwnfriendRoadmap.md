@@ -19,35 +19,42 @@ new firmware.
 At this phase `pwnd_tot` is a *social* score (distinct units met) — honest, but a
 costume rather than earned handshakes.
 
-## Phase 2 — Extract into a first-class app + earn it for real
+## Phase 2 — Earn it for real (capture landed)
 
-Goal: the full-persona friend becomes its own thing, not a Marauder appendage, and its
-advertised stats are earned like a real pwnagotchi.
+Goal: the friend's advertised stats are earned like a real pwnagotchi. Capture is now
+**implemented** on top of the Phase 1 Marauder fork.
 
-- **Extract** the beacon/persona logic out of the Marauder fork into a dedicated ESP32
-  firmware the project fully owns (no wrestling Marauder's scan-mode state machine, no
-  rebase-on-every-release tax). The Marauder `pwnfriend` command stays as the
+- **Passive capability (done)**: real AP scanning + channel hopping alongside the pwngrid
+  mesh. Every AP seen is reported (`PWNFRIEND_AP`), driving the on-screen APS count.
+- **Handshake / PMKID capture (done)**: the friend passively records WPA handshakes and
+  RSN PMKIDs from networks in range and reports each as an earned `PWNFRIEND_PWND`, so
+  `pwnd_run`/`pwnd_tot` are now **real captured-handshake counts**, not a social score.
+  Frames are streamed as hex (`PWNFRIEND_HS`) and written to a crackable linktype-105
+  pcap on the Flipper SD (`/ext/apps_data/pwnfriend/handshakes/`).
+- **Opt-in deauth (done)**: an optional active deauth to speed a capture. **Off by
+  default**, gated behind an explicit per-session opt-in; the `-deauth` flag is only sent
+  when the user turns it on, and the friend then advertises `policy.deauth: true`.
+
+  > ⚠️ Capture and deauth are only for networks you own or are explicitly authorized to
+  > test. Both are off by default and gated behind an explicit opt-in. The rest of the
+  > friend (presence, mesh, passive scan) needs none of it. Educational use only.
+
+### Still remaining
+
+- **Extract** the beacon/persona/capture logic out of the Marauder fork into a dedicated
+  ESP32 firmware the project fully owns (no wrestling Marauder's scan-mode state machine,
+  no rebase-on-every-release tax). The Marauder `pwnfriend` command stays as the
   lightweight "just say hi" option for people who only want that.
-- **Passive capability**: real AP scanning + channel hopping + full pwngrid mesh (real
-  encounters with other units, honest presence/uptime). `pwnd_tot` starts reflecting
-  networks actually seen.
-- **Handshake capture** *(user-selected target)*: capture WPA handshakes / PMKIDs so
-  `pwnd_tot` is earned exactly like a true pwnagotchi. Marauder already has EAPOL/PMKID
-  capture, so Phase 1's fork can seed this before extraction.
-
-  > ⚠️ Handshake capture is only for networks you own or are explicitly authorized to
-  > test. This is gated behind an explicit opt-in and is off by default. The rest of the
-  > friend (presence, mesh, passive scan) needs none of it.
-
 - **GPS-tagged captures** *(Feberis Pro has a GPS)*: log *where* the friend met each unit
   and caught each handshake, wardriving-style. Marauder already does this
   (`WIFI_SCAN_WAR_DRIVE`, `GpsInterface`, geofences), so the friend can record a little
   map of its social life and its catches. Same authorization caveat applies to captures;
   presence/meeting locations are benign.
-
+- **AI brain**: a real mood/behaviour model driving channel choice and target selection
+  from what it's seeing, instead of the current meeting-count heuristic — the piece that
+  makes it feel like a pwnagotchi rather than a beacon with a face.
 - The Flipper `pwnfriend` app remains the companion brain/display: it keeps owning the
-  persona and rendering it, and gains views for captured handshakes, GPS trails, and
-  richer stats.
+  persona and rendering it, and gains richer views for captured handshakes and GPS trails.
 
 ## Build & test tooling (in-repo)
 

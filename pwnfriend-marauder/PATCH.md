@@ -145,6 +145,68 @@ before reaching this code.
 
 ---
 
+## 6b. `WiFiScan.cpp` — capture EAPOL/PMKID (DATA frames)
+
+The promiscuous filter already passes DATA (`WiFiScan.h`: `filt = MGMT | DATA`), but
+`beaconSnifferCallback` only ever acts on `WIFI_PKT_MGMT`. To capture handshakes we
+add a DATA-frame branch **before** the mgmt-only dispatch `if`, i.e. immediately
+before the line
+
+```cpp
+if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PROBE) ||
+```
+
+insert:
+
+```cpp
+if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) &&
+    (type == WIFI_PKT_DATA)) {
+  if (pwnfriend_obj.reportHandshake(snifferPacket->payload, len,
+                                    snifferPacket->rx_ctrl.rssi,
+                                    snifferPacket->rx_ctrl.channel))
+    buffer_obj.append(snifferPacket, len);
+  return;
+}
+```
+
+`len` here is still `rx_ctrl.sig_len` (the mgmt path decrements it by 4 only inside the
+`WIFI_PKT_MGMT` block), so DATA frames get their full length. `reportHandshake` detects
+an EAPOL M2 (→ `type:"handshake"`) or an RSN PMKID KDE in M1 (→ `type:"pmkid"`), dedups
+per BSSID for the session, and emits `PWNFRIEND_PWND`. It also streams the full frame to
+the Flipper as `PWNFRIEND_HS <lowercase-hex>` (the Flipper reassembles those into a pcap;
+raw binary would trip the serial CLI's CR/XON handling), and returns true for **any**
+EAPOL frame so the caller also appends it to the on-board pcap if the ESP32 has an SD.
+
+## 6c. `WiFiScan.cpp` — recon non-pwngrid beacons
+
+Inside the beacon branch (`payload[0] == 0x80`, after the pwngrid `mac_match` return),
+immediately **before**
+
+```cpp
+if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWN) {
+```
+
+insert:
+
+```cpp
+if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) {
+  if (pwnfriend_obj.reportAP(snifferPacket->payload, len,
+                             snifferPacket->rx_ctrl.rssi,
+                             snifferPacket->rx_ctrl.channel))
+    buffer_obj.append(snifferPacket, len);
+  return;
+}
+```
+
+`len` here is already FCS-stripped (`-4`), fine for SSID parsing. `reportAP` dedups each
+non-pwngrid AP into one `PWNFRIEND_AP` line per BSSID and stores it (BSSID + ESSID +
+channel) so the deauth tick and the `PWNFRIEND_PWND` SSID lookup have it. The stored
+channel is also what the `-deauth` opt-in uses: `broadcast()` only deauths recon'd APs
+on the channel it is currently parked on, and only when the persona's `-deauth` flag is
+set (default off). No filter change is needed — `filt` already passes DATA.
+
+---
+
 ## 7. `CommandLine.cpp` / `CommandLine.h` — the command
 
 In `CommandLine.h`, next to `SNIFF_PWN_CMD`:

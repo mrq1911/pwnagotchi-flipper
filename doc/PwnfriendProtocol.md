@@ -119,17 +119,21 @@ Commands are newline-terminated ASCII lines, matching Marauder's CLI parser
 ### Flipper → ESP32
 
 ```
-pwnfriend -n <name> -id <64hex> -f <faceIdx> -pr <pwnd_run> -pt <pwnd_tot> -u <uptime> -e <epoch> [-ch <n>]
+pwnfriend -n <name> -id <64hex> -f <faceIdx> -pr <pwnd_run> -pt <pwnd_tot> -u <uptime> -e <epoch> [-ch <n>] [-deauth]
 ```
 
 - `-n`   persona name (no spaces; use `_`, rendered back to space by the app if desired)
 - `-id`  64-hex identity (stable across the persona's life)
 - `-f`   face index into the shared face table (see below); ESP32 maps it to the glyph
-- `-pr`  pwnd this run
-- `-pt`  pwnd total
+- `-pr`  pwnd this run — now the count of **real** handshakes/PMKIDs captured this session
+- `-pt`  pwnd total — lifetime count of real captures (no longer a social score)
 - `-u`   uptime seconds
 - `-e`   epoch
 - `-ch`  optional: pin to a single channel instead of hopping
+- `-deauth`  optional flag, **appended only when the user has opted in** (default off).
+  When present the friend may actively deauth to force a handshake, and advertises
+  `policy.deauth: true` so the mesh sees the real policy. Absent = passive only. See
+  [§4 Safety & authorization](#4-safety--authorization).
 
 On receipt the ESP32 (re)builds the advertisement JSON, starts/refreshes broadcasting,
 and simultaneously sniffs for other Pwnagotchis. `stopscan` (existing Marauder command)
@@ -153,6 +157,40 @@ and a heartbeat when broadcasting is (re)confirmed:
 PWNFRIEND_ADV name=flippy ch=6 sent=128
 ```
 
+In full pwnagotchi mode the ESP32 also scans APs and captures handshakes, and reports
+those with three more events.
+
+An access point seen while scanning (drives the on-screen **APS** count and the pool of
+capturable targets), deduped per BSSID:
+
+```
+PWNFRIEND_AP {"bssid":"aa:bb:cc:dd:ee:ff","ssid":"NAME","channel":6,"rssi":-61}
+```
+
+A captured handshake / PMKID — the friend's **earned pwnd**, deduped per BSSID per
+session:
+
+```
+PWNFRIEND_PWND {"bssid":"aa:bb:cc:dd:ee:ff","ssid":"NAME","type":"handshake","channel":6,"rssi":-61}
+```
+
+`type` is `handshake` for an EAPOL M2, or `pmkid` for an RSN PMKID from M1. `ssid` is
+sanitized the same way as `PWNFRIEND_PEER` names and may be `""` for a hidden AP. The
+Flipper de-dupes AP lines by `bssid` and pwnd lines by `bssid`+`type`, so a re-heard
+handshake never double-counts and the `-pt`/`-pr` counts fed back stay honest.
+
+The raw 802.11 frame behind each capture, for the crackable pcap — one frame per line,
+lowercase hex of the full frame:
+
+```
+PWNFRIEND_HS <lowercase-hex-of-the-full-802.11-frame>
+```
+
+Hex, not raw binary, because the Flipper CLI UART mangles raw CR / XON / XOFF bytes; hex
+is line-safe and self-synchronising on the `\n` boundary. Only EAPOL / PMKID frames are
+streamed (never beacons/data), so a line stays small. See
+[§4 Safety & authorization](#4-safety--authorization) for the pcap format and location.
+
 Lines are `\n`-terminated. Any line not starting with `PWNFRIEND_` is ordinary Marauder
 output and the app ignores it.
 
@@ -175,3 +213,39 @@ own screen and in the advertised glyph:
 
 (Full list in `pwnagotchi.h`.) The friend's face is chosen by its mood, which is driven
 by how many peers it has met recently — see the app README.
+
+---
+
+## 4. Safety & authorization
+
+Presence (advertise + peer sniff) is the default and is unrestricted — it only broadcasts
+a beacon and listens. Capture and deauth are **opt-in and off by default on both ends**:
+
+- The Flipper app stays in presence-only mode until you explicitly enable capture. Deauth
+  is a further, separate opt-in that resets to off every launch; it is only meaningful
+  with capture on, and requires its own confirmation.
+- `-deauth` is **only appended to the `pwnfriend` command when the user has turned deauth
+  on**. Absent = passive only, which is the default. There is no default-on path to
+  transmitting a deauth.
+- Whenever deauth is active the advertised `policy.deauth` is `true`; the friend never
+  deauths while advertising `deauth:false`, so the mesh always sees the real policy.
+
+> Handshake/PMKID capture and deauth are only legal on Wi-Fi networks you own or are
+> explicitly authorized to test. Unauthorized use may be a crime where you live. You are
+> responsible for how you use this. Educational use only.
+
+### pcap output
+
+Frames streamed via `PWNFRIEND_HS` are hex-decoded on the Flipper and appended to a
+standard libpcap file — **linktype 105 (LINKTYPE_IEEE802_11**, bare 802.11, matching
+Marauder's own pcap byte-for-byte), so aircrack-ng, `hcxpcapngtool` and Wireshark read it
+directly. Captures are written to the Flipper SD under:
+
+```
+/ext/apps_data/pwnfriend/handshakes/
+```
+
+Each file grows a global header once, then one 16-byte record header + frame per captured
+EAPOL/PMKID frame; the file stays valid even if the board is yanked mid-capture. The SSID
+a cracker needs is carried alongside in the matching `PWNFRIEND_PWND` line (and can be fed
+to `aircrack-ng -e` / `hcxpcapngtool` if not embedded).

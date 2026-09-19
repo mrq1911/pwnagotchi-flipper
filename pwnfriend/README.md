@@ -28,10 +28,27 @@ units to show on screen.
 - The Flipper pushes the persona to the ESP32 over UART; the ESP32 broadcasts it as a
   pwngrid beacon (source MAC `de:ad:be:ef:de:ad`, JSON in vendor IE 222) across the 2.4
   GHz channels, and reports any Pwnagotchis it hears back to the Flipper.
-- The friend **grows**: uptime accumulates, each distinct unit it meets bumps its
-  "friends met" (advertised as `pwnd_tot`, so it looks like a real unit collecting
-  handshakes), and its level ticks up. Its mood/face reacts — lonely when no one's
-  around, excited on a new meeting, ♥ when a good friend lingers nearby.
+- The friend **grows**: uptime accumulates, it meets other units, and (in full
+  pwnagotchi mode, below) it captures real handshakes that count as `pwnd_tot`, so its
+  level ticks up for real. Its mood/face reacts — lonely when no one's around, excited on
+  a new meeting, ♥ when a good friend lingers nearby.
+
+## Full pwnagotchi mode
+
+The friend isn't just a costume anymore. Beyond saying hi it can behave like a real
+pwnagotchi:
+
+- **scans** the APs around it (each one drives the on-screen APS count),
+- passively **captures** WPA handshakes / PMKIDs from networks in range,
+- saves them as crackable `.pcap` files on the Flipper SD
+  (`/ext/apps_data/pwnfriend/handshakes/`, linktype 105 — open them straight in
+  aircrack-ng / hcxtools / Wireshark),
+- earns **real** pwnd from each capture, so `pwnd_run`/`pwnd_tot` are earned handshakes
+  now, not just units met,
+- and reacts with pwnagotchi **moods / faces** as it works.
+
+There's an optional active **deauth** to nudge a client into re-handshaking. It's off by
+default, resets to off every launch, and needs its own confirmation before it'll transmit.
 
 ## Controls
 
@@ -61,8 +78,19 @@ Drop `pwnfriend/` into your firmware's `applications_user/` and:
 The pwngrid air format and the Flipper↔ESP32 serial contract are documented in
 [`../doc/PwnfriendProtocol.md`](../doc/PwnfriendProtocol.md).
 
-## Note
+## Safety & legality
 
-This talks to the mesh the same way a real Pwnagotchi does — it only broadcasts a
-presence beacon and listens. It does not deauth, capture handshakes, or attack anything.
-It exists purely to keep a lonely Pwnagotchi company. Educational use only.
+By default the friend only says hi and listens — it advertises a presence beacon and
+shows units in range. That's lawful anywhere and needs no setup.
+
+It can *optionally* be switched into capture mode, which passively records WPA
+handshakes / PMKIDs, and — if you separately enable it — deauth, which actively kicks
+clients to force a handshake. **Both are off by default and gated behind an explicit
+opt-in** (deauth resets to off every launch and needs its own confirmation).
+
+> **⚠️ Capture and deauth are only legal on networks you own or are explicitly authorized
+> to test.** Unauthorized use may be illegal where you live. You alone are responsible for
+> how you use this. Educational use only.
+
+When deauth is on, the friend advertises `policy.deauth: true` to the mesh — it does not
+hide what it's doing.

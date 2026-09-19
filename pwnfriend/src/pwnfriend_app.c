@@ -13,6 +13,8 @@
 #include "../include/peers.h"
 #include "../include/face.h"
 #include "../include/pwnagotchi.h"
+#include "../include/consent.h"
+#include "../include/pcap.h"
 
 typedef enum {
     WorkerEventStop = (1 << 0),
@@ -20,6 +22,15 @@ typedef enum {
 } WorkerEventFlags;
 
 #define WORKER_EVENTS_MASK (WorkerEventStop | WorkerEventRx)
+
+// Capture escalation, default off. Cycled with Up; leaving Off the first time
+// needs the one-time consent acknowledgement. Passive = record handshakes the
+// firmware sniffs; Deauth = also advertise + send active deauth (-deauth 1).
+typedef enum {
+    CaptureOff = 0,
+    CapturePassive,
+    CaptureDeauth,
+} CaptureMode;
 
 typedef struct {
     Persona* persona;
@@ -30,6 +41,10 @@ typedef struct {
     uint32_t adv_sent_count; // last "sent=" from the ESP32
     uint8_t adv_channel; // last channel it reported broadcasting on
     Pwnagotchi* pwn; // flipagotchi renderer state, repopulated each draw
+    char last_pwnd_ssid[33]; // most recent capture, for the PWND/message readout
+    CaptureMode capture_mode; // OFF by default; the deauth/capture gate
+    bool consent_given; // cached consent_is_given() — capture UI is locked until true
+    bool showing_consent; // modal: the one-time authorization acknowledgement
 } PwnfriendModel;
 
 typedef struct {
@@ -41,11 +56,15 @@ typedef struct {
     FuriStreamBuffer* rx_stream;
     FuriHalSerialHandle* serial_handle;
     FuriTimer* timer;
+    Storage* storage; // for the handshake pcap writer
 
-    // Line assembly — touched only by the worker thread.
-    char line[288];
+    // Line assembly — touched only by the worker thread. Sized to hold a whole
+    // hex-encoded EAPOL frame line (PWNFRIEND_HS <~600 hex>), not just JSON.
+    char line[1024];
     size_t line_len;
+    char hs_name[33]; // fs-safe name of the current capture target (worker-only)
     bool got_new_friend; // set by worker, consumed for a notification blink
+    bool got_pwnd; // set by worker, consumed for the capture blink
 } PwnfriendApp;
 
 static const NotificationSequence sequence_new_friend = {
@@ -57,12 +76,27 @@ static const NotificationSequence sequence_new_friend = {
     NULL,
 };
 
+// A louder blink for an actual handshake capture — this is the "got pwnd" moment.
+static const NotificationSequence sequence_pwnd = {
+    &message_display_backlight_on,
+    &message_red_255,
+    &message_blue_255,
+    &message_vibro_on,
+    &message_delay_50,
+    &message_vibro_off,
+    &message_delay_50,
+    &message_vibro_on,
+    &message_delay_50,
+    &message_vibro_off,
+    NULL,
+};
+
 // ---------------------------------------------------------------------------
 // Serial: build + send the advertise command, and stop.
 // ---------------------------------------------------------------------------
 
 static void pwnfriend_send_advertise(PwnfriendApp* app) {
-    char cmd[188];
+    char cmd[200];
     with_view_model(
         app->view,
         PwnfriendModel * model,
@@ -74,16 +108,28 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
             for(char* c = safe_name; *c; c++) {
                 if(*c == ' ') *c = '_';
             }
+            // -pr/-pt now carry REAL captured-handshake counts; -e the epoch.
+            // -cap/-deauth are the honest firmware-side gates: both are sent as an
+            // explicit 0/1 every advertise so a previously-armed radio is actively
+            // disarmed (a "real gate" must be able to turn OFF, not just ON). -cap
+            // is 1 in Passive/Deauth, -deauth is 1 only in Deauth. The firmware
+            // mirrors -deauth into the beacon's policy.deauth, so the mesh always
+            // sees the truth. Current firmware that doesn't know -cap ignores it.
+            int cap = (model->capture_mode != CaptureOff) ? 1 : 0;
+            int deauth = (model->capture_mode == CaptureDeauth) ? 1 : 0;
             snprintf(
                 cmd,
                 sizeof(cmd),
-                "pwnfriend -n %s -id %s -f %d -pr %lu -pt %lu -u %lu\n",
+                "pwnfriend -n %s -id %s -f %d -pr %lu -pt %lu -u %lu -e %lu -cap %d -deauth %d\n",
                 safe_name,
                 p->s.identity,
                 (int)persona_face(p),
-                (unsigned long)p->friends_session,
-                (unsigned long)p->s.friends_met,
-                (unsigned long)p->s.total_uptime);
+                (unsigned long)p->pwnd_run, // REAL handshakes this run
+                (unsigned long)p->s.pwnd_tot, // REAL handshakes lifetime
+                (unsigned long)p->s.total_uptime,
+                (unsigned long)p->epoch,
+                cap,
+                deauth);
             model->last_adv_sent = model->tick_secs;
         },
         false);
@@ -160,9 +206,113 @@ static void pwnfriend_handle_adv_line(PwnfriendApp* app, const char* line) {
         true);
 }
 
+// Derive a filesystem-safe capture name from an ssid (or bssid fallback):
+// keep [A-Za-z0-9._-], map everything else to '_', truncate. Empty -> "capture".
+static void pwnfriend_fs_safe_name(char* out, size_t out_sz, const char* in) {
+    size_t n = 0;
+    for(const char* c = in; *c && n < out_sz - 1; c++) {
+        char ch = *c;
+        bool keep = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                    (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
+        out[n++] = keep ? ch : '_';
+    }
+    out[n] = '\0';
+    if(n == 0) strncpy(out, "capture", out_sz - 1);
+}
+
+static int hexval(char c) {
+    if(c >= '0' && c <= '9') return c - '0';
+    if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
+    char bssid[18] = {0};
+    char ssid[33] = {0};
+    char type[12] = {0};
+    int channel = 0, rssi = 0;
+
+    line_extract_str(line, "\"bssid\":\"", bssid, sizeof(bssid));
+    line_extract_str(line, "\"ssid\":\"", ssid, sizeof(ssid));
+    line_extract_str(line, "\"type\":\"", type, sizeof(type));
+    line_extract_int(line, "\"channel\":", &channel);
+    line_extract_int(line, "\"rssi\":", &rssi);
+
+    const char* label = ssid[0] ? ssid : bssid;
+    // Remember the fs-safe target name for the PWNFRIEND_HS frames that follow
+    // (worker thread only, so no lock needed).
+    pwnfriend_fs_safe_name(app->hs_name, sizeof(app->hs_name), label);
+
+    bool counted = false;
+    with_view_model(
+        app->view,
+        PwnfriendModel * model,
+        {
+            // Gate the earned count behind the consent + capture opt-in: without
+            // it we ignore whatever the firmware happens to report.
+            if(model->capture_mode != CaptureOff) {
+                persona_note_pwnd(model->persona);
+                strncpy(model->last_pwnd_ssid, label, sizeof(model->last_pwnd_ssid) - 1);
+                model->last_pwnd_ssid[sizeof(model->last_pwnd_ssid) - 1] = '\0';
+                counted = true;
+            }
+        },
+        true);
+
+    if(counted) app->got_pwnd = true; // capture blink
+}
+
+static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
+    char bssid[18] = {0};
+    char ssid[33] = {0};
+    int channel = 0, rssi = 0;
+
+    line_extract_str(line, "\"bssid\":\"", bssid, sizeof(bssid));
+    line_extract_str(line, "\"ssid\":\"", ssid, sizeof(ssid));
+    line_extract_int(line, "\"channel\":", &channel);
+    line_extract_int(line, "\"rssi\":", &rssi);
+
+    with_view_model(
+        app->view, PwnfriendModel * model, { persona_note_ap(model->persona); }, true);
+}
+
+static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
+    // line = "PWNFRIEND_HS <lowercase-hex-of-the-full-802.11-frame>"
+    const char* p = line + 13; // past "PWNFRIEND_HS "
+
+    // Only record if capture is opted in; otherwise silently drop the frame.
+    bool record = false;
+    with_view_model(
+        app->view,
+        PwnfriendModel * model,
+        { record = (model->capture_mode != CaptureOff); },
+        false);
+    if(!record) return;
+
+    static uint8_t frame[PCAP_SNAPLEN];
+    size_t flen = 0;
+    while(p[0] && p[1] && flen < sizeof(frame)) {
+        int hi = hexval(p[0]), lo = hexval(p[1]);
+        if(hi < 0 || lo < 0) return; // corrupt line -> drop, don't write
+        frame[flen++] = (uint8_t)((hi << 4) | lo);
+        p += 2;
+    }
+    if(flen == 0) return;
+    pcap_append_frame(app->storage, app->hs_name, frame, (uint16_t)flen);
+}
+
 static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
+    // PWNFRIEND_PWND and PWNFRIEND_PEER share the PWNFRIEND_P prefix, so both
+    // full comparisons are needed.
     if(strncmp(line, "PWNFRIEND_PEER ", 15) == 0) {
         pwnfriend_handle_peer_line(app, line);
+    } else if(strncmp(line, "PWNFRIEND_PWND ", 15) == 0) {
+        pwnfriend_handle_pwnd_line(app, line);
+    } else if(strncmp(line, "PWNFRIEND_HS ", 13) == 0) {
+        pwnfriend_handle_hs_line(app, line);
+    } else if(strncmp(line, "PWNFRIEND_AP ", 13) == 0) {
+        pwnfriend_handle_ap_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_ADV ", 14) == 0) {
         pwnfriend_handle_adv_line(app, line);
     }
@@ -191,12 +341,12 @@ static void pwnfriend_populate(PwnfriendModel* model) {
         furi_string_set(pwn->channel, "*");
     }
 
-    // APS: units currently in range.
-    uint32_t active = 0;
-    for(int i = 0; i < MAX_PEERS; i++) {
-        if(model->peers.items[i].used) active++;
-    }
-    furi_string_printf(pwn->apStat, "%lu", (unsigned long)active);
+    // APS: access points seen this session (lifetime).
+    furi_string_printf(
+        pwn->apStat,
+        "%lu (%lu)",
+        (unsigned long)p->aps_session,
+        (unsigned long)p->s.aps_tot);
 
     // UP: cumulative uptime as hh:mm:ss.
     uint32_t up = (uint32_t)p->s.total_uptime;
@@ -207,22 +357,24 @@ static void pwnfriend_populate(PwnfriendModel* model) {
         (unsigned long)((up % 3600) / 60),
         (unsigned long)(up % 60));
 
-    // PWND: friends met, this session (lifetime) — the friend's social score.
+    // PWND: real handshakes captured, this session (lifetime).
     furi_string_printf(
         pwn->handshakes,
         "%lu (%lu)",
-        (unsigned long)p->friends_session,
-        (unsigned long)p->s.friends_met);
+        (unsigned long)p->pwnd_run,
+        (unsigned long)p->s.pwnd_tot);
 
-    // Message: level + mood, or a paused hint.
-    if(model->advertising) {
+    // Message: a paused hint, the fresh catch, or level + mood voice line.
+    if(!model->advertising) {
+        furi_string_set(pwn->message, "paused - OK to greet");
+    } else if((p->mood == MoodHappy || p->mood == MoodCool) && model->last_pwnd_ssid[0]) {
+        furi_string_printf(pwn->message, "pwnd %s!", model->last_pwnd_ssid);
+    } else {
         furi_string_printf(
             pwn->message,
             "Lv%lu %s",
             (unsigned long)persona_level(p),
             persona_mood_label(p));
-    } else {
-        furi_string_set(pwn->message, "paused - OK to greet");
     }
 
     // Friend slot: the closest (strongest) unit, with signal bars.
@@ -243,11 +395,50 @@ static void pwnfriend_populate(PwnfriendModel* model) {
     }
 }
 
+// The one-time authorization acknowledgement, shown before capture can be armed.
+static void pwnfriend_draw_consent(Canvas* canvas) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 9, "Capture & deauth");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 21, "Capture/deauth only on");
+    canvas_draw_str(canvas, 2, 30, "networks you own or are");
+    canvas_draw_str(canvas, 2, 39, "authorized to test.");
+    canvas_draw_str(canvas, 2, 48, "You are responsible.");
+    canvas_draw_str(canvas, 2, 62, "Hold OK=accept  Back=no");
+}
+
+// A bottom-right badge showing the live capture state (overwrites the AI tag).
+static void pwnfriend_draw_capture_badge(Canvas* canvas, CaptureMode mode) {
+    if(mode == CaptureOff) return;
+    canvas_set_font(canvas, FontSecondary);
+    const char* tag = (mode == CaptureDeauth) ? "DEAUTH" : "CAP";
+    int w = canvas_string_width(canvas, tag);
+    int x = FLIPPER_SCREEN_WIDTH - w - 1;
+    if(mode == CaptureDeauth) {
+        // Inverse box so active RF transmission is unmistakable.
+        canvas_draw_box(canvas, x - 1, 56, w + 2, 8);
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_str(canvas, x, 63, tag);
+        canvas_set_color(canvas, ColorBlack);
+    } else {
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_box(canvas, x - 1, 56, w + 2, 8);
+        canvas_set_color(canvas, ColorBlack);
+        canvas_draw_str(canvas, x, 63, tag);
+    }
+}
+
 static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
     PwnfriendModel* model = ctx;
     canvas_clear(canvas);
+    if(model->showing_consent) {
+        pwnfriend_draw_consent(canvas);
+        return;
+    }
     pwnfriend_populate(model);
     pwnagotchi_draw_all(model->pwn, canvas);
+    pwnfriend_draw_capture_badge(canvas, model->capture_mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -256,9 +447,41 @@ static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
 
 static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
     PwnfriendApp* app = ctx;
+
+    // While the consent modal is up: long-press OK accepts, Back cancels; every
+    // other input is swallowed so nothing leaks through to the pwnagotchi view.
+    bool consent_modal = false;
+    with_view_model(
+        app->view, PwnfriendModel * model, { consent_modal = model->showing_consent; }, false);
+    if(consent_modal) {
+        if(event->key == InputKeyOk && event->type == InputTypeLong) {
+            consent_record();
+            bool advertising = false;
+            with_view_model(
+                app->view,
+                PwnfriendModel * model,
+                {
+                    model->showing_consent = false;
+                    model->consent_given = true;
+                    model->capture_mode = CapturePassive; // enact the pending enable
+                    advertising = model->advertising;
+                },
+                true);
+            if(advertising) pwnfriend_send_advertise(app);
+            return true;
+        }
+        if(event->key == InputKeyBack && event->type == InputTypeShort) {
+            with_view_model(
+                app->view, PwnfriendModel * model, { model->showing_consent = false; }, true);
+            return true; // consume so Back doesn't exit the app
+        }
+        return true; // modal swallows all other input
+    }
+
     if(event->type != InputTypeShort) return false;
 
     if(event->key == InputKeyOk) {
+        // OK: start / pause advertising (unchanged).
         bool now_advertising = false;
         with_view_model(
             app->view,
@@ -273,6 +496,29 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
         } else {
             pwnfriend_send_stop(app);
         }
+        return true;
+    }
+
+    if(event->key == InputKeyUp) {
+        // Up: cycle the capture gate Off -> Passive -> Deauth -> Off. Leaving Off
+        // the first time needs the consent acknowledgement (shown, not cycled).
+        bool prompted = false, changed = false, advertising = false;
+        with_view_model(
+            app->view,
+            PwnfriendModel * model,
+            {
+                if(model->capture_mode == CaptureOff && !model->consent_given) {
+                    model->showing_consent = true;
+                    prompted = true;
+                } else {
+                    model->capture_mode = (model->capture_mode + 1) % 3;
+                    changed = true;
+                }
+                advertising = model->advertising;
+            },
+            true);
+        // Push the new deauth state to the firmware right away when live.
+        if(changed && !prompted && advertising) pwnfriend_send_advertise(app);
         return true;
     }
     return false;
@@ -369,6 +615,10 @@ static int32_t pwnfriend_worker(void* context) {
                 app->got_new_friend = false;
                 notification_message(app->notification, &sequence_new_friend);
             }
+            if(app->got_pwnd) {
+                app->got_pwnd = false;
+                notification_message(app->notification, &sequence_pwnd);
+            }
         }
     }
     return 0;
@@ -386,6 +636,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
 
     app->gui = furi_record_open(RECORD_GUI);
     app->notification = furi_record_open(RECORD_NOTIFICATION);
+    app->storage = furi_record_open(RECORD_STORAGE);
 
     app->view_dispatcher = view_dispatcher_alloc();
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
@@ -404,6 +655,10 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             peers_init(&model->peers);
             model->tick_secs = 0;
             model->advertising = false;
+            model->capture_mode = CaptureOff; // default: presence only
+            model->consent_given = consent_is_given();
+            model->showing_consent = false;
+            model->last_pwnd_ssid[0] = '\0';
         },
         true);
 
@@ -466,6 +721,7 @@ static void pwnfriend_app_free(PwnfriendApp* app) {
 
     furi_record_close(RECORD_GUI);
     furi_record_close(RECORD_NOTIFICATION);
+    furi_record_close(RECORD_STORAGE);
     app->gui = NULL;
 
     furi_stream_buffer_free(app->rx_stream);

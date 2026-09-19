@@ -202,6 +202,42 @@ def main():
         "            wifi_scan_obj.processPwnagotchiBeacon(snifferPacket->payload, len);",
         tag="pwnfriend_obj.reportPeer(")
     steps += d
+
+    # 3b. Capture path: EAPOL/PMKID arrive as DATA frames. `filt` already passes
+    # DATA (WiFiScan.h: filt = MGMT|DATA), but beaconSnifferCallback only acts on
+    # MGMT frames. Handle pwnfriend DATA frames before the mgmt-only dispatch and
+    # append any EAPOL frame to the pcap so the capture is crackable offline.
+    # `len` here is still rx_ctrl.sig_len (un-decremented) — correct for DATA.
+    t, d = insert_before(
+        t,
+        "  if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PROBE) ||",
+        "  if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) &&\n"
+        "      (type == WIFI_PKT_DATA)) {\n"
+        "    if (pwnfriend_obj.reportHandshake(snifferPacket->payload, len,\n"
+        "                                      snifferPacket->rx_ctrl.rssi,\n"
+        "                                      snifferPacket->rx_ctrl.channel))\n"
+        "      buffer_obj.append(snifferPacket, len);\n"
+        "    return;\n"
+        "  }\n",
+        tag="pwnfriend_obj.reportHandshake(")
+    steps += d
+
+    # 3c. Recon: dedup non-pwngrid beacons into PWNFRIEND_AP lines, and save the
+    # first beacon per AP to the pcap so its ESSID is in the 22000 hashline. Sits
+    # inside if(type==MGMT)->if(payload[0]==0x80), after the pwngrid mac_match
+    # return, so peers never reach it. `len` here is already FCS-stripped (-4).
+    t, d = insert_before(
+        t,
+        "        if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWN) {",
+        "        if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) {\n"
+        "          if (pwnfriend_obj.reportAP(snifferPacket->payload, len,\n"
+        "                                     snifferPacket->rx_ctrl.rssi,\n"
+        "                                     snifferPacket->rx_ctrl.channel))\n"
+        "            buffer_obj.append(snifferPacket, len);\n"
+        "          return;\n"
+        "        }\n",
+        tag="pwnfriend_obj.reportAP(")
+    steps += d
     _write(p, t)
 
     # 4. CommandLine.h — the command string.
