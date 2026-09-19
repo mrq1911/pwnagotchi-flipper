@@ -3,69 +3,102 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>pwnfriend export — crackable + WiGLE</title>
+<title>pwnflipper export — crackable + WiGLE</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <style>
-  :root { color-scheme: dark; }
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #111; color: #ddd; }
-  header { padding: 16px 20px; background: #1a1a1a; border-bottom: 1px solid #333; }
-  h1 { font-size: 18px; margin: 0; }
-  .sub { color: #888; font-size: 12px; margin-top: 4px; }
-  main { padding: 20px; max-width: 860px; margin: 0 auto; }
-  button { font: inherit; background: #2b6cb0; color: #fff; border: 0; border-radius: 6px;
-           padding: 9px 14px; cursor: pointer; margin: 0 8px 8px 0; }
-  button.secondary { background: #333; }
-  button:disabled { opacity: .5; cursor: default; }
-  #drop { border: 2px dashed #444; border-radius: 8px; padding: 28px; text-align: center;
-          color: #999; margin: 14px 0; }
-  #drop.hot { border-color: #2b6cb0; color: #ddd; background: #16233a; }
-  .row { display: flex; flex-wrap: wrap; gap: 14px; margin: 14px 0; }
-  .card { flex: 1 1 240px; background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 14px; }
-  .num { font-size: 28px; font-weight: 700; }
-  .num.good { color: #48bb78; } .num.warn { color: #ecc94b; } .num.bad { color: #888; }
-  pre#log { background: #000; border: 1px solid #333; border-radius: 6px; padding: 12px;
-            height: 220px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
-  a.dl { display: inline-block; }
-  code { background: #222; padding: 1px 5px; border-radius: 4px; }
-  .note { color: #888; font-size: 12px; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
-  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #262626; }
-  th { color: #888; font-weight: 600; }
+  /* Flipper-orange + pwnagotchi dot-matrix vibe. */
+  :root { color-scheme: dark; --org:#ff8200; --bg:#000; --panel:#0d0d0c; --line:#2c2c26;
+          --dim:#8a8a78; --fg:#e9e9d6; --grn:#8dff6b; --red:#ff5b5b; }
+  * { box-sizing: border-box; }
+  body { font: 13px/1.5 "DejaVu Sans Mono", ui-monospace, Menlo, Consolas, monospace;
+         margin: 0; background: var(--bg); color: var(--fg); }
+  a { color: var(--org); }
+  header { padding: 12px 16px; background: var(--org); color: #000; display: flex;
+           align-items: center; gap: 14px; }
+  header .face { font-size: 22px; line-height: 1; white-space: nowrap; }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: 2px; text-transform: uppercase; }
+  header .mood { font-size: 12px; opacity: .82; }
+  main { padding: 14px 16px; max-width: 900px; margin: 0 auto; }
+  .panel { border: 1px solid var(--line); background: var(--panel); margin: 12px 0; }
+  .panel > .bar { background: var(--org); color: #000; padding: 3px 8px; font-weight: 700;
+                  text-transform: uppercase; letter-spacing: 2px; font-size: 11px; }
+  .panel > .body { padding: 12px; }
+  button { font: inherit; background: #000; color: var(--org); border: 1px solid var(--org);
+           padding: 8px 12px; cursor: pointer; margin: 0 8px 8px 0; text-transform: uppercase;
+           letter-spacing: 1px; }
+  button:hover { background: var(--org); color: #000; }
+  button.secondary { color: var(--fg); border-color: var(--line); }
+  button.secondary:hover { background: var(--line); color: var(--fg); }
+  button:disabled { opacity: .4; cursor: default; background: #000; color: var(--dim); border-color: var(--line); }
+  #drop { border: 2px dashed var(--line); padding: 20px; text-align: center; color: var(--dim); margin: 12px 0 0; }
+  #drop.hot { border-color: var(--org); color: var(--fg); }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+  .card { flex: 1 1 170px; border: 1px solid var(--line); background: var(--panel); padding: 10px 12px; }
+  .card .num { font-size: 26px; font-weight: 700; color: var(--org); }
+  .card .num.good { color: var(--grn); } .card .num.warn { color: #ffd23f; }
+  .card .lbl { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+  pre#log { background: #000; border: 0; margin: 0; padding: 10px; height: 170px; overflow: auto;
+            font-size: 12px; white-space: pre-wrap; color: var(--grn); }
+  code { background: #1a1a12; color: var(--org); padding: 1px 5px; }
+  .note { color: var(--dim); font-size: 11px; line-height: 1.7; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--org); text-transform: uppercase; font-size: 10px; letter-spacing: 1px; }
+  td.ok { color: var(--grn); } td.no { color: var(--dim); }
+  #map { height: 320px; }
+  .leaflet-container { background: #000; font-family: inherit; }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #0d0d0c; color: var(--fg);
+            border: 1px solid var(--org); border-radius: 0; }
+  .leaflet-popup-content { font-size: 12px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>pwnfriend export</h1>
-  <div class="sub">Pull captures from the Flipper, convert crackable handshakes/PMKIDs to hashcat
-    <code>22000</code>, and grab the WiGLE wardrive CSV. Everything runs in your browser — nothing is uploaded.</div>
+  <span class="face" id="face">(◕‿‿◕)</span>
+  <div>
+    <h1>pwnflipper&nbsp;export</h1>
+    <div class="mood" id="mood">feed me your loot ...</div>
+  </div>
 </header>
 <main>
-  <div class="row" style="align-items:center">
-    <div>
-      <button id="serial">Connect Flipper (USB)</button>
-      <button id="pick" class="secondary">Choose folder…</button>
-      <input id="dir" type="file" webkitdirectory directory multiple hidden>
-      <input id="files" type="file" accept=".pcap,.csv" multiple hidden>
-    </div>
-  </div>
-  <div id="drop">…or drop the Flipper's <code>pwnfriend</code> folder (or its <code>.pcap</code> / <code>wardrive.csv</code>) here</div>
+  <div class="panel"><div class="bar">Source</div><div class="body">
+    <button id="serial">Connect Flipper (USB)</button>
+    <button id="pick" class="secondary">Choose folder…</button>
+    <input id="dir" type="file" webkitdirectory directory multiple hidden>
+    <input id="files" type="file" accept=".pcap,.csv" multiple hidden>
+    <div id="drop">…or drop the Flipper's <code>pwnfriend</code> folder (its <code>.pcap</code> / <code>wardrive.csv</code>) here</div>
+  </div></div>
 
   <div class="row">
-    <div class="card"><div class="num" id="nPcap">0</div>pcaps read</div>
-    <div class="card"><div class="num good" id="nCrack">0</div>crackable (22000 lines)</div>
-    <div class="card"><div class="num warn" id="nPartial">0</div>partial (need ESSID / more frames)</div>
-    <div class="card"><div class="num" id="nWigle">0</div>WiGLE rows</div>
+    <div class="card"><div class="num" id="nPcap">0</div><div class="lbl">pcaps read</div></div>
+    <div class="card"><div class="num good" id="nCrack">0</div><div class="lbl">crackable</div></div>
+    <div class="card"><div class="num warn" id="nPartial">0</div><div class="lbl">partial</div></div>
+    <div class="card"><div class="num" id="nWigle">0</div><div class="lbl">wigle rows</div></div>
   </div>
 
   <div id="downloads" class="row"></div>
-  <table id="results" hidden><thead><tr><th>BSSID</th><th>ESSID</th><th>type</th><th>status</th></tr></thead><tbody></tbody></table>
 
-  <h3>Log</h3>
-  <pre id="log"></pre>
+  <div class="panel" id="mapwrap" hidden><div class="bar">Wardrive map</div>
+    <div class="body" style="padding:0"><div id="map"></div></div></div>
+
+  <div class="panel" id="resultwrap" hidden><div class="bar">Captures</div>
+    <div class="body" style="padding:0">
+      <table id="results"><thead><tr><th>BSSID</th><th>ESSID</th><th>type</th><th>status</th></tr></thead><tbody></tbody></table>
+    </div></div>
+
+  <div class="panel"><div class="bar">Log</div><div class="body" style="padding:0"><pre id="log"></pre></div></div>
+
   <div class="note">
-    USB pull uses Web Serial (Chrome/Edge). Reads <code>/ext/apps_data/pwnfriend/</code> via the Flipper CLI
-    <code>storage</code> command (close qFlipper/lab.flipper.net first — only one app can hold the port).
-    If USB isn't available, copy the <code>pwnfriend</code> folder off the SD with qFlipper and drop it here.
-    <br>Crack with: <code>hashcat -m 22000 pwnfriend.hc22000 wordlist</code>. Upload the CSV at <code>wigle.net</code> → Uploads.
+    Capture conversion runs entirely in your browser — pcaps/handshakes are never uploaded. The map
+    loads tiles from CARTO/OpenStreetMap, so only the map viewport (not your AP data) reaches those tile servers.
+    <br>USB pull uses Web Serial (Chrome/Edge), reading <code>/ext/apps_data/pwnfriend/</code> via the Flipper
+    CLI <code>storage</code> command — close qFlipper/lab.flipper.net first (one app owns the port). No USB? Copy
+    the <code>pwnfriend</code> folder off the SD with qFlipper and drop it above.
+    <br>Crack: <code>hashcat -m 22000 pwnfriend.hc22000 &lt;wordlist&gt;</code>. Wardrive: upload the CSV at
+    <code>wigle.net</code> → Uploads.
   </div>
 </main>
 <script>
@@ -240,7 +273,11 @@ let allFrames = [];
 let pcapCount = 0;
 let wardriveText = '';
 
-function reset() { allFrames = []; pcapCount = 0; wardriveText = ''; $('#results').querySelector('tbody').innerHTML = ''; }
+function reset() {
+  allFrames = []; pcapCount = 0; wardriveText = '';
+  $('#results').querySelector('tbody').innerHTML = '';
+  $('#resultwrap').hidden = true;
+}
 
 function addPcap(name, buf) {
   const pkts = parsePcap(buf);
@@ -251,26 +288,38 @@ function addPcap(name, buf) {
 
 function render() {
   const { lines, rows } = convert(allFrames);
-  $('#nPcap').textContent = pcapCount;
   const crack = rows.filter(r => r[3] === 'crackable').length;
-  const partial = rows.filter(r => r[3] !== 'crackable').length;
+  const partial = rows.length - crack;
+  $('#nPcap').textContent = pcapCount;
   $('#nCrack').textContent = crack;
   $('#nPartial').textContent = partial;
-  const wrows = wardriveText ? Math.max(0, wardriveText.trim().split('\n').length - 2) : 0;
-  $('#nWigle').textContent = wrows;
+
+  const points = parseWardrive(wardriveText);
+  $('#nWigle').textContent = points.length;
 
   const tb = $('#results').querySelector('tbody'); tb.innerHTML = '';
   for (const r of rows) {
     const tr = document.createElement('tr');
-    r.forEach(c => { const td = document.createElement('td'); td.textContent = c ?? ''; tr.appendChild(td); });
+    r.forEach((c, i) => {
+      const td = document.createElement('td');
+      td.textContent = c ?? '';
+      if (i === 3) td.className = c === 'crackable' ? 'ok' : 'no';
+      tr.appendChild(td);
+    });
     tb.appendChild(tr);
   }
-  $('#results').hidden = rows.length === 0;
+  $('#resultwrap').hidden = rows.length === 0;
 
   const dl = $('#downloads'); dl.innerHTML = '';
-  if (lines.length) dl.appendChild(mkDownload('pwnfriend.hc22000', lines.join('\n') + '\n', `Download ${lines.length} × 22000`));
-  if (wardriveText) dl.appendChild(mkDownload('pwnfriend-wardrive.csv', wardriveText, 'Download WiGLE CSV'));
-  log(`done: ${pcapCount} pcaps, ${crack} crackable, ${partial} partial, ${wrows} WiGLE rows`);
+  if (lines.length) dl.appendChild(mkDownload('pwnfriend.hc22000', lines.join('\n') + '\n', `⬇ ${lines.length} × 22000`));
+  if (wardriveText) dl.appendChild(mkDownload('pwnfriend-wardrive.csv', wardriveText, '⬇ WiGLE CSV'));
+
+  // crackable APs (12-hex bssids) get highlighted on the map
+  const crackSet = new Set(rows.filter(r => r[3] === 'crackable').map(r => r[0]));
+  renderMap(points, crackSet);
+
+  setFace(pcapCount, points.length, crack, partial);
+  log(`done: ${pcapCount} pcaps, ${crack} crackable, ${partial} partial, ${points.length} located APs`);
 }
 
 function mkDownload(fname, text, label) {
@@ -281,6 +330,93 @@ function mkDownload(fname, text, label) {
   const b = document.createElement('button');
   b.textContent = label; a.appendChild(b);
   return a;
+}
+
+// ---------------------------------------------------------------------------
+// WiGLE wardrive CSV -> located AP points
+// ---------------------------------------------------------------------------
+function splitCsv(line) {
+  const out = []; let cur = '', q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) {
+      if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+      else cur += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+function parseWardrive(text) {
+  if (!text) return [];
+  const lines = text.split(/\r?\n/);
+  const pts = [];
+  for (let i = 2; i < lines.length; i++) { // skip the WigleWifi + column-header rows
+    if (!lines[i].trim()) continue;
+    const f = splitCsv(lines[i]);
+    if (f.length < 8) continue;
+    const lat = parseFloat(f[6]), lon = parseFloat(f[7]);
+    if (!isFinite(lat) || !isFinite(lon) || (lat === 0 && lon === 0)) continue;
+    pts.push({ mac: (f[0] || '').toLowerCase(), ssid: f[1] || '', auth: f[2] || '',
+               ch: f[4] || '', rssi: f[5] || '', lat, lon });
+  }
+  return pts;
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+// ---------------------------------------------------------------------------
+// Leaflet map of the wardrive, crackable APs highlighted
+// ---------------------------------------------------------------------------
+let _map = null, _markers = null;
+function renderMap(points, crackSet) {
+  const wrap = $('#mapwrap');
+  if (typeof L === 'undefined') { wrap.hidden = true; log('map lib offline — skipping map'); return; }
+  const pts = points.filter(p => isFinite(p.lat) && isFinite(p.lon));
+  if (!pts.length) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  if (!_map) {
+    _map = L.map('map', { attributionControl: true });
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+      { maxZoom: 20, attribution: '© OpenStreetMap · © CARTO' }).addTo(_map);
+    _markers = L.layerGroup().addTo(_map);
+  }
+  _markers.clearLayers();
+  const latlngs = [];
+  for (const p of pts) {
+    const crackable = crackSet.has(p.mac.replace(/[^0-9a-f]/g, ''));
+    const mk = L.circleMarker([p.lat, p.lon], {
+      radius: crackable ? 7 : 4,
+      color: crackable ? '#ff8200' : '#8dff6b',
+      weight: crackable ? 2 : 1,
+      fillColor: crackable ? '#ff8200' : '#8dff6b',
+      fillOpacity: crackable ? 0.9 : 0.25,
+    });
+    mk.bindPopup(
+      `<b>${escapeHtml(p.ssid || '(hidden)')}</b><br>${escapeHtml(p.mac)}<br>` +
+      `${escapeHtml(p.auth)}<br>ch ${escapeHtml(p.ch)} · ${escapeHtml(p.rssi)} dBm` +
+      (crackable ? '<br><b style="color:#ff8200">✔ CRACKABLE</b>' : ''));
+    mk.addTo(_markers);
+    latlngs.push([p.lat, p.lon]);
+  }
+  _map.invalidateSize(); // it was display:none until now
+  _map.fitBounds(latlngs, { padding: [30, 30], maxZoom: 17 });
+}
+
+// ---------------------------------------------------------------------------
+// pwnagotchi face + mood line reacting to the loot
+// ---------------------------------------------------------------------------
+function setFace(pcaps, located, crack, partial) {
+  let face = '(◕‿‿◕)', mood = 'feed me your loot ...';
+  if (crack > 0) { face = '(⌐■_■)'; mood = `${crack} crackable! I pwn therefore I am.`; }
+  else if (pcaps > 0 && partial > 0) { face = '(≖__≖)'; mood = `${partial} partial — missing the ESSID beacon.`; }
+  else if (pcaps > 0) { face = '(-__-)'; mood = 'nothing crackable in here ...'; }
+  else if (located > 0) { face = '(•‿‿•)'; mood = `${located} networks mapped.`; }
+  $('#face').textContent = face;
+  $('#mood').textContent = mood;
 }
 
 // ---------------------------------------------------------------------------
