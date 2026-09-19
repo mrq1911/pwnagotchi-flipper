@@ -127,6 +127,10 @@ def main():
 
     runner = '''void WiFiScan::RunPwnfriendScan(uint8_t scan_mode, uint16_t color) {
   (void)scan_mode; (void)color;
+  // Real scan start: clear the per-session capture dedup tables here (NOT in
+  // configureFromArgs, which the Flipper re-runs every ~15s to refresh the
+  // persona) so a persona refresh doesn't re-count pwnd APs / inflate pwnd_tot.
+  pwnfriend_obj.beginSession();
   startPcap("pwnfriend");
   // Mirror Marauder's beacon-attack TX init EXACTLY. The AP config
   // (esp_wifi_set_config) is REQUIRED: without it the AP iface never fully
@@ -213,9 +217,17 @@ def main():
         "  if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PROBE) ||",
         "  if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) &&\n"
         "      (type == WIFI_PKT_DATA)) {\n"
+        "    #ifdef HAS_GPS\n"
+        "      bool pf_fix = gps_obj.getFixStatus();\n"
+        "      double pf_lat = pf_fix ? atof(gps_obj.getLat().c_str()) : 0.0;\n"
+        "      double pf_lon = pf_fix ? atof(gps_obj.getLon().c_str()) : 0.0;\n"
+        "    #else\n"
+        "      bool pf_fix = false; double pf_lat = 0.0; double pf_lon = 0.0;\n"
+        "    #endif\n"
         "    if (pwnfriend_obj.reportHandshake(snifferPacket->payload, len,\n"
         "                                      snifferPacket->rx_ctrl.rssi,\n"
-        "                                      snifferPacket->rx_ctrl.channel))\n"
+        "                                      snifferPacket->rx_ctrl.channel,\n"
+        "                                      pf_fix, pf_lat, pf_lon))\n"
         "      buffer_obj.append(snifferPacket, len);\n"
         "    return;\n"
         "  }\n",
@@ -230,9 +242,17 @@ def main():
         t,
         "        if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWN) {",
         "        if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) {\n"
+        "          #ifdef HAS_GPS\n"
+        "            bool pf_fix = gps_obj.getFixStatus();\n"
+        "            double pf_lat = pf_fix ? atof(gps_obj.getLat().c_str()) : 0.0;\n"
+        "            double pf_lon = pf_fix ? atof(gps_obj.getLon().c_str()) : 0.0;\n"
+        "          #else\n"
+        "            bool pf_fix = false; double pf_lat = 0.0; double pf_lon = 0.0;\n"
+        "          #endif\n"
         "          if (pwnfriend_obj.reportAP(snifferPacket->payload, len,\n"
         "                                     snifferPacket->rx_ctrl.rssi,\n"
-        "                                     snifferPacket->rx_ctrl.channel))\n"
+        "                                     snifferPacket->rx_ctrl.channel,\n"
+        "                                     pf_fix, pf_lat, pf_lon))\n"
         "            buffer_obj.append(snifferPacket, len);\n"
         "          return;\n"
         "        }\n",
@@ -259,6 +279,12 @@ def main():
     handler = '''    else if (cmd_args.get(0) == PWNFRIEND_CMD) {
       if (!pwnfriend_obj.configureFromArgs(&cmd_args)) {
         Serial.println(F("PWNFRIEND_ERR bad -id (need 64 hex)"));
+      } else if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) {
+        // Already running: configureFromArgs() already refreshed + rebuilt the
+        // persona. Do NOT StartScan again -- that would tear down/re-init WiFi,
+        // wipe recon, and reset the channel hop. The ~15s command re-send is
+        // only a live persona update.
+        Serial.println(F("pwnfriend persona updated"));
       } else {
         Serial.print(F("Starting pwnfriend. Stop with "));
         Serial.println(STOPSCAN_CMD);

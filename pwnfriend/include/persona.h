@@ -18,13 +18,16 @@ typedef enum {
     MoodExcited, // sustained activity, or a fresh capture streak / new friend
     MoodBonded, // a good friend is nearby (♥ FRIEND face)
     // --- new moods for the full pwnagotchi machine ---
-    MoodBored, // several quiet epochs
-    MoodSleep, // a long quiet stretch, drifting off
-    MoodSad, // no friends AND no catches for a long time
-    MoodMotivated, // actively racking up APs this epoch
-    MoodSmart, // a flood of APs this epoch
-    MoodHappy, // just grabbed a handshake
-    MoodCool, // handshake streak this epoch
+    MoodBored, // inactive_for >= bored_num_epochs (BORED face)
+    MoodSleep, // inactive_for >= 2*sad_num_epochs, drifting off (SLEEP face)
+    MoodSad, // inactive_for >= sad_num_epochs (SAD face)
+    MoodMotivated, // actively racking up APs this epoch (MOTIVATED face)
+    MoodSmart, // a flood of APs this epoch (SMART face)
+    MoodHappy, // just grabbed a handshake (HAPPY face)
+    MoodCool, // handshake streak this epoch (COOL face)
+    // --- appended (ordinals stay stable for the wire/save layout) ---
+    MoodGrateful, // a down epoch, but a good friend is around (GRATEFUL face)
+    MoodDemotivated, // a deauth/assoc that missed (DEMOTIVATED face)
 } PersonaMood;
 
 // Persisted-to-SD portion. Fixed layout; bump PERSONA_SAVE_VERSION on change.
@@ -94,6 +97,11 @@ void persona_note_pwnd(Persona* p);
 // Note that an access point was seen this tick. Feeds aps_session and the
 // epoch's activity signal (drives MOTIVATED/SMART).
 void persona_note_ap(Persona* p);
+
+// Note that a deauth/assoc attempt yielded nothing (the target went out of range).
+// Mirrors pwnagotchi Automata._on_miss / view.on_miss: a brief demotivated nudge.
+// Optional to call — the firmware wires it when an interaction misses.
+void persona_note_miss(Persona* p);
 
 // Derived getters.
 Face persona_face(const Persona* p);

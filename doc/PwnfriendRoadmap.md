@@ -29,15 +29,23 @@ Goal: the friend's advertised stats are earned like a real pwnagotchi. Capture i
 - **Handshake / PMKID capture (done)**: the friend passively records WPA handshakes and
   RSN PMKIDs from networks in range and reports each as an earned `PWNFRIEND_PWND`, so
   `pwnd_run`/`pwnd_tot` are now **real captured-handshake counts**, not a social score.
-  Frames are streamed as hex (`PWNFRIEND_HS`) and written to a crackable linktype-105
-  pcap on the Flipper SD (`/ext/apps_data/pwnfriend/handshakes/`).
+  Frames are streamed as self-describing hex (`PWNFRIEND_HS <bssid> <frame>`) into a
+  per-BSSID linktype-105 pcap on the Flipper SD
+  (`/ext/apps_data/pwnfriend/handshakes/<bssid>.pcap`). Each file also carries the ESSID
+  beacon (streamed by `reportAP`), so it is directly crackable with hcxtools/hashcat.
 - **Opt-in deauth (done)**: an optional active deauth to speed a capture. **Off by
   default**, gated behind an explicit per-session opt-in; the `-deauth` flag is only sent
   when the user turns it on, and the friend then advertises `policy.deauth: true`.
+- **GPS-tagged captures (done)** *(Feberis Pro has a GPS)*: the friend logs *where* it saw
+  each AP and caught each handshake, wardriving-style. On a GPS fix the ESP32 tags
+  `PWNFRIEND_AP`/`PWNFRIEND_PWND` with `lat`/`lon` (reading Marauder's `gps_obj`, all under
+  `#ifdef HAS_GPS`), and the Flipper writes a WiGLE-importable
+  `/ext/apps_data/pwnfriend/wardrive.csv`. Same authorization caveat applies to captures;
+  presence/meeting locations are benign.
 
   > ⚠️ Capture and deauth are only for networks you own or are explicitly authorized to
   > test. Both are off by default and gated behind an explicit opt-in. The rest of the
-  > friend (presence, mesh, passive scan) needs none of it. Educational use only.
+  > friend (presence, mesh, passive scan, geotagging) needs none of it. Educational use only.
 
 ### Still remaining
 
@@ -45,14 +53,10 @@ Goal: the friend's advertised stats are earned like a real pwnagotchi. Capture i
   ESP32 firmware the project fully owns (no wrestling Marauder's scan-mode state machine,
   no rebase-on-every-release tax). The Marauder `pwnfriend` command stays as the
   lightweight "just say hi" option for people who only want that.
-- **GPS-tagged captures** *(Feberis Pro has a GPS)*: log *where* the friend met each unit
-  and caught each handshake, wardriving-style. Marauder already does this
-  (`WIFI_SCAN_WAR_DRIVE`, `GpsInterface`, geofences), so the friend can record a little
-  map of its social life and its catches. Same authorization caveat applies to captures;
-  presence/meeting locations are benign.
-- **AI brain**: a real mood/behaviour model driving channel choice and target selection
-  from what it's seeing, instead of the current meeting-count heuristic — the piece that
-  makes it feel like a pwnagotchi rather than a beacon with a face.
+- **AI brain** *(the last big "someday")*: a real mood/behaviour (RL-style) model driving
+  channel choice and target selection from what it's seeing, instead of the current
+  meeting-count heuristic — the piece that makes it feel like a pwnagotchi rather than a
+  beacon with a face.
 - The Flipper `pwnfriend` app remains the companion brain/display: it keeps owning the
   persona and rendering it, and gains richer views for captured handshakes and GPS trails.
 

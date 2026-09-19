@@ -58,6 +58,7 @@ Right after `WiFiScan::RunPwnScan`, add:
 ```cpp
 void WiFiScan::RunPwnfriendScan(uint8_t scan_mode, uint16_t color) {
   (void)scan_mode; (void)color;
+  pwnfriend_obj.beginSession();   // clear per-session capture dedup at REAL start
   startPcap("pwnfriend");
   esp_wifi_init(&cfg2);
   #ifdef HAS_IDF_3
@@ -82,6 +83,12 @@ void WiFiScan::RunPwnfriendScan(uint8_t scan_mode, uint16_t color) {
 
 (Names like `filt`, `cfg2`, `setMac`, `beaconSnifferCallback` come straight from the
 fork's own `RunPwnScan`, so they resolve wherever that does.)
+
+`beginSession()` clears the per-session capture dedup tables (`_n_recon` /
+`_n_pwnd_seen`). It lives here — at real scan start — and **not** in
+`configureFromArgs()`, because the Flipper re-sends the whole `pwnfriend` command every
+~15s to refresh the persona; clearing on each refresh would re-count already-pwnd APs
+and inflate `pwnd_tot` without bound.
 
 ---
 
@@ -161,9 +168,17 @@ insert:
 ```cpp
 if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) &&
     (type == WIFI_PKT_DATA)) {
+  #ifdef HAS_GPS
+    bool pf_fix = gps_obj.getFixStatus();
+    double pf_lat = pf_fix ? atof(gps_obj.getLat().c_str()) : 0.0;
+    double pf_lon = pf_fix ? atof(gps_obj.getLon().c_str()) : 0.0;
+  #else
+    bool pf_fix = false; double pf_lat = 0.0; double pf_lon = 0.0;
+  #endif
   if (pwnfriend_obj.reportHandshake(snifferPacket->payload, len,
                                     snifferPacket->rx_ctrl.rssi,
-                                    snifferPacket->rx_ctrl.channel))
+                                    snifferPacket->rx_ctrl.channel,
+                                    pf_fix, pf_lat, pf_lon))
     buffer_obj.append(snifferPacket, len);
   return;
 }
@@ -172,10 +187,17 @@ if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) &&
 `len` here is still `rx_ctrl.sig_len` (the mgmt path decrements it by 4 only inside the
 `WIFI_PKT_MGMT` block), so DATA frames get their full length. `reportHandshake` detects
 an EAPOL M2 (→ `type:"handshake"`) or an RSN PMKID KDE in M1 (→ `type:"pmkid"`), dedups
-per BSSID for the session, and emits `PWNFRIEND_PWND`. It also streams the full frame to
-the Flipper as `PWNFRIEND_HS <lowercase-hex>` (the Flipper reassembles those into a pcap;
-raw binary would trip the serial CLI's CR/XON handling), and returns true for **any**
-EAPOL frame so the caller also appends it to the on-board pcap if the ESP32 has an SD.
+per BSSID for the session, and emits `PWNFRIEND_PWND` (geotagged with `lat`/`lon` when
+the GPS has a fix). It also streams the full frame to the Flipper as a **self-describing**
+`PWNFRIEND_HS <bssid12hex> <framehex>` line — the BSSID is derived from the frame's DS
+bits and prefixed so the Flipper files the frame under the right per-BSSID pcap without
+depending on a preceding `PWND` (protocol v2; raw binary would trip the serial CLI's
+CR/XON handling, so we stream lowercase hex). It returns true for **any** EAPOL frame so
+the caller also appends it to the on-board pcap if the ESP32 has an SD.
+
+The `gps_obj` reference is only in scope under `#ifdef HAS_GPS` (the callback declares
+`extern GpsInterface gps_obj;` in that same guard), so the GPS reads are guarded to keep
+non-GPS boards building. `atof`/`getLat()`/`getLon()` mirror the fork's own wardrive paths.
 
 ## 6c. `WiFiScan.cpp` — recon non-pwngrid beacons
 
@@ -190,20 +212,35 @@ insert:
 
 ```cpp
 if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) {
+  #ifdef HAS_GPS
+    bool pf_fix = gps_obj.getFixStatus();
+    double pf_lat = pf_fix ? atof(gps_obj.getLat().c_str()) : 0.0;
+    double pf_lon = pf_fix ? atof(gps_obj.getLon().c_str()) : 0.0;
+  #else
+    bool pf_fix = false; double pf_lat = 0.0; double pf_lon = 0.0;
+  #endif
   if (pwnfriend_obj.reportAP(snifferPacket->payload, len,
                              snifferPacket->rx_ctrl.rssi,
-                             snifferPacket->rx_ctrl.channel))
+                             snifferPacket->rx_ctrl.channel,
+                             pf_fix, pf_lat, pf_lon))
     buffer_obj.append(snifferPacket, len);
   return;
 }
 ```
 
 `len` here is already FCS-stripped (`-4`), fine for SSID parsing. `reportAP` dedups each
-non-pwngrid AP into one `PWNFRIEND_AP` line per BSSID and stores it (BSSID + ESSID +
-channel) so the deauth tick and the `PWNFRIEND_PWND` SSID lookup have it. The stored
-channel is also what the `-deauth` opt-in uses: `broadcast()` only deauths recon'd APs
-on the channel it is currently parked on, and only when the persona's `-deauth` flag is
-set (default off). No filter change is needed — `filt` already passes DATA.
+non-pwngrid AP into one `PWNFRIEND_AP` line per BSSID (geotagged with `lat`/`lon` when
+the GPS has a fix) and stores it (BSSID + ESSID + channel) so the deauth tick and the
+`PWNFRIEND_PWND` SSID lookup have it. On the **first** beacon per BSSID it also streams
+that beacon to the Flipper as a `PWNFRIEND_HS <bssid> <framehex>` line, so the per-BSSID
+pcap contains the ESSID-bearing beacon (a mandatory WPA 22000 field) and is actually
+crackable. The stored channel + ESSID are also what the `-deauth` opt-in ("active mode")
+uses: on each throttled burst `broadcast()` walks the recon'd APs on the channel it is
+currently parked on and, for each, sends an **association request** to solicit the AP's
+RSN PMKID (EAPOL M1, no client needed) **and** a **deauth** to force a full 4-way
+handshake — pwnagotchi's `associate` + `deauth` halves (agent.py), gated on the persona's
+`-deauth` flag (default off; passive mode stays listen-only). No filter change is needed —
+`filt` already passes DATA, and both frames go out on `WIFI_IF_AP` from the main loop.
 
 ---
 
@@ -221,6 +258,11 @@ In `CommandLine.cpp`'s command dispatch (next to the `SNIFF_PWN_CMD` handler):
 else if (cmd_args.get(0) == PWNFRIEND_CMD) {
   if (!pwnfriend_obj.configureFromArgs(&cmd_args)) {
     Serial.println(F("PWNFRIEND_ERR bad -id (need 64 hex)"));
+  } else if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) {
+    // Already running: configureFromArgs() already refreshed + rebuilt the persona.
+    // Do NOT StartScan again — that would tear down/re-init WiFi, wipe recon, and
+    // reset the channel hop. The ~15s command re-send is only a live persona update.
+    Serial.println(F("pwnfriend persona updated"));
   } else {
     Serial.print(F("Starting pwnfriend. Stop with "));
     Serial.println(STOPSCAN_CMD);
@@ -229,7 +271,10 @@ else if (cmd_args.get(0) == PWNFRIEND_CMD) {
 }
 ```
 
-Add `#include "Pwnfriend.h"` and `extern Pwnfriend pwnfriend_obj;` at the top of
+The `currentScanMode == WIFI_SCAN_PWNFRIEND` branch is what keeps the recon table, the
+capture dedup, and the channel-hop state alive across the Flipper's 15s command re-sends
+— only the very first `pwnfriend` command starts a scan; later ones just update the
+persona. Add `#include "Pwnfriend.h"` and `extern Pwnfriend pwnfriend_obj;` at the top of
 `CommandLine.cpp` if not already visible.
 
 ---

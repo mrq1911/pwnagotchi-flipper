@@ -48,17 +48,29 @@ class Pwnfriend {
     // Capture path (called from the pwnfriend rx callback on DATA frames).
     // Detects a crackable EAPOL M2 handshake or an RSN PMKID (M1) and, once per
     // BSSID this session, emits a PWNFRIEND_PWND line. Streams every EAPOL frame
-    // to the Flipper as PWNFRIEND_HS <hex> for the pcap. `payload` is the raw
-    // 802.11 frame, `length` is rx_ctrl.sig_len. Returns true if the frame was
-    // EAPOL (so the caller should append it to the pcap too).
-    bool reportHandshake(const uint8_t* payload, int length, int rssi, int channel);
+    // to the Flipper as a self-describing PWNFRIEND_HS <bssid> <hex> line so it
+    // is filed under the right per-BSSID pcap. `payload` is the raw 802.11 frame,
+    // `length` is rx_ctrl.sig_len. `has_fix`/`lat`/`lon` geotag the PWND line when
+    // the GPS has a fix. Returns true if the frame was EAPOL (so the caller should
+    // append it to the on-board pcap too).
+    bool reportHandshake(const uint8_t* payload, int length, int rssi, int channel,
+                         bool has_fix, double lat, double lon);
 
-    // Recon: dedup a non-pwngrid beacon into one PWNFRIEND_AP line per BSSID.
-    // Returns true the first time a BSSID is stored (append the beacon then).
-    bool reportAP(const uint8_t* payload, int length, int rssi, int channel);
+    // Recon: dedup a non-pwngrid beacon into one PWNFRIEND_AP line per BSSID, and
+    // stream that first beacon to the Flipper as a PWNFRIEND_HS line so the pcap
+    // carries the ESSID (a mandatory 22000 field). `has_fix`/`lat`/`lon` geotag
+    // the AP line when the GPS has a fix. Returns true the first time a BSSID is
+    // stored (append the beacon to the on-board pcap then).
+    bool reportAP(const uint8_t* payload, int length, int rssi, int channel,
+                  bool has_fix, double lat, double lon);
 
     // True once a persona has been loaded (so broadcast() has something to send).
     bool ready() const { return _ready; }
+
+    // Clear the per-session capture dedup tables. Called at real scan start
+    // (RunPwnfriendScan), NOT on a persona refresh — so re-sending the pwnfriend
+    // command every 15s doesn't re-count already-pwnd APs and inflate pwnd_tot.
+    void beginSession() { _n_recon = 0; _n_pwnd_seen = 0; }
 
     void reset();
 
@@ -86,8 +98,9 @@ class Pwnfriend {
     bool     _ready;
 
     uint32_t _sent;
+    uint32_t _last_active_ms;  // throttle for the assoc+deauth active burst
 
-    // Per-session capture bookkeeping (cleared in configureFromArgs()).
+    // Per-session capture bookkeeping (cleared in beginSession(), at scan start).
     struct ReconAP { uint8_t bssid[6]; char ssid[33]; uint8_t channel; };
     static const int MAX_RECON = 64;
     static const int MAX_PWND  = 64;
@@ -99,12 +112,18 @@ class Pwnfriend {
     int  reconIndex(const uint8_t* bssid) const;   // -1 if unseen
     bool markPwnd(const uint8_t* bssid);           // true if newly counted
     void emitPwnd(const uint8_t* bssid, const char* ssid,
-                  const char* type, int channel, int rssi);
+                  const char* type, int channel, int rssi,
+                  bool has_fix, double lat, double lon);
     void deauthAP(const uint8_t* bssid);
-    // Emit one PWNFRIEND_HS <lowercase-hex> line for a raw 802.11 frame. The
-    // Flipper reassembles these into a pcap (raw binary would trip the CLI's
-    // CR/XON handling, so we stream hex).
-    void streamFrameHex(const uint8_t* frame, int length);
+    // Send a WPA2 association request to a target AP to solicit its RSN PMKID
+    // (EAPOL M1) — pwnagotchi's associate() half, no client needed. Only fired
+    // in active mode (the -deauth opt-in), same as deauthAP.
+    void assocAP(const uint8_t* bssid, const char* ssid);
+    // Emit one self-describing "PWNFRIEND_HS <bssid12hex> <framehex>" line for a
+    // raw 802.11 frame. The Flipper files the frame under <bssid>.pcap by parsing
+    // this line alone (no dependence on a preceding PWND). Raw binary would trip
+    // the CLI's CR/XON handling, so we stream lowercase hex.
+    void streamFrameHex(const uint8_t* bssid, const uint8_t* frame, int length);
 };
 
 // Map a face index (matching flipagotchi's enum PwnagotchiFace) to a glyph.

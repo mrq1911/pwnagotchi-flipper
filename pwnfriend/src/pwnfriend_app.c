@@ -15,6 +15,7 @@
 #include "../include/pwnagotchi.h"
 #include "../include/consent.h"
 #include "../include/pcap.h"
+#include "../include/wardrive.h"
 
 typedef enum {
     WorkerEventStop = (1 << 0),
@@ -22,6 +23,11 @@ typedef enum {
 } WorkerEventFlags;
 
 #define WORKER_EVENTS_MASK (WorkerEventStop | WorkerEventRx)
+
+// Distinct BSSIDs whose capture we've already counted this app session. Caps the
+// per-session pwnd dedup table; a re-emitted PWNFRIEND_PWND (the Flipper re-sends
+// the whole command every 15s) is then idempotent and can't inflate pwnd_run/tot.
+#define PWND_SEEN_MAX 64
 
 // Capture escalation, default off. Cycled with Up; leaving Off the first time
 // needs the one-time consent acknowledgement. Passive = record handshakes the
@@ -45,6 +51,16 @@ typedef struct {
     CaptureMode capture_mode; // OFF by default; the deauth/capture gate
     bool consent_given; // cached consent_is_given() — capture UI is locked until true
     bool showing_consent; // modal: the one-time authorization acknowledgement
+
+    // Per-session capture dedup: 12-hex (no-colon) BSSIDs we've already counted.
+    char pwnd_seen[PWND_SEEN_MAX][13];
+    uint8_t pwnd_seen_count;
+
+    // GPS: set once the firmware reports any lat/lon (geotag seen). last_lat/lon
+    // are verbatim decimal-degree strings from the most recent fix, for the badge.
+    bool gps_seen;
+    char last_lat[16];
+    char last_lon[16];
 } PwnfriendModel;
 
 typedef struct {
@@ -59,10 +75,9 @@ typedef struct {
     Storage* storage; // for the handshake pcap writer
 
     // Line assembly — touched only by the worker thread. Sized to hold a whole
-    // hex-encoded EAPOL frame line (PWNFRIEND_HS <~600 hex>), not just JSON.
+    // hex-encoded EAPOL frame line (PWNFRIEND_HS <bssid> <~600 hex>), not just JSON.
     char line[1024];
     size_t line_len;
-    char hs_name[33]; // fs-safe name of the current capture target (worker-only)
     bool got_new_friend; // set by worker, consumed for a notification blink
     bool got_pwnd; // set by worker, consumed for the capture blink
 } PwnfriendApp;
@@ -165,6 +180,26 @@ static bool line_extract_int(const char* s, const char* key, int* out) {
     return true;
 }
 
+// Copy the numeric token after `key` verbatim (sign/digits/dot/exponent) into out.
+// We never parse lat/lon to a float — the Flipper printf has %f disabled — so the
+// firmware's decimal-degree text is passed straight through to the wardrive CSV.
+static bool line_extract_number(const char* s, const char* key, char* out, size_t out_sz) {
+    const char* pos = strstr(s, key);
+    if(!pos) return false;
+    pos += strlen(key);
+    size_t i = 0;
+    while(*pos && i < out_sz - 1) {
+        char c = *pos;
+        bool numeric = (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' ||
+                       c == 'e' || c == 'E';
+        if(!numeric) break;
+        out[i++] = c;
+        pos++;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
 static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
     char name[PEER_NAME_MAX] = {0};
     char identity[PEER_ID_MAX] = {0};
@@ -206,20 +241,6 @@ static void pwnfriend_handle_adv_line(PwnfriendApp* app, const char* line) {
         true);
 }
 
-// Derive a filesystem-safe capture name from an ssid (or bssid fallback):
-// keep [A-Za-z0-9._-], map everything else to '_', truncate. Empty -> "capture".
-static void pwnfriend_fs_safe_name(char* out, size_t out_sz, const char* in) {
-    size_t n = 0;
-    for(const char* c = in; *c && n < out_sz - 1; c++) {
-        char ch = *c;
-        bool keep = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-                    (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
-        out[n++] = keep ? ch : '_';
-    }
-    out[n] = '\0';
-    if(n == 0) strncpy(out, "capture", out_sz - 1);
-}
-
 static int hexval(char c) {
     if(c >= '0' && c <= '9') return c - '0';
     if(c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -227,10 +248,38 @@ static int hexval(char c) {
     return -1;
 }
 
+// Normalise a bssid to a 12-char lowercase-hex key (colons dropped). Non-hex is
+// skipped, so both "aa:bb:cc:dd:ee:ff" and "aabbccddeeff" collapse to one key.
+static void bssid_key(char out[13], const char* in) {
+    size_t n = 0;
+    for(const char* c = in; *c && n < 12; c++) {
+        if(hexval(*c) < 0) continue;
+        out[n++] = (*c >= 'A' && *c <= 'F') ? (char)(*c + 32) : *c;
+    }
+    out[n] = '\0';
+}
+
+// Insert a bssid key into the per-session pwnd dedup set. Returns true only on the
+// first sight of that bssid (so persona_note_pwnd fires once). When the table is
+// full, returns false — mirrors the firmware's markPwnd cap so counts can't run away.
+static bool pwnd_seen_insert(PwnfriendModel* model, const char* key) {
+    if(!key[0]) return false;
+    for(uint8_t i = 0; i < model->pwnd_seen_count; i++) {
+        if(strcmp(model->pwnd_seen[i], key) == 0) return false;
+    }
+    if(model->pwnd_seen_count >= PWND_SEEN_MAX) return false;
+    strncpy(model->pwnd_seen[model->pwnd_seen_count], key, 12);
+    model->pwnd_seen[model->pwnd_seen_count][12] = '\0';
+    model->pwnd_seen_count++;
+    return true;
+}
+
 static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
     char bssid[18] = {0};
     char ssid[33] = {0};
     char type[12] = {0};
+    char lat[16] = {0};
+    char lon[16] = {0};
     int channel = 0, rssi = 0;
 
     line_extract_str(line, "\"bssid\":\"", bssid, sizeof(bssid));
@@ -238,11 +287,13 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
     line_extract_str(line, "\"type\":\"", type, sizeof(type));
     line_extract_int(line, "\"channel\":", &channel);
     line_extract_int(line, "\"rssi\":", &rssi);
+    // lat/lon are present only when the GPS had a fix (contract v2); both or neither.
+    bool have_gps = line_extract_number(line, "\"lat\":", lat, sizeof(lat)) &&
+                    line_extract_number(line, "\"lon\":", lon, sizeof(lon));
 
     const char* label = ssid[0] ? ssid : bssid;
-    // Remember the fs-safe target name for the PWNFRIEND_HS frames that follow
-    // (worker thread only, so no lock needed).
-    pwnfriend_fs_safe_name(app->hs_name, sizeof(app->hs_name), label);
+    char key[13];
+    bssid_key(key, bssid);
 
     bool counted = false;
     with_view_model(
@@ -250,15 +301,29 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
         PwnfriendModel * model,
         {
             // Gate the earned count behind the consent + capture opt-in: without
-            // it we ignore whatever the firmware happens to report.
-            if(model->capture_mode != CaptureOff) {
+            // it we ignore whatever the firmware happens to report. Dedup by BSSID
+            // across the session so a re-emitted PWND (every 15s) counts only once.
+            if(model->capture_mode != CaptureOff && pwnd_seen_insert(model, key)) {
                 persona_note_pwnd(model->persona);
                 strncpy(model->last_pwnd_ssid, label, sizeof(model->last_pwnd_ssid) - 1);
                 model->last_pwnd_ssid[sizeof(model->last_pwnd_ssid) - 1] = '\0';
                 counted = true;
             }
+            if(have_gps) {
+                model->gps_seen = true;
+                strncpy(model->last_lat, lat, sizeof(model->last_lat) - 1);
+                model->last_lat[sizeof(model->last_lat) - 1] = '\0';
+                strncpy(model->last_lon, lon, sizeof(model->last_lon) - 1);
+                model->last_lon[sizeof(model->last_lon) - 1] = '\0';
+            }
         },
         true);
+
+    // A captured handshake implies WPA/WPA2-PSK; log it (once) as a geotagged row.
+    if(have_gps && counted) {
+        wardrive_log(
+            app->storage, bssid, ssid, "[WPA2-PSK-CCMP][ESS]", channel, rssi, lat, lon);
+    }
 
     if(counted) app->got_pwnd = true; // capture blink
 }
@@ -266,20 +331,58 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
 static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
     char bssid[18] = {0};
     char ssid[33] = {0};
+    char lat[16] = {0};
+    char lon[16] = {0};
     int channel = 0, rssi = 0;
 
     line_extract_str(line, "\"bssid\":\"", bssid, sizeof(bssid));
     line_extract_str(line, "\"ssid\":\"", ssid, sizeof(ssid));
     line_extract_int(line, "\"channel\":", &channel);
     line_extract_int(line, "\"rssi\":", &rssi);
+    bool have_gps = line_extract_number(line, "\"lat\":", lat, sizeof(lat)) &&
+                    line_extract_number(line, "\"lon\":", lon, sizeof(lon));
 
     with_view_model(
-        app->view, PwnfriendModel * model, { persona_note_ap(model->persona); }, true);
+        app->view,
+        PwnfriendModel * model,
+        {
+            persona_note_ap(model->persona);
+            if(have_gps) {
+                model->gps_seen = true;
+                strncpy(model->last_lat, lat, sizeof(model->last_lat) - 1);
+                model->last_lat[sizeof(model->last_lat) - 1] = '\0';
+                strncpy(model->last_lon, lon, sizeof(model->last_lon) - 1);
+                model->last_lon[sizeof(model->last_lon) - 1] = '\0';
+            }
+        },
+        true);
+
+    // The firmware emits one PWNFRIEND_AP per BSSID per session, so this is one
+    // geotagged wardrive row per network. Encryption is unknown from a beacon here.
+    if(have_gps) {
+        wardrive_log(app->storage, bssid, ssid, "[ESS]", channel, rssi, lat, lon);
+    }
 }
 
 static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
-    // line = "PWNFRIEND_HS <lowercase-hex-of-the-full-802.11-frame>"
+    // Contract v2, self-describing:
+    //   line = "PWNFRIEND_HS <bssid12hex> <lowercase-hex-of-the-full-802.11-frame>"
+    // The bssid on THIS line names the per-target pcap, so a beacon (streamed by
+    // reportAP) and its EAPOL frames land in the same <bssid>.pcap without relying
+    // on a preceding PWND — that's what makes the file ESSID-bearing and crackable.
     const char* p = line + 13; // past "PWNFRIEND_HS "
+
+    // Parse exactly 12 hex chars for the bssid, then require the space separator.
+    char bssid[13];
+    size_t bi = 0;
+    while(*p && *p != ' ' && bi < sizeof(bssid) - 1) {
+        if(hexval(*p) < 0) return; // malformed bssid -> drop the line
+        bssid[bi++] = (*p >= 'A' && *p <= 'F') ? (char)(*p + 32) : *p;
+        p++;
+    }
+    bssid[bi] = '\0';
+    if(bi != 12 || *p != ' ') return; // need 12 hex chars then a single space
+    p++; // step past the separator to the frame hex
 
     // Only record if capture is opted in; otherwise silently drop the frame.
     bool record = false;
@@ -299,7 +402,9 @@ static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
         p += 2;
     }
     if(flen == 0) return;
-    pcap_append_frame(app->storage, app->hs_name, frame, (uint16_t)flen);
+
+    // bssid is already fs-safe (12 lowercase hex), so it's the pcap filename.
+    pcap_append_frame(app->storage, bssid, frame, (uint16_t)flen);
 }
 
 static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
@@ -429,6 +534,16 @@ static void pwnfriend_draw_capture_badge(Canvas* canvas, CaptureMode mode) {
     }
 }
 
+// A tiny "gps" tag on the bottom line once any geotag has been seen, sitting left
+// of the mode/capture tag so it never collides with the PWND readout or the badge.
+static void pwnfriend_draw_gps_tag(Canvas* canvas, const PwnfriendModel* model) {
+    if(!model->gps_seen) return;
+    canvas_set_font(canvas, FontSecondary);
+    const char* tag = "gps";
+    int w = canvas_string_width(canvas, tag);
+    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - w - 28, 63, tag);
+}
+
 static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
     PwnfriendModel* model = ctx;
     canvas_clear(canvas);
@@ -438,6 +553,7 @@ static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
     }
     pwnfriend_populate(model);
     pwnagotchi_draw_all(model->pwn, canvas);
+    pwnfriend_draw_gps_tag(canvas, model);
     pwnfriend_draw_capture_badge(canvas, model->capture_mode);
 }
 
@@ -659,6 +775,10 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->consent_given = consent_is_given();
             model->showing_consent = false;
             model->last_pwnd_ssid[0] = '\0';
+            model->pwnd_seen_count = 0;
+            model->gps_seen = false;
+            model->last_lat[0] = '\0';
+            model->last_lon[0] = '\0';
         },
         true);
 

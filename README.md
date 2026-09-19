@@ -29,12 +29,17 @@ See [`pwnfriend/README.md`](pwnfriend/README.md), the Marauder patch in
 
 ### Full pwnagotchi mode
 
-Beyond just saying hi, the friend can now behave like a real pwnagotchi: it scans APs,
-passively captures WPA handshakes / PMKIDs, saves them as crackable `.pcap` files on the
-Flipper SD (`/ext/apps_data/pwnfriend/handshakes/`, linktype 105 — aircrack-ng /
-hcxtools / Wireshark read them directly), earns **real** pwnd from each capture, and
-reacts with pwnagotchi moods and faces. There's an optional active deauth to speed a
-capture along.
+Beyond just saying hi, the friend can now behave like a real pwnagotchi:
+
+- **scans** APs and passively **captures** WPA handshakes / PMKIDs → earns **real** pwnd,
+  and reacts with pwnagotchi moods and faces.
+- **saves a crackable `.pcap` per network** on the Flipper SD
+  (`/ext/apps_data/pwnfriend/handshakes/<bssid>.pcap`, linktype 105). Each file now carries
+  the network's ESSID beacon plus its EAPOL/PMKID frames → feed it straight to hcxtools /
+  hashcat (mode 22000) / aircrack-ng, no manual ESSID needed.
+- **geotags** every sighting when a GPS is present (Feberis Pro) and writes a
+  **WiGLE-importable** wardrive log (`/ext/apps_data/pwnfriend/wardrive.csv`).
+- optional active **deauth** to speed a capture along.
 
 > **⚠️ Authorized use only.** Handshake/PMKID capture and deauth are only legal on Wi-Fi
 > networks you **own or are explicitly authorized to test**. Both are **off by default**

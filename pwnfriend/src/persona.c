@@ -14,29 +14,37 @@
 // app exists to prevent on the pwnagotchi is one we let our own friend show too.
 #define LONELY_AFTER_SECS 45
 
-// One "epoch" ~ a recon window. The mood machine evaluates activity per epoch.
-// pwnagotchi counts epochs in recon sweeps; here an epoch is a fixed 30 s window,
-// so its bored/sad/excited "num_epochs" thresholds scale down proportionately.
-#define PERSONA_EPOCH_SECS 30
+// One "epoch" == one recon window. Upstream personality.recon_time = 30 s, so we
+// use the same wall-time per epoch: "num_epochs" here means the same as upstream.
+#define PERSONA_EPOCH_SECS 30 // personality.recon_time
 
-// Per-epoch activity thresholds (APs seen inside one epoch).
+// max_inactive_scale / recon_inactive_multiplier: agent.recon() doubles recon_time
+// once inactive_for >= max_inactive_scale, so the friend slows its scanning when
+// nothing is happening. We mirror that by stretching the epoch window the same way,
+// which scales the wall-time onset of boredom/sadness exactly like upstream.
+#define PERSONA_MAX_INACTIVE_SCALE 2 // personality.max_inactive_scale
+#define PERSONA_RECON_INACTIVE_MULT 2 // personality.recon_inactive_multiplier
+
+// Per-epoch activity thresholds (APs seen inside one epoch). Upstream's activity is
+// "did we deauth/assoc/handshake this epoch"; we proxy it with per-epoch AP volume
+// (min_rssi filtering stays in firmware, out of the brain).
 #define PERSONA_EPOCH_ACTIVE_APS 4 // >= this -> the epoch counts as "active"
 #define PERSONA_SMART_APS 8 // a flood this epoch -> SMART face
 
-// Consecutive-epoch thresholds (mirrors pwnagotchi bored/sad/excited_num_epochs).
-#define PERSONA_EXCITED_EPOCHS 3 // consecutive active epochs -> EXCITED
-#define PERSONA_BORED_EPOCHS 4 // consecutive quiet epochs   -> BORED  (~2 min)
-#define PERSONA_SLEEP_EPOCHS 8 // ... even longer            -> SLEEP  (~4 min)
-#define PERSONA_SAD_EPOCHS 6 // quiet AND catch-less       -> SAD
+// Consecutive-epoch thresholds (real pwnagotchi defaults.toml values).
+#define PERSONA_EXCITED_EPOCHS 10 // active_for >= excited_num_epochs -> EXCITED
+#define PERSONA_BORED_EPOCHS 15 // inactive_for >= bored_num_epochs -> BORED
+#define PERSONA_SAD_EPOCHS 25 // inactive_for >= sad_num_epochs   -> SAD
+#define PERSONA_SLEEP_EPOCHS (PERSONA_SAD_EPOCHS * 2) // 2x sad (automata's escalation) -> SLEEP
 
 // Handshake streak inside one epoch that earns the COOL face.
 #define PERSONA_COOL_STREAK 4
 
 // Time-based feels (seconds).
 #define PERSONA_CURIOUS_SECS 15 // a peer this recently -> curious
-#define PERSONA_SAD_SECS 180 // no catch this long feeds the gloom
 #define PERSONA_PWND_REACT_SECS 8 // hold the capture (happy/cool/excited) face
 #define PERSONA_PEER_REACT_SECS 6 // hold the "new friend!" excited face
+#define PERSONA_MISS_REACT_SECS 4 // hold the "missed!" demotivated face
 
 static uint64_t persona_now_unix(void) {
     DateTime dt;
@@ -122,8 +130,19 @@ bool persona_save(Persona* p) {
     return ok;
 }
 
+// Current epoch length in seconds. Upstream agent.recon() doubles recon_time once
+// inactive_for >= max_inactive_scale; we stretch the epoch window identically so
+// the wall-time onset of boredom/sadness scales the same way it does upstream.
+static uint32_t persona_epoch_len(const Persona* p) {
+    if(p->inactive_epochs >= PERSONA_MAX_INACTIVE_SCALE)
+        return PERSONA_EPOCH_SECS * PERSONA_RECON_INACTIVE_MULT;
+    return PERSONA_EPOCH_SECS;
+}
+
 // Close out the current epoch: classify it, roll the active/inactive streaks,
-// and reset the per-epoch tallies. Mirrors pwnagotchi's epoch bookkeeping.
+// and reset the per-epoch tallies. Mirrors pwnagotchi Epoch.next(): an epoch is
+// "active" iff there was any activity OR a handshake, and inactive/active_for are
+// the consecutive streaks the mood machine reads.
 static void persona_end_epoch(Persona* p) {
     p->epoch++;
     p->s.epochs_tot++;
@@ -143,33 +162,42 @@ static void persona_end_epoch(Persona* p) {
     p->hs_this_epoch = 0;
 }
 
-// The steady-state mood when no transient reaction is being held. Priority order
-// is chosen so a real signal (friend, live activity) always beats a slow decay.
+// The steady-state mood when no transient reaction is being held. Mirrors the
+// dispatch in Automata.next_epoch(): the activity streak (active/inactive_for)
+// drives excited/bored/sad, and a good friend around turns any down epoch grateful
+// (upstream set_bored/set_sad/set_lonely all defer to set_grateful when the support
+// network is strong enough).
 static PersonaMood persona_baseline_mood(const Persona* p) {
-    // A good friend in range always wins.
-    if(p->friend_near) return MoodBonded;
+    // The automata activity/social droughts. sad supersedes bored, both pure
+    // inactivity (Epoch.next); sleep is our friendlier stand-in for automata's
+    // set_angry escalation at inactive_for >= 2*sad_num_epochs.
+    bool sleepy = (p->inactive_epochs >= PERSONA_SLEEP_EPOCHS);
+    bool sad = (p->inactive_epochs >= PERSONA_SAD_EPOCHS);
+    bool bored = (p->inactive_epochs >= PERSONA_BORED_EPOCHS);
+    bool lonely = (p->secs_since_peer >= LONELY_AFTER_SECS);
+    bool down = sleepy || sad || bored || lonely;
 
-    bool no_peers = (p->secs_since_peer >= LONELY_AFTER_SECS);
+    // A good friend in range always wins: grateful on a bad day (the support-network
+    // override), bonded otherwise (on_new_peer picks the FRIEND face for a bond).
+    if(p->friend_near) return down ? MoodGrateful : MoodBonded;
 
-    // Live activity this very epoch reacts fastest.
+    // Live activity this very epoch reacts fastest (per-epoch AP volume + the
+    // sustained excited from active_for >= excited_num_epochs).
     if(p->aps_this_epoch >= PERSONA_SMART_APS) return MoodSmart;
     if(p->active_epochs >= PERSONA_EXCITED_EPOCHS) return MoodExcited;
     if(p->aps_this_epoch >= PERSONA_EPOCH_ACTIVE_APS) return MoodMotivated;
 
-    // A unit just visited -> curious (still social; beats the gloom onset).
+    // A unit just dropped by -> curious (on_new_peer for a returning unit).
     if(p->secs_since_peer < PERSONA_CURIOUS_SECS) return MoodCurious;
 
-    // Long drought of BOTH friends and catches -> sad; friends-only drought -> lonely.
-    if(no_peers && p->secs_since_pwnd >= PERSONA_SAD_SECS &&
-       p->inactive_epochs >= PERSONA_SAD_EPOCHS)
-        return MoodSad;
-    if(no_peers) return MoodLonely;
+    // The slow decay: sleep (deep) > sad > bored are pure inactivity; then our
+    // social 'lonely' drought (no peers heard for a while).
+    if(sleepy) return MoodSleep;
+    if(sad) return MoodSad;
+    if(bored) return MoodBored;
+    if(lonely) return MoodLonely;
 
-    // Quiet but not lonely -> bored, then drifting to sleep.
-    if(p->inactive_epochs >= PERSONA_SLEEP_EPOCHS) return MoodSleep;
-    if(p->inactive_epochs >= PERSONA_BORED_EPOCHS) return MoodBored;
-
-    return MoodContent; // awake / idle
+    return MoodContent; // awake / normal (on_normal)
 }
 
 void persona_tick(Persona* p, uint32_t dt) {
@@ -179,8 +207,10 @@ void persona_tick(Persona* p, uint32_t dt) {
     p->secs_since_pwnd += dt;
     p->secs_in_epoch += dt;
 
-    // Epoch boundary: score the window and roll the streak counters.
-    if(p->secs_in_epoch >= PERSONA_EPOCH_SECS) {
+    // Epoch boundary: score the window and roll the streak counters. The window
+    // stretches while inactive (persona_epoch_len), mirroring agent.recon()'s
+    // recon_time doubling.
+    if(p->secs_in_epoch >= persona_epoch_len(p)) {
         p->secs_in_epoch = 0;
         persona_end_epoch(p);
     }
@@ -237,6 +267,14 @@ void persona_note_ap(Persona* p) {
     // so MOTIVATED/SMART surface within a second without flicker.
 }
 
+void persona_note_miss(Persona* p) {
+    // Automata._on_miss -> view.on_miss: an interaction that hit nothing. Upstream
+    // flashes a face + "Missed!"; we hold a short DEMOTIVATED nudge, then settle back.
+    // (We don't model max_misses_for_recon -> stale -> lonely/angry; kept simple.)
+    p->mood = MoodDemotivated;
+    p->mood_lock_secs = PERSONA_MISS_REACT_SECS;
+}
+
 Face persona_face(const Persona* p) {
     switch(p->mood) {
     case MoodLonely:
@@ -263,6 +301,10 @@ Face persona_face(const Persona* p) {
         return FaceHappy;
     case MoodCool:
         return FaceCool;
+    case MoodGrateful:
+        return FaceGrateful;
+    case MoodDemotivated:
+        return FaceDemotivated;
     default:
         return FaceAwake;
     }
@@ -284,32 +326,39 @@ uint32_t persona_level(const Persona* p) {
     return level;
 }
 
+// One representative line per mood, taken from pwnagotchi's voice.py (upstream
+// random-picks from a list; we keep the shortest faithful pick for the Flipper's
+// message area). The mapping follows view.py's face<->voice pairing.
 const char* persona_mood_label(const Persona* p) {
     switch(p->mood) {
     case MoodLonely:
-        return "lonely...";
+        return "I feel so alone ..."; // voice.on_lonely
     case MoodContent:
-        return "hack the planet";
+        return "Hack the Planet!"; // voice.on_starting (on_normal is just "...")
     case MoodCurious:
-        return "curious";
+        return "Unit is nearby!"; // voice.on_new_peer (returning unit)
     case MoodExcited:
-        return "living the life!";
+        return "I'm living the life!"; // voice.on_excited
     case MoodBonded:
-        return "<3 buddy";
+        return "I love my friends!"; // voice.on_grateful (a bond in range)
     case MoodBored:
-        return "bored...";
+        return "I'm bored ..."; // voice.on_bored
     case MoodSleep:
-        return "zzz...";
+        return "Zzzzz"; // voice.on_napping
     case MoodSad:
-        return "so alone :(";
+        return "I'm very sad ..."; // voice.on_sad
     case MoodMotivated:
-        return "on the hunt!";
+        return "Best day of my life!"; // voice.on_motivated
     case MoodSmart:
-        return "so many APs!";
+        return "So many networks!!!"; // voice.on_excited
     case MoodHappy:
-        return "got a handshake!";
+        return "Cool, got a handshake!"; // voice.on_handshakes
     case MoodCool:
-        return "on a streak!";
+        return "I pwn therefore I am."; // voice.on_excited (streak swagger)
+    case MoodGrateful:
+        return "Good friends are a blessing!"; // voice.on_grateful
+    case MoodDemotivated:
+        return "Shitty day :/"; // voice.on_demotivated (a miss)
     default:
         return "";
     }

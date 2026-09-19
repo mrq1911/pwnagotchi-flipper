@@ -161,38 +161,54 @@ In full pwnagotchi mode the ESP32 also scans APs and captures handshakes, and re
 those with three more events.
 
 An access point seen while scanning (drives the on-screen **APS** count and the pool of
-capturable targets), deduped per BSSID:
+capturable targets), deduped per BSSID. `lat`/`lon` are appended only when the GPS has a
+fix — see [§5 GPS geotagging](#5-gps-geotagging--wardrive-log):
 
 ```
-PWNFRIEND_AP {"bssid":"aa:bb:cc:dd:ee:ff","ssid":"NAME","channel":6,"rssi":-61}
+PWNFRIEND_AP {"bssid":"aa:bb:cc:dd:ee:ff","ssid":"NAME","channel":6,"rssi":-61[,"lat":48.208,"lon":16.373]}
 ```
+
+For the first beacon of each BSSID, `reportAP()` **also** streams that beacon as a
+`PWNFRIEND_HS` line (below). That is what puts the ESSID-bearing beacon into the network's
+pcap and makes it actually crackable.
 
 A captured handshake / PMKID — the friend's **earned pwnd**, deduped per BSSID per
-session:
+session; `lat`/`lon` again appended only on a GPS fix:
 
 ```
-PWNFRIEND_PWND {"bssid":"aa:bb:cc:dd:ee:ff","ssid":"NAME","type":"handshake","channel":6,"rssi":-61}
+PWNFRIEND_PWND {"bssid":"aa:bb:cc:dd:ee:ff","ssid":"NAME","type":"handshake","channel":6,"rssi":-61[,"lat":48.208,"lon":16.373]}
 ```
 
 `type` is `handshake` for an EAPOL M2, or `pmkid` for an RSN PMKID from M1. `ssid` is
 sanitized the same way as `PWNFRIEND_PEER` names and may be `""` for a hidden AP. The
-Flipper de-dupes AP lines by `bssid` and pwnd lines by `bssid`+`type`, so a re-heard
-handshake never double-counts and the `-pt`/`-pr` counts fed back stay honest.
+Flipper de-dupes both AP and capture lines by `bssid` across the whole app session, so the
+command being re-sent every ~15 s never double-counts a network and the `-pt`/`-pr` counts
+fed back stay honest.
 
-The raw 802.11 frame behind each capture, for the crackable pcap — one frame per line,
-lowercase hex of the full frame:
+The raw 802.11 frame behind each capture (and the first beacon per BSSID), for the
+crackable pcap — one frame per line, **self-describing**: the BSSID as 12 lowercase hex
+chars with no colons, a space, then the full frame as lowercase hex:
 
 ```
-PWNFRIEND_HS <lowercase-hex-of-the-full-802.11-frame>
+PWNFRIEND_HS <bssid12hex> <lowercase-hex-of-the-full-802.11-frame>
 ```
+
+e.g. `PWNFRIEND_HS aabbccddeeff 8000000000...`. The Flipper files the frame into
+`<bssid>.pcap` by parsing the BSSID on **this** line — it no longer depends on a preceding
+`PWNFRIEND_PWND` to know the target. This matters because most EAPOL frames (M1/M3/M4 and
+PMKID) never produce a `PWND`, and lines from the rx-callback can arrive out of order; a
+self-describing HS line can't be misfiled under the wrong (or the default) pcap.
 
 Hex, not raw binary, because the Flipper CLI UART mangles raw CR / XON / XOFF bytes; hex
-is line-safe and self-synchronising on the `\n` boundary. Only EAPOL / PMKID frames are
-streamed (never beacons/data), so a line stays small. See
+is line-safe and self-synchronising on the `\n` boundary. Only beacons (one per BSSID) and
+EAPOL / PMKID frames are streamed (never bulk data), so a line stays small. See
 [§4 Safety & authorization](#4-safety--authorization) for the pcap format and location.
 
 Lines are `\n`-terminated. Any line not starting with `PWNFRIEND_` is ordinary Marauder
-output and the app ignores it.
+output and the app ignores it. **Each `PWNFRIEND_*` line is emitted as one atomic
+`Serial.write`** of a fully built buffer (line + trailing `\n`): the WiFi rx-callback task
+and the main loop both print, and a byte-at-a-time write would let their lines interleave
+and garble.
 
 ---
 
@@ -239,13 +255,53 @@ a beacon and listens. Capture and deauth are **opt-in and off by default on both
 Frames streamed via `PWNFRIEND_HS` are hex-decoded on the Flipper and appended to a
 standard libpcap file — **linktype 105 (LINKTYPE_IEEE802_11**, bare 802.11, matching
 Marauder's own pcap byte-for-byte), so aircrack-ng, `hcxpcapngtool` and Wireshark read it
-directly. Captures are written to the Flipper SD under:
+directly. There is **one pcap per network, named by BSSID**, on the Flipper SD:
 
 ```
-/ext/apps_data/pwnfriend/handshakes/
+/ext/apps_data/pwnfriend/handshakes/<bssid>.pcap
 ```
 
-Each file grows a global header once, then one 16-byte record header + frame per captured
-EAPOL/PMKID frame; the file stays valid even if the board is yanked mid-capture. The SSID
-a cracker needs is carried alongside in the matching `PWNFRIEND_PWND` line (and can be fed
-to `aircrack-ng -e` / `hcxpcapngtool` if not embedded).
+Because `reportAP()` streams the first beacon of each BSSID and every capture's
+`PWNFRIEND_HS` line carries its own BSSID, each file holds that network's ESSID-bearing
+beacon **plus** its EAPOL/PMKID frames. That makes it directly crackable — feed it to
+`hcxpcapngtool` → hashcat mode 22000 (or aircrack-ng) with no manual `-e`/ESSID needed,
+because the ESSID is a mandatory 22000 field and now lives in the file.
+
+Each file grows a 24-byte global header once, then one 16-byte record header + frame per
+captured frame; the file stays valid even if the board is yanked mid-capture.
+
+---
+
+## 5. GPS geotagging & wardrive log
+
+Boards with a GPS (the **Feberis Pro**) geotag what they see. The ESP32 reads Marauder's
+global `gps_obj` and, **only when it reports a fix**, appends `lat`/`lon` (decimal-degree
+floats) to the JSON of each `PWNFRIEND_AP` and `PWNFRIEND_PWND` line:
+
+```
+PWNFRIEND_AP   {"bssid":"aa:bb:cc:dd:ee:ff","ssid":"NAME","channel":6,"rssi":-61,"lat":48.208,"lon":16.373}
+PWNFRIEND_PWND {"bssid":"aa:bb:cc:dd:ee:ff","ssid":"NAME","type":"handshake","channel":6,"rssi":-61,"lat":48.208,"lon":16.373}
+```
+
+With **no fix, both keys are omitted entirely** — never sent as `0` or `null`. All GPS
+reads are wrapped in `#ifdef HAS_GPS`, so non-GPS boards (the Wi-Fi Dev Board) build
+unchanged and simply never emit `lat`/`lon`.
+
+The Flipper turns every geotagged line into a **WiGLE-importable** wardrive CSV on its SD:
+
+```
+/ext/apps_data/pwnfriend/wardrive.csv
+```
+
+A WiGLE pre-header line, then the column header, then one `WIFI` row per geotagged AP (and
+optionally per capture). Rows without lat/lon are **skipped** — only geotagged sightings
+are logged:
+
+```
+WigleWifi-1.4,appRelease=pwnfriend,model=flipper,release=1.0,device=pwnfriend,display=,board=esp32,brand=marauder
+MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type
+aa:bb:cc:dd:ee:ff,NAME,[WPA2],2026-09-19 12:00:00,6,-61,48.208,16.373,140.0,5.0,WIFI
+```
+
+Import it straight into wigle.net. The capture authorization caveat in §4 applies to any
+handshake rows; plain AP/meeting locations are benign presence data.

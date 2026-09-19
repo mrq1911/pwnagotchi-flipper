@@ -40,9 +40,12 @@ pwnagotchi:
 
 - **scans** the APs around it (each one drives the on-screen APS count),
 - passively **captures** WPA handshakes / PMKIDs from networks in range,
-- saves them as crackable `.pcap` files on the Flipper SD
-  (`/ext/apps_data/pwnfriend/handshakes/`, linktype 105 — open them straight in
-  aircrack-ng / hcxtools / Wireshark),
+- saves a **crackable `.pcap` per network** on the Flipper SD
+  (`/ext/apps_data/pwnfriend/handshakes/<bssid>.pcap`, linktype 105). Each file bundles the
+  network's ESSID beacon with its EAPOL/PMKID frames, so it opens straight in
+  aircrack-ng / hcxtools (hashcat mode 22000) / Wireshark — no manual ESSID needed,
+- **geotags** every sighting when a GPS is attached (Feberis Pro) and logs a
+  **WiGLE-importable** `wardrive.csv` (`/ext/apps_data/pwnfriend/wardrive.csv`),
 - earns **real** pwnd from each capture, so `pwnd_run`/`pwnd_tot` are earned handshakes
   now, not just units met,
 - and reacts with pwnagotchi **moods / faces** as it works.
