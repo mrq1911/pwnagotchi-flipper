@@ -10,7 +10,6 @@
 #include <math.h>
 
 #include "../include/pwnfriend.h"
-#include "../include/cities.h"
 #include "../include/persona.h"
 #include "../include/peers.h"
 #include "../include/face.h"
@@ -39,6 +38,11 @@ typedef enum {
 // its whole recon list on resume; we key by BSSID so each network counts once).
 #define AP_MAX 256 // browsable AP history (persisted across sessions to aps.bin)
 #define WL_MAX 16 // whitelisted BSSIDs we send to the firmware (matches its MAX_WL)
+
+// "Home" point — the GPS stat shows distance + compass direction to here.
+#define HOME_LAT 50.081148f
+#define HOME_LON 14.451144f
+#define HOME_NAME "Prague"
 
 // Persisted AP table (so you can browse APs/pwns from previous sessions).
 #define AP_DB_PATH "/ext/apps_data/pwnfriend/aps.bin"
@@ -72,7 +76,7 @@ typedef enum {
     StatPageMood = 0, // the pwnagotchi voice line (default)
     StatPageCounts, // "ate N shakes!"
     StatPageSocial, // "met N friends!"
-    StatPageGps, // nearest major city ("Near Prague"); full coords on the Stats screen
+    StatPageGps, // distance+direction to home ("Prague 12km SW"); full coords on the Stats screen
     StatPageCount,
 } StatPage;
 
@@ -142,7 +146,7 @@ typedef struct {
     bool gps_seen;
     char last_lat[16];
     char last_lon[16];
-    char gps_place[32]; // nearest major city, e.g. "Near Prague" (reverse-geocoded offline)
+    char gps_place[32]; // distance+direction to HOME, e.g. "Prague 12km SW"
 
     // ESP32-link watchdog: warn when the board stops answering (unplugged, rear
     // switch off ESP32, wrong firmware). All in tick_secs, written under the lock.
@@ -468,26 +472,30 @@ static float parse_deg(const char* s) {
     return sign * v;
 }
 
-// Reverse-geocode the last GPS fix to the nearest major city (offline, from CITIES[])
-// and format model->gps_place, e.g. "In Prague" / "Near Rio de Janeiro". Cheap: one
-// pass over ~1.2k cities with a cos(lat)-weighted equirectangular distance.
+// Format model->gps_place as distance + 8-point compass direction from the last fix
+// to HOME (e.g. "Prague 12km SW", "Prague 320m NE", "At Prague!"). Single-precision
+// math only (Cortex-M4F builds with -Werror=double-promotion).
 static void pwnfriend_update_place(PwnfriendModel* model) {
     float lat = parse_deg(model->last_lat), lon = parse_deg(model->last_lon);
     if(lat >= 1e8f || lon >= 1e8f) { model->gps_place[0] = '\0'; return; }
     float coslat = cosf(lat * 3.14159265f / 180.0f);
-    float best = 1e18f;
-    int bi = -1;
-    for(int i = 0; i < CITIES_N; i++) {
-        float dlat = lat - (float)CITIES[i].lat / 100.0f; // table stores degrees*100
-        float dlon = (lon - (float)CITIES[i].lon / 100.0f) * coslat;
-        float d2 = dlat * dlat + dlon * dlon;
-        if(d2 < best) { best = d2; bi = i; }
+    float north = HOME_LAT - lat; // degrees north to home
+    float east = (HOME_LON - lon) * coslat; // degrees east to home (longitude-corrected)
+    float km = sqrtf(north * north + east * east) * 111.0f; // ~111 km / degree
+    static const char* DIRS[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    // atan2f: 0 = due north, +pi/2 = east. Round to eighths; &7 wraps negatives correctly.
+    const char* dir = DIRS[((int)roundf(atan2f(east, north) / 0.78539816f)) & 7];
+    if(km < 0.3f) {
+        snprintf(model->gps_place, sizeof(model->gps_place), "At %s!", HOME_NAME);
+    } else if(km < 1.0f) {
+        snprintf(
+            model->gps_place, sizeof(model->gps_place), "%s %dm %s", HOME_NAME,
+            (int)(km * 1000.0f), dir);
+    } else {
+        snprintf(
+            model->gps_place, sizeof(model->gps_place), "%s %dkm %s", HOME_NAME, (int)(km + 0.5f),
+            dir);
     }
-    if(bi < 0) { model->gps_place[0] = '\0'; return; }
-    float km = sqrtf(best) * 111.0f; // ~111 km per degree of latitude
-    snprintf(
-        model->gps_place, sizeof(model->gps_place), "%s %s", km < 25.0f ? "In" : "Near",
-        CITIES[bi].name);
 }
 
 static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
