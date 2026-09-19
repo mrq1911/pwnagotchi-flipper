@@ -19,6 +19,7 @@
 #include "../include/pcap.h"
 #include "../include/wardrive.h"
 #include "qrcodegen.h"
+#include <storage/storage.h>
 
 typedef enum {
     WorkerEventStop = (1 << 0),
@@ -36,8 +37,13 @@ typedef enum {
 // Per-AP records: the browser + crackability progress + target/whitelist all read
 // this. Also fixes the old pause/resume AP-count inflation (the firmware re-emits
 // its whole recon list on resume; we key by BSSID so each network counts once).
-#define AP_MAX 128
+#define AP_MAX 256 // browsable AP history (persisted across sessions to aps.bin)
 #define WL_MAX 16 // whitelisted BSSIDs we send to the firmware (matches its MAX_WL)
+
+// Persisted AP table (so you can browse APs/pwns from previous sessions).
+#define AP_DB_PATH "/ext/apps_data/pwnfriend/aps.bin"
+#define AP_DB_MAGIC 0x50414E46u // 'FNAP'
+#define AP_DB_VERSION 1
 
 typedef struct {
     char bssid[13]; // 12-hex key (no colons)
@@ -415,6 +421,37 @@ static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
     return i;
 }
 
+// Persisted AP table, so the browser shows APs/pwns from previous sessions too.
+// `targeted` is session-only (cleared on load); whitelist persists and is re-sent to
+// the firmware by the first advertise.
+static void ap_db_load(Storage* storage, PwnfriendModel* model) {
+    File* f = storage_file_alloc(storage);
+    if(storage_file_open(f, AP_DB_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        uint32_t hdr[3] = {0};
+        if(storage_file_read(f, hdr, sizeof(hdr)) == sizeof(hdr) && hdr[0] == AP_DB_MAGIC &&
+           hdr[1] == AP_DB_VERSION) {
+            uint32_t n = hdr[2] > AP_MAX ? AP_MAX : hdr[2];
+            size_t got = storage_file_read(f, model->aps, n * sizeof(ApRec));
+            model->ap_count = (uint16_t)(got / sizeof(ApRec));
+            for(uint16_t i = 0; i < model->ap_count; i++) model->aps[i].targeted = false;
+        }
+    }
+    storage_file_close(f);
+    storage_file_free(f);
+}
+
+static void ap_db_save(Storage* storage, PwnfriendModel* model) {
+    storage_common_mkdir(storage, "/ext/apps_data/pwnfriend");
+    File* f = storage_file_alloc(storage);
+    if(storage_file_open(f, AP_DB_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        uint32_t hdr[3] = {AP_DB_MAGIC, AP_DB_VERSION, model->ap_count};
+        storage_file_write(f, hdr, sizeof(hdr));
+        storage_file_write(f, model->aps, (size_t)model->ap_count * sizeof(ApRec));
+    }
+    storage_file_close(f);
+    storage_file_free(f);
+}
+
 // Parse a decimal-degree string ("50.0784950" / "-14.42") to double without atof
 // (avoids any %f/newlib-nano float-formatting dependency). Returns 1e9 on empty.
 static float parse_deg(const char* s) {
@@ -441,8 +478,8 @@ static void pwnfriend_update_place(PwnfriendModel* model) {
     float best = 1e18f;
     int bi = -1;
     for(int i = 0; i < CITIES_N; i++) {
-        float dlat = lat - CITIES[i].lat;
-        float dlon = (lon - CITIES[i].lon) * coslat;
+        float dlat = lat - (float)CITIES[i].lat / 100.0f; // table stores degrees*100
+        float dlon = (lon - (float)CITIES[i].lon / 100.0f) * coslat;
         float d2 = dlat * dlat + dlon * dlon;
         if(d2 < best) { best = d2; bi = i; }
     }
@@ -1501,7 +1538,13 @@ static void pwnfriend_timer_callback(void* ctx) {
         // persona pointer lives for the app's lifetime; a save racing a note_peer
         // update at worst records a slightly stale count, which is harmless.
         with_view_model(
-            app->view, PwnfriendModel * model, { persona_save(model->persona); }, false);
+            app->view,
+            PwnfriendModel * model,
+            {
+                persona_save(model->persona);
+                ap_db_save(app->storage, model);
+            },
+            false);
     }
 }
 
@@ -1605,6 +1648,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->last_pwnd_ssid[0] = '\0';
             model->pwnd_seen_count = 0;
             model->ap_count = 0;
+            ap_db_load(app->storage, model); // browse APs/pwns from previous sessions
             model->tuned_channel = 0; // auto (*) — the recon sweep
             model->stat_page = StatPageMood;
             model->min_rssi = -78; // matches the firmware default attack floor
@@ -1665,7 +1709,13 @@ static void pwnfriend_app_free(PwnfriendApp* app) {
     // Stop advertising and persist a final time (serial still live).
     pwnfriend_send_stop(app);
     with_view_model(
-        app->view, PwnfriendModel * model, { persona_save(model->persona); }, false);
+        app->view,
+        PwnfriendModel * model,
+        {
+            persona_save(model->persona);
+            ap_db_save(app->storage, model);
+        },
+        false);
 
     // Tear down serial (which silences the RX IRQ) BEFORE freeing the worker
     // thread, so a byte arriving mid-teardown can't poke a freed thread.
