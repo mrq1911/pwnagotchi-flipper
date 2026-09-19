@@ -101,9 +101,18 @@ class Pwnfriend {
     uint32_t _last_active_ms;  // throttle for the assoc+deauth active burst
 
     // Per-session capture bookkeeping (cleared in beginSession(), at scan start).
-    struct ReconAP { uint8_t bssid[6]; char ssid[33]; uint8_t channel; };
+    struct ReconAP {
+        uint8_t bssid[6];
+        char ssid[33];
+        uint8_t channel;
+        uint8_t attacks; // active-mode assoc/deauth bursts aimed at this AP
+        bool missed;     // already emitted a PWNFRIEND_MISS for it
+    };
     static const int MAX_RECON = 64;
     static const int MAX_PWND  = 64;
+    // Active-mode bursts against an AP with no capture before it counts as a
+    // "miss" (pwnagotchi's on_miss). ACTIVE_INTERVAL_MS apart, so ~4 * 2s = 8s.
+    static const int MISS_ATTEMPTS = 4;
     ReconAP  _recon[MAX_RECON];
     int      _n_recon;
     uint8_t  _pwnd_seen[MAX_PWND][6];
@@ -111,6 +120,7 @@ class Pwnfriend {
 
     int  reconIndex(const uint8_t* bssid) const;   // -1 if unseen
     bool markPwnd(const uint8_t* bssid);           // true if newly counted
+    bool isPwnd(const uint8_t* bssid) const;       // already captured this session?
     void emitPwnd(const uint8_t* bssid, const char* ssid,
                   const char* type, int channel, int rssi,
                   bool has_fix, double lat, double lon);

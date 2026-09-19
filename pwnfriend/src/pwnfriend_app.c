@@ -407,6 +407,13 @@ static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
     pcap_append_frame(app->storage, bssid, frame, (uint16_t)flen);
 }
 
+static void pwnfriend_handle_miss_line(PwnfriendApp* app) {
+    // pwnagotchi's on_miss: firmware attacked an AP MISS_ATTEMPTS times with no
+    // capture. Flash the demotivated face (only reached in active/Deauth mode).
+    with_view_model(
+        app->view, PwnfriendModel * model, { persona_note_miss(model->persona); }, true);
+}
+
 static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
     // PWNFRIEND_PWND and PWNFRIEND_PEER share the PWNFRIEND_P prefix, so both
     // full comparisons are needed.
@@ -420,6 +427,8 @@ static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
         pwnfriend_handle_ap_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_ADV ", 14) == 0) {
         pwnfriend_handle_adv_line(app, line);
+    } else if(strncmp(line, "PWNFRIEND_MISS ", 15) == 0) {
+        pwnfriend_handle_miss_line(app);
     }
     // Any other line is ordinary Marauder chatter; ignore it.
 }

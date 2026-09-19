@@ -286,6 +286,19 @@ void Pwnfriend::broadcast() {
             if (_recon[i].channel == ch) {
                 assocAP(_recon[i].bssid, _recon[i].ssid);  // -> RSN PMKID (M1)
                 deauthAP(_recon[i].bssid);                 // -> 4-way handshake
+                if (_recon[i].attacks < 255) _recon[i].attacks++;
+                // pwnagotchi's on_miss: attacked this AP MISS_ATTEMPTS times with
+                // no capture -> a "miss" (the Flipper flashes the demotivated
+                // face). Emit once per AP, as one atomic line.
+                if (!_recon[i].missed && _recon[i].attacks >= MISS_ATTEMPTS &&
+                    !isPwnd(_recon[i].bssid)) {
+                    _recon[i].missed = true;
+                    char mac[18];
+                    fmt_mac(mac, _recon[i].bssid);
+                    char line[40];
+                    int n = snprintf(line, sizeof(line), "PWNFRIEND_MISS %s\n", mac);
+                    if (n > 0) Serial.write((const uint8_t*)line, (size_t)n);
+                }
             }
         }
     }
@@ -343,6 +356,12 @@ int Pwnfriend::reconIndex(const uint8_t* bssid) const {
     for (int i = 0; i < _n_recon; i++)
         if (memcmp(_recon[i].bssid, bssid, 6) == 0) return i;
     return -1;
+}
+
+bool Pwnfriend::isPwnd(const uint8_t* bssid) const {
+    for (int i = 0; i < _n_pwnd_seen; i++)
+        if (memcmp(_pwnd_seen[i], bssid, 6) == 0) return true;
+    return false;
 }
 
 bool Pwnfriend::markPwnd(const uint8_t* bssid) {
@@ -471,6 +490,8 @@ bool Pwnfriend::reportAP(const uint8_t* payload, int length, int rssi, int chann
     strncpy(_recon[_n_recon].ssid, ssid, sizeof(_recon[_n_recon].ssid) - 1);
     _recon[_n_recon].ssid[sizeof(_recon[_n_recon].ssid) - 1] = '\0';
     _recon[_n_recon].channel = (uint8_t)channel;
+    _recon[_n_recon].attacks = 0;
+    _recon[_n_recon].missed = false;
     _n_recon++;
 
     // Stream this first beacon to the Flipper so its per-BSSID pcap carries the

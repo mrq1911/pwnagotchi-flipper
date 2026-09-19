@@ -181,6 +181,15 @@ PWNFRIEND_PWND {"bssid":"aa:bb:cc:dd:ee:ff","ssid":"NAME","type":"handshake","ch
 
 `type` is `handshake` for an EAPOL M2, or `pmkid` for an RSN PMKID from M1. `ssid` is
 sanitized the same way as `PWNFRIEND_PEER` names and may be `""` for a hidden AP. The
+
+**Miss (active mode only)** — after the ESP32 has assoc/deauth'd an AP `MISS_ATTEMPTS`
+(4) times with no capture, it emits a single line so the brain can flash the demotivated
+face (pwnagotchi's `on_miss`):
+
+```
+PWNFRIEND_MISS aa:bb:cc:dd:ee:ff
+```
+
 Flipper de-dupes both AP and capture lines by `bssid` across the whole app session, so the
 command being re-sent every ~15 s never double-counts a network and the `-pt`/`-pr` counts
 fed back stay honest.
