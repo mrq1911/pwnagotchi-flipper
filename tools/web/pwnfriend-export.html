@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pwnfriend export — crackable + WiGLE</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #111; color: #ddd; }
+  header { padding: 16px 20px; background: #1a1a1a; border-bottom: 1px solid #333; }
+  h1 { font-size: 18px; margin: 0; }
+  .sub { color: #888; font-size: 12px; margin-top: 4px; }
+  main { padding: 20px; max-width: 860px; margin: 0 auto; }
+  button { font: inherit; background: #2b6cb0; color: #fff; border: 0; border-radius: 6px;
+           padding: 9px 14px; cursor: pointer; margin: 0 8px 8px 0; }
+  button.secondary { background: #333; }
+  button:disabled { opacity: .5; cursor: default; }
+  #drop { border: 2px dashed #444; border-radius: 8px; padding: 28px; text-align: center;
+          color: #999; margin: 14px 0; }
+  #drop.hot { border-color: #2b6cb0; color: #ddd; background: #16233a; }
+  .row { display: flex; flex-wrap: wrap; gap: 14px; margin: 14px 0; }
+  .card { flex: 1 1 240px; background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 14px; }
+  .num { font-size: 28px; font-weight: 700; }
+  .num.good { color: #48bb78; } .num.warn { color: #ecc94b; } .num.bad { color: #888; }
+  pre#log { background: #000; border: 1px solid #333; border-radius: 6px; padding: 12px;
+            height: 220px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+  a.dl { display: inline-block; }
+  code { background: #222; padding: 1px 5px; border-radius: 4px; }
+  .note { color: #888; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #262626; }
+  th { color: #888; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>pwnfriend export</h1>
+  <div class="sub">Pull captures from the Flipper, convert crackable handshakes/PMKIDs to hashcat
+    <code>22000</code>, and grab the WiGLE wardrive CSV. Everything runs in your browser — nothing is uploaded.</div>
+</header>
+<main>
+  <div class="row" style="align-items:center">
+    <div>
+      <button id="serial">Connect Flipper (USB)</button>
+      <button id="pick" class="secondary">Choose folder…</button>
+      <input id="dir" type="file" webkitdirectory directory multiple hidden>
+      <input id="files" type="file" accept=".pcap,.csv" multiple hidden>
+    </div>
+  </div>
+  <div id="drop">…or drop the Flipper's <code>pwnfriend</code> folder (or its <code>.pcap</code> / <code>wardrive.csv</code>) here</div>
+
+  <div class="row">
+    <div class="card"><div class="num" id="nPcap">0</div>pcaps read</div>
+    <div class="card"><div class="num good" id="nCrack">0</div>crackable (22000 lines)</div>
+    <div class="card"><div class="num warn" id="nPartial">0</div>partial (need ESSID / more frames)</div>
+    <div class="card"><div class="num" id="nWigle">0</div>WiGLE rows</div>
+  </div>
+
+  <div id="downloads" class="row"></div>
+  <table id="results" hidden><thead><tr><th>BSSID</th><th>ESSID</th><th>type</th><th>status</th></tr></thead><tbody></tbody></table>
+
+  <h3>Log</h3>
+  <pre id="log"></pre>
+  <div class="note">
+    USB pull uses Web Serial (Chrome/Edge). Reads <code>/ext/apps_data/pwnfriend/</code> via the Flipper CLI
+    <code>storage</code> command (close qFlipper/lab.flipper.net first — only one app can hold the port).
+    If USB isn't available, copy the <code>pwnfriend</code> folder off the SD with qFlipper and drop it here.
+    <br>Crack with: <code>hashcat -m 22000 pwnfriend.hc22000 wordlist</code>. Upload the CSV at <code>wigle.net</code> → Uploads.
+  </div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const log = (...a) => { const l = $('#log'); l.textContent += a.join(' ') + '\n'; l.scrollTop = l.scrollHeight; };
+const hex = u8 => Array.from(u8, b => b.toString(16).padStart(2, '0')).join('');
+const macHex = u8 => hex(u8);
+
+// ---------------------------------------------------------------------------
+// pcap parsing (libpcap, linktype 105 = IEEE 802.11, or 127 radiotap)
+// ---------------------------------------------------------------------------
+function parsePcap(buf) {
+  const dv = new DataView(buf);
+  if (buf.byteLength < 24) return null;
+  const magic = dv.getUint32(0, true);
+  let le;
+  if (magic === 0xa1b2c3d4 || magic === 0xa1b23c4d) le = true;
+  else if (magic === 0xd4c3b2a1 || magic === 0x4d3cb2a1) le = false;
+  else return null;
+  const linktype = dv.getUint32(20, le);
+  const pkts = [];
+  let off = 24;
+  while (off + 16 <= buf.byteLength) {
+    const incl = dv.getUint32(off + 8, le);
+    off += 16;
+    if (incl <= 0 || off + incl > buf.byteLength) break;
+    let data = new Uint8Array(buf, off, incl);
+    off += incl;
+    if (linktype === 127) { // radiotap: skip its header to the 802.11 frame
+      if (data.length < 4) continue;
+      const rtlen = data[2] | (data[3] << 8);
+      if (rtlen >= data.length) continue;
+      data = data.subarray(rtlen);
+    }
+    pkts.push(data);
+  }
+  return pkts;
+}
+
+// Locate the EAPOL body inside an 802.11 data frame (after LLC/SNAP + 0x888e).
+function eapolBody(f) {
+  for (let i = 0; i + 8 <= f.length; i++) {
+    if (f[i] === 0xaa && f[i+1] === 0xaa && f[i+2] === 0x03 &&
+        f[i+3] === 0 && f[i+4] === 0 && f[i+5] === 0 &&
+        f[i+6] === 0x88 && f[i+7] === 0x8e) return i + 8;
+  }
+  return -1;
+}
+
+// BSSID + STA from the DS bits (fromDS/toDS in FC byte 1).
+function apStaOf(f) {
+  const tods = f[1] & 1, fromds = f[1] & 2;
+  const a1 = f.subarray(4, 10), a2 = f.subarray(10, 16), a3 = f.subarray(16, 22);
+  if (fromds && !tods) return { ap: a2, sta: a1 };
+  if (tods && !fromds) return { ap: a1, sta: a2 };
+  if (!tods && !fromds) return { ap: a3, sta: a2 };
+  return { ap: a3, sta: a2 };
+}
+
+// Build the 22000 lines from a set of frames (across all pcaps).
+function convert(frames) {
+  const essid = new Map();       // bssidHex -> essid string
+  const pmkids = [];             // {pmkid, ap, sta}
+  const anonces = new Map();     // key ap|sta -> [{nonce, rc, msg}]
+  const mics = [];               // {ap, sta, mic, rc, eapol(mic-zeroed), msg}
+
+  const key = (a, b) => macHex(a) + '|' + macHex(b);
+
+  for (const f of frames) {
+    if (f.length < 24) continue;
+    const type = (f[0] & 0x0c) >> 2, sub = (f[0] & 0xf0) >> 4;
+    // Beacon (0/8) or probe response (0/5): learn the ESSID.
+    if (type === 0 && (sub === 8 || sub === 5)) {
+      const bssid = macHex(f.subarray(16, 22));
+      let p = 36; // after mgmt hdr(24) + fixed params(12)
+      while (p + 2 <= f.length) {
+        const id = f[p], len = f[p+1];
+        if (p + 2 + len > f.length) break;
+        if (id === 0 && len > 0) {
+          const raw = f.subarray(p + 2, p + 2 + len);
+          // Skip cloaked SSIDs (all-NUL or all-blank), so a hidden-AP beacon can't
+          // poison the map before a probe response with the real name is seen.
+          if (raw.some(b => b !== 0x00 && b !== 0x20)) {
+            const s = new TextDecoder().decode(raw);
+            if (s && !essid.has(bssid)) essid.set(bssid, s);
+          }
+        }
+        p += 2 + len;
+      }
+      continue;
+    }
+    if (type !== 2) continue; // only DATA carries EAPOL
+    const eo = eapolBody(f);
+    if (eo < 0 || eo + 99 > f.length) continue;
+    if (f[eo + 1] !== 0x03) continue; // EAPOL-Key
+    // EAPOL-Key body: [0]ver [1]type [2..3]len [4]desc [5..6]KeyInfo [7..8]KeyLength
+    // [9..16]ReplayCounter [17..48]KeyNonce [49..64]IV [65..72]RSC [73..80]KeyID
+    // [81..96]KeyMIC [97..98]KeyDataLen [99..]KeyData
+    const ki = (f[eo + 5] << 8) | f[eo + 6];
+    const ack = !!(ki & 0x80), mic = !!(ki & 0x100), sec = !!(ki & 0x200);
+    const { ap, sta } = apStaOf(f);
+    const rc = hex(f.subarray(eo + 9, eo + 17));   // replay counter (8 bytes)
+    const nonce = f.subarray(eo + 17, eo + 49);    // 32-byte key nonce
+    const micVal = f.subarray(eo + 81, eo + 97);   // 16-byte MIC
+    const kdl = (f[eo + 97] << 8) | f[eo + 98];
+
+    if (ack && !mic) {                              // M1: ANonce (+ maybe PMKID)
+      anonces.set(key(ap, sta), (anonces.get(key(ap, sta)) || []).concat([{ nonce: hex(nonce), rc, msg: 1 }]));
+      // PMKID KDE: dd <len> 00 0f ac 04 <16 pmkid>
+      const kd = f.subarray(eo + 99, eo + 99 + kdl);
+      for (let i = 0; i + 22 <= kd.length; i++) {
+        if (kd[i] === 0xdd && kd[i+2] === 0x00 && kd[i+3] === 0x0f && kd[i+4] === 0xac && kd[i+5] === 0x04) {
+          const pmkid = kd.subarray(i + 6, i + 22);
+          if (pmkid.some(b => b)) pmkids.push({ pmkid: hex(pmkid), ap: macHex(ap), sta: macHex(sta) });
+          break;
+        }
+      }
+    } else if (ack && mic && sec) {                 // M3: ANonce
+      anonces.set(key(ap, sta), (anonces.get(key(ap, sta)) || []).concat([{ nonce: hex(nonce), rc, msg: 3 }]));
+    } else if (mic && !ack) {                        // M2 or M4: MIC + EAPOL frame
+      const eapLen = ((f[eo + 2] << 8) | f[eo + 3]) + 4; // EAPOL hdr len field + 4
+      const end = Math.min(f.length, eo + eapLen);
+      const eapol = f.slice(eo, end);
+      for (let i = 0; i < 16; i++) eapol[81 + i] = 0;   // zero the MIC (offset 81) for hashcat
+      mics.push({ ap: macHex(ap), sta: macHex(sta), mic: hex(micVal), rc, eapol: hex(eapol), msg: sec ? 4 : 2 });
+    }
+  }
+
+  const lines = [];
+  const seen = new Set();
+  const rows = [];
+  const essidHexOf = b => { const s = essid.get(b); return s ? hex(new TextEncoder().encode(s)) : null; };
+
+  // PMKID (WPA*02) — no client traffic needed, just needs the ESSID.
+  for (const p of pmkids) {
+    const eh = essidHexOf(p.ap);
+    const tag = 'pmkid:' + p.pmkid;
+    if (seen.has(tag)) continue; seen.add(tag);
+    if (eh) {
+      lines.push(`WPA*02*${p.pmkid}*${p.ap}*${p.sta}*${eh}***`);
+      rows.push([p.ap, essid.get(p.ap), 'PMKID', 'crackable']);
+    } else {
+      rows.push([p.ap, '(unknown)', 'PMKID', 'no ESSID']);
+    }
+  }
+
+  // Handshake (WPA*01) — pair a MIC msg (M2/M4) with an ANonce msg (M1/M3).
+  for (const m of mics) {
+    const cands = anonces.get(m.ap + '|' + m.sta) || [];
+    // M2 pairs with M1 (same rc); M4 pairs with M3 (same rc). Fall back to any.
+    let a = cands.find(c => c.rc === m.rc) || cands.find(c => (m.msg === 2 ? c.msg === 1 : c.msg === 3)) || cands[0];
+    if (!a) continue;
+    const eh = essidHexOf(m.ap);
+    const mp = (a.msg === 1 && m.msg === 2) ? '00' : (a.msg === 3 && m.msg === 2) ? '02' :
+               (a.msg === 1 && m.msg === 4) ? '01' : (a.msg === 3 && m.msg === 4) ? '05' : '00';
+    const tag = 'hs:' + m.ap + m.sta + m.mic;
+    if (seen.has(tag)) continue; seen.add(tag);
+    if (eh) {
+      lines.push(`WPA*01*${m.mic}*${m.ap}*${m.sta}*${eh}*${a.nonce}*${m.eapol}*${mp}`);
+      rows.push([m.ap, essid.get(m.ap), 'handshake', 'crackable']);
+    } else {
+      rows.push([m.ap, '(unknown)', 'handshake', 'no ESSID']);
+    }
+  }
+  return { lines, rows };
+}
+
+// ---------------------------------------------------------------------------
+// Ingest: gather all frames + wardrive text, then render.
+// ---------------------------------------------------------------------------
+let allFrames = [];
+let pcapCount = 0;
+let wardriveText = '';
+
+function reset() { allFrames = []; pcapCount = 0; wardriveText = ''; $('#results').querySelector('tbody').innerHTML = ''; }
+
+function addPcap(name, buf) {
+  const pkts = parsePcap(buf);
+  if (!pkts) { log('skip (not a pcap):', name); return; }
+  pcapCount++;
+  for (const p of pkts) allFrames.push(p);
+}
+
+function render() {
+  const { lines, rows } = convert(allFrames);
+  $('#nPcap').textContent = pcapCount;
+  const crack = rows.filter(r => r[3] === 'crackable').length;
+  const partial = rows.filter(r => r[3] !== 'crackable').length;
+  $('#nCrack').textContent = crack;
+  $('#nPartial').textContent = partial;
+  const wrows = wardriveText ? Math.max(0, wardriveText.trim().split('\n').length - 2) : 0;
+  $('#nWigle').textContent = wrows;
+
+  const tb = $('#results').querySelector('tbody'); tb.innerHTML = '';
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    r.forEach(c => { const td = document.createElement('td'); td.textContent = c ?? ''; tr.appendChild(td); });
+    tb.appendChild(tr);
+  }
+  $('#results').hidden = rows.length === 0;
+
+  const dl = $('#downloads'); dl.innerHTML = '';
+  if (lines.length) dl.appendChild(mkDownload('pwnfriend.hc22000', lines.join('\n') + '\n', `Download ${lines.length} × 22000`));
+  if (wardriveText) dl.appendChild(mkDownload('pwnfriend-wardrive.csv', wardriveText, 'Download WiGLE CSV'));
+  log(`done: ${pcapCount} pcaps, ${crack} crackable, ${partial} partial, ${wrows} WiGLE rows`);
+}
+
+function mkDownload(fname, text, label) {
+  const a = document.createElement('a');
+  a.className = 'dl';
+  a.href = URL.createObjectURL(new Blob([text], { type: 'application/octet-stream' }));
+  a.download = fname;
+  const b = document.createElement('button');
+  b.textContent = label; a.appendChild(b);
+  return a;
+}
+
+// ---------------------------------------------------------------------------
+// Drag & drop / folder picker
+// ---------------------------------------------------------------------------
+async function ingestFiles(fileList) {
+  reset();
+  for (const f of fileList) {
+    try {
+      const lower = f.name.toLowerCase();
+      if (lower.endsWith('.pcap')) addPcap(f.name, await f.arrayBuffer());
+      else if (lower.endsWith('.csv')) {
+        const t = await f.text();
+        if (lower.endsWith('wardrive.csv') || t.startsWith('WigleWifi')) wardriveText = t;
+      }
+    } catch (e) {
+      log('skip (unreadable):', f.name, '-', (e && e.message) || e);
+    }
+  }
+  render();
+}
+$('#pick').onclick = () => $('#dir').click();
+$('#dir').onchange = e => ingestFiles(e.target.files);
+const drop = $('#drop');
+['dragover', 'dragenter'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('hot'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('hot'); }));
+drop.addEventListener('drop', async e => {
+  const items = e.dataTransfer.items;
+  const files = [];
+  const walk = async entry => {
+    if (entry.isFile) files.push(await new Promise(r => entry.file(r)));
+    else if (entry.isDirectory) {
+      const rd = entry.createReader();
+      const ents = await new Promise(r => rd.readEntries(r));
+      for (const en of ents) await walk(en);
+    }
+  };
+  if (items && items[0]?.webkitGetAsEntry) {
+    for (const it of items) { const en = it.webkitGetAsEntry(); if (en) await walk(en); }
+    await ingestFiles(files);
+  } else {
+    await ingestFiles(e.dataTransfer.files);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Web Serial pull from the Flipper CLI (storage list / read)
+// ---------------------------------------------------------------------------
+const DIR = '/ext/apps_data/pwnfriend';
+let port, reader, writer;
+
+async function serialConnect() {
+  if (!('serial' in navigator)) { log('Web Serial not supported — use Chrome/Edge, or drop the folder.'); return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    reader = port.readable.getReader();
+    writer = port.writable.getWriter();
+    log('connected. syncing CLI…');
+    await drainTo('>: ', 2000).catch(() => {});
+    await sendCmd('\r\n');
+    reset();
+    // handshakes dir
+    const listing = await sendCmd(`storage list ${DIR}/handshakes\r\n`);
+    const names = [...listing.matchAll(/\[F\]\s+(\S+\.pcap)\s+\d+b?/g)].map(m => m[1]);
+    log(`found ${names.length} pcaps`);
+    let i = 0;
+    for (const n of names) {
+      const buf = await storageRead(`${DIR}/handshakes/${n}`);
+      if (buf) addPcap(n, buf);
+      if (++i % 10 === 0) log(`  …${i}/${names.length}`);
+    }
+    const w = await storageRead(`${DIR}/wardrive.csv`);
+    if (w) wardriveText = new TextDecoder().decode(new Uint8Array(w));
+    render();
+  } catch (e) {
+    log('serial error:', e.message || e);
+  } finally {
+    // Each release/close independently guarded so one failure can't skip the rest,
+    // and the close is actually awaited so the port frees before the next connect.
+    try { reader && reader.releaseLock(); } catch (_) {}
+    try { writer && writer.releaseLock(); } catch (_) {}
+    try { if (port) await port.close(); } catch (_) {}
+    reader = writer = port = null;
+  }
+}
+
+// read until a marker string is seen; returns the accumulated text
+let rxBuf = new Uint8Array(0);
+function appendRx(chunk) {
+  const n = new Uint8Array(rxBuf.length + chunk.length);
+  n.set(rxBuf); n.set(chunk, rxBuf.length); rxBuf = n;
+}
+async function drainTo(marker, timeoutMs) {
+  const enc = new TextEncoder().encode(marker);
+  const deadline = Date.now() + (timeoutMs || 4000);
+  while (Date.now() < deadline) {
+    const { value, done } = await Promise.race([
+      reader.read(),
+      new Promise(r => setTimeout(() => r({ value: null, done: false }), 250)),
+    ]);
+    if (done) break;
+    if (value) appendRx(value);
+    if (indexOfSub(rxBuf, enc) >= 0) break;
+  }
+  const text = new TextDecoder().decode(rxBuf);
+  rxBuf = new Uint8Array(0);
+  return text;
+}
+function indexOfSub(hay, needle) {
+  outer: for (let i = 0; i + needle.length <= hay.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (hay[i + j] !== needle[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+async function sendCmd(cmd) {
+  rxBuf = new Uint8Array(0);
+  await writer.write(new TextEncoder().encode(cmd));
+  return await drainTo('>: ', 4000);
+}
+// storage read: parse "Size: N", then read exactly N raw bytes (8-bit clean on the
+// device's output path), independent of any text prompt handling.
+async function storageRead(path) {
+  rxBuf = new Uint8Array(0);
+  await writer.write(new TextEncoder().encode(`storage read ${path}\r\n`));
+  // wait for the FULL "Size: N\r\n" header line (anchor on the newline so a split
+  // read like "Size: 12" before "34\r\n" can't lock in a truncated size).
+  const readTO = () => Promise.race([
+    reader.read(),
+    new Promise(r => setTimeout(() => r({ value: null, done: false, timeout: true }), 250)),
+  ]);
+  const sizeRe = /Size:\s*(\d+)\r?\n/;
+  const hdrText = await (async () => {
+    let idle = Date.now() + 4000;
+    while (Date.now() < idle) {
+      const m = new TextDecoder().decode(rxBuf).match(sizeRe);
+      if (m) return m;
+      const { value, done } = await readTO();
+      if (done) break;
+      if (value) { appendRx(value); idle = Date.now() + 4000; }
+    }
+    return new TextDecoder().decode(rxBuf).match(sizeRe);
+  })();
+  if (!hdrText) { log('  read failed (no Size):', path); return null; }
+  const size = parseInt(hdrText[1], 10);
+  // bytes start right after the "Size: N\r\n" header within rxBuf
+  const headerEnd = indexOfSub(rxBuf, new TextEncoder().encode(hdrText[0]));
+  let start = headerEnd + hdrText[0].length;
+  // accumulate until we have `size` payload bytes, with an idle deadline so a
+  // stalled/truncated transfer can't hang the whole pull.
+  let idle = Date.now() + 4000;
+  while (rxBuf.length - start < size) {
+    if (Date.now() > idle) { log('  read timed out:', path); return null; }
+    const { value, done } = await readTO();
+    if (done) break;
+    if (value) { appendRx(value); idle = Date.now() + 4000; }
+  }
+  const payload = rxBuf.slice(start, start + size);
+  // drain trailing prompt
+  await drainTo('>: ', 800).catch(() => {});
+  return payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+}
+$('#serial').onclick = serialConnect;
+if (!('serial' in navigator)) $('#serial').disabled = true;
+</script>
+</body>
+</html>
