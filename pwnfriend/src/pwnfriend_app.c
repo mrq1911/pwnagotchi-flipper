@@ -39,10 +39,13 @@ typedef enum {
 #define AP_MAX 256 // browsable AP history (persisted across sessions to aps.bin)
 #define WL_MAX 16 // whitelisted BSSIDs we send to the firmware (matches its MAX_WL)
 
-// "Home" point — the GPS stat shows distance + compass direction to here.
+// "Home" point — the GPS stat shows distance + compass direction to here. This is
+// the default; "Set home" in the menu overrides it with the current fix (persisted).
 #define HOME_LAT 50.081148f
 #define HOME_LON 14.451144f
-#define HOME_NAME "Prague"
+#define HOME_NAME "Home"
+#define HOME_DB_PATH "/ext/apps_data/pwnfriend/home.bin"
+#define HOME_DB_MAGIC 0x484D4E46u // 'FNMH'
 
 // Persisted AP table (so you can browse APs/pwns from previous sessions).
 #define AP_DB_PATH "/ext/apps_data/pwnfriend/aps.bin"
@@ -101,6 +104,7 @@ typedef enum {
     MenuChannel,
     MenuMinRssi,
     MenuRecon,
+    MenuSetHome,
     MenuAbout,
     MenuCount,
 } MenuItem;
@@ -146,7 +150,8 @@ typedef struct {
     bool gps_seen;
     char last_lat[16];
     char last_lon[16];
-    char gps_place[32]; // distance+direction to HOME, e.g. "Prague 12km SW"
+    char gps_place[32]; // distance+direction to home, e.g. "Home 12km SW"
+    float home_lat, home_lon; // the point the GPS compass points at (default Prague; settable)
 
     // ESP32-link watchdog: warn when the board stops answering (unplugged, rear
     // switch off ESP32, wrong firmware). All in tick_secs, written under the lock.
@@ -456,6 +461,37 @@ static void ap_db_save(Storage* storage, PwnfriendModel* model) {
     storage_file_free(f);
 }
 
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    float lat;
+    float lon;
+} HomeDb;
+
+static void home_load(Storage* storage, PwnfriendModel* model) {
+    File* f = storage_file_alloc(storage);
+    if(storage_file_open(f, HOME_DB_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        HomeDb h = {0};
+        if(storage_file_read(f, &h, sizeof(h)) == sizeof(h) && h.magic == HOME_DB_MAGIC) {
+            model->home_lat = h.lat;
+            model->home_lon = h.lon;
+        }
+    }
+    storage_file_close(f);
+    storage_file_free(f);
+}
+
+static void home_save(Storage* storage, PwnfriendModel* model) {
+    storage_common_mkdir(storage, "/ext/apps_data/pwnfriend");
+    File* f = storage_file_alloc(storage);
+    if(storage_file_open(f, HOME_DB_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        HomeDb h = {HOME_DB_MAGIC, 1, model->home_lat, model->home_lon};
+        storage_file_write(f, &h, sizeof(h));
+    }
+    storage_file_close(f);
+    storage_file_free(f);
+}
+
 // Parse a decimal-degree string ("50.0784950" / "-14.42") to double without atof
 // (avoids any %f/newlib-nano float-formatting dependency). Returns 1e9 on empty.
 static float parse_deg(const char* s) {
@@ -479,8 +515,8 @@ static void pwnfriend_update_place(PwnfriendModel* model) {
     float lat = parse_deg(model->last_lat), lon = parse_deg(model->last_lon);
     if(lat >= 1e8f || lon >= 1e8f) { model->gps_place[0] = '\0'; return; }
     float coslat = cosf(lat * 3.14159265f / 180.0f);
-    float north = HOME_LAT - lat; // degrees north to home
-    float east = (HOME_LON - lon) * coslat; // degrees east to home (longitude-corrected)
+    float north = model->home_lat - lat; // degrees north to home
+    float east = (model->home_lon - lon) * coslat; // degrees east to home (longitude-corrected)
     float km = sqrtf(north * north + east * east) * 111.0f; // ~111 km / degree
     static const char* DIRS[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
     // atan2f: 0 = due north, +pi/2 = east. Round to eighths; &7 wraps negatives correctly.
@@ -1033,6 +1069,9 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
             break;
         case MenuMinRssi: snprintf(row, sizeof(row), "Min RSSI: %d", model->min_rssi); break;
         case MenuRecon: snprintf(row, sizeof(row), "Recon: %us", model->recon_secs); break;
+        case MenuSetHome:
+            snprintf(row, sizeof(row), "Set home %s", model->gps_seen ? "(here)" : "(no GPS)");
+            break;
         case MenuAbout: snprintf(row, sizeof(row), "About"); break;
         default: row[0] = '\0';
         }
@@ -1362,6 +1401,15 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         break;
                     case MenuStats: model->screen = ScreenStats; break;
                     case MenuAbout: model->screen = ScreenAbout; break;
+                    case MenuSetHome:
+                        // Capture the current fix as home (persisted). Needs a fix.
+                        if(model->gps_seen) {
+                            model->home_lat = parse_deg(model->last_lat);
+                            model->home_lon = parse_deg(model->last_lon);
+                            pwnfriend_update_place(model);
+                            home_save(app->storage, model);
+                        }
+                        break;
                     case MenuAdvertise:
                         model->advertising = !model->advertising;
                         now_adv = model->advertising;
@@ -1671,6 +1719,9 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->last_lat[0] = '\0';
             model->last_lon[0] = '\0';
             model->gps_place[0] = '\0';
+            model->home_lat = HOME_LAT; // default; overridden by home.bin / "Set home"
+            model->home_lon = HOME_LON;
+            home_load(app->storage, model);
             model->last_rx_secs = 0;
             model->advertising_since = 0; // advertising starts now (tick 0) -> grace runs
             model->link_down = false;
