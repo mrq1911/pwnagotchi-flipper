@@ -160,11 +160,18 @@ void pwnagotchi_draw_channel(Pwnagotchi* pwn, Canvas* canvas) {
 }
 
 void pwnagotchi_draw_aps(Pwnagotchi* pwn, Canvas* canvas) {
-    pwnagotchi_draw_str("APS ", pwn->apStat, PWNAGOTCHI_APS_I, PWNAGOTCHI_APS_J, canvas);
+    pwnagotchi_draw_str("AP ", pwn->apStat, PWNAGOTCHI_APS_I, PWNAGOTCHI_APS_J, canvas);
 }
 
 void pwnagotchi_draw_uptime(Pwnagotchi* pwn, Canvas* canvas) {
-    pwnagotchi_draw_str("UP ", pwn->uptime, PWNAGOTCHI_UPTIME_I, PWNAGOTCHI_UPTIME_J, canvas);
+    // Right-aligned to the screen edge so a full hh:mm:ss (even 3-digit hours) can
+    // neither run off the right nor collide with the AP count to its left.
+    FuriString* tmp = furi_string_alloc_printf("UP %s", furi_string_get_cstr(pwn->uptime));
+    canvas_set_font(canvas, PWNAGOTCHI_FONT);
+    uint16_t w = canvas_string_width(canvas, furi_string_get_cstr(tmp));
+    canvas_draw_str(
+        canvas, FLIPPER_SCREEN_WIDTH - w, PWNAGOTCHI_UPTIME_I, furi_string_get_cstr(tmp));
+    furi_string_free(tmp);
 }
 
 void pwnagotchi_draw_lines(Pwnagotchi* pwn, Canvas* canvas) {

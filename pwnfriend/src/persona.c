@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <furi_hal_random.h>
+#include <furi_hal_version.h>
 #include <storage/storage.h>
 #include <datetime/datetime.h>
 #include <furi_hal_rtc.h>
@@ -10,9 +11,11 @@
 #define PERSONA_DIR "/ext/apps_data/pwnfriend"
 #define PERSONA_PATH PERSONA_DIR "/persona.bin"
 
-// Seconds of silence before the friend gets lonely — the sad face this whole
-// app exists to prevent on the pwnagotchi is one we let our own friend show too.
-#define LONELY_AFTER_SECS 45
+// pwnagotchi's "lonely" is NOT peer-absence (a lone friend is the normal, intended
+// case) — it's staleness: is_stale() == epoch.num_missed > max_misses_for_recon,
+// i.e. it attacked APs this epoch and caught nothing ("agent missed N interactions
+// -> lonely"). We mirror that: misses past this threshold in an epoch -> lonely.
+#define PERSONA_MAX_MISSES 5 // personality.max_misses_for_recon
 
 // One "epoch" == one recon window. Upstream personality.recon_time = 30 s, so we
 // use the same wall-time per epoch: "num_epochs" here means the same as upstream.
@@ -40,6 +43,11 @@
 // Handshake streak inside one epoch that earns the COOL face.
 #define PERSONA_COOL_STREAK 4
 
+// How many fully-silent epochs (no APs/handshakes/misses) an engaged unit tolerates
+// before it's allowed to get bored/sad — so a busy hunt stays content but a truly
+// dead area still eventually bores it.
+#define PERSONA_HUNT_PATIENCE 5
+
 // Time-based feels (seconds).
 #define PERSONA_CURIOUS_SECS 15 // a peer this recently -> curious
 #define PERSONA_PWND_REACT_SECS 8 // hold the capture (happy/cool/excited) face
@@ -63,11 +71,21 @@ static void persona_gen_identity(char* out /* PERSONA_ID_HEX_LEN+1 */) {
     out[PERSONA_ID_HEX_LEN] = '\0';
 }
 
+// The display name is the Flipper's own device name (e.g. "Tr1te"), so a friend on
+// the mesh sees the unit it's actually looking at. The persistent 64-hex identity
+// (the friendship key) is untouched — only this shown name tracks the device.
+static void persona_set_device_name(Persona* p) {
+    const char* dev = furi_hal_version_get_name_ptr();
+    if(!dev || !dev[0]) dev = "pwn"; // no name programmed -> a sane default
+    strncpy(p->s.name, dev, PERSONA_NAME_MAX - 1);
+    p->s.name[PERSONA_NAME_MAX - 1] = '\0';
+}
+
 static void persona_mint(Persona* p) {
     memset(p, 0, sizeof(Persona));
     p->s.magic = PERSONA_SAVE_MAGIC;
     p->s.version = PERSONA_SAVE_VERSION;
-    strncpy(p->s.name, "flippy", PERSONA_NAME_MAX - 1);
+    persona_set_device_name(p);
     persona_gen_identity(p->s.identity);
     p->s.born_unix = persona_now_unix();
     p->s.total_uptime = 0;
@@ -95,6 +113,9 @@ Persona* persona_alloc(void) {
             // Guard against a corrupt name/identity from a truncated write.
             p->s.name[PERSONA_NAME_MAX - 1] = '\0';
             p->s.identity[PERSONA_ID_HEX_LEN] = '\0';
+            // The shown name always tracks the Flipper's own device name, even for
+            // a persona saved under the old hardcoded name. Identity stays as saved.
+            persona_set_device_name(p);
             // The memset above zeroed every volatile epoch counter before p->s = saved.
             p->mood = MoodContent;
             p->secs_since_peer = 0;
@@ -149,14 +170,35 @@ static void persona_end_epoch(Persona* p) {
 
     bool got_hs = (p->hs_this_epoch > 0);
     bool active = got_hs || (p->aps_this_epoch >= PERSONA_EPOCH_ACTIVE_APS);
+    // Any traffic at all this epoch (fresh AP, capture, or miss) resets the quiet
+    // streak; a genuinely silent unit accrues quiet epochs.
+    bool traffic = got_hs || (p->aps_this_epoch > 0) || (p->misses_this_epoch > 0);
+    if(traffic)
+        p->quiet_epochs = 0;
+    else if(p->quiet_epochs < 0xffffffff)
+        p->quiet_epochs++;
 
     if(active) {
         p->active_epochs++;
+        p->inactive_epochs = 0;
+    } else if(p->hunting && p->quiet_epochs < PERSONA_HUNT_PATIENCE) {
+        // Engaged (advertising + capture armed + APs around) and still seeing traffic
+        // recently: stay content, don't slide into bored/sad. The firmware reports each
+        // AP only once, so "new APs per epoch" dries up mid-hunt — this keeps the friend
+        // from going perma-sad. But once the area goes truly silent for PATIENCE epochs,
+        // boredom is allowed to set in (so bored/sad stay reachable).
+        p->active_epochs = 0;
         p->inactive_epochs = 0;
     } else {
         p->active_epochs = 0;
         p->inactive_epochs++;
     }
+
+    // Snapshot this epoch's misses so baseline_mood can render lonely for the next
+    // window (agent.next_epoch reads epoch.num_missed BEFORE resetting it), then
+    // clear the running tally for the new epoch.
+    p->last_epoch_missed = p->misses_this_epoch;
+    p->misses_this_epoch = 0;
 
     p->aps_this_epoch = 0;
     p->hs_this_epoch = 0;
@@ -170,12 +212,13 @@ static void persona_end_epoch(Persona* p) {
 static PersonaMood persona_baseline_mood(const Persona* p) {
     // The automata activity/social droughts. sad supersedes bored, both pure
     // inactivity (Epoch.next); sleep is our friendlier stand-in for automata's
-    // set_angry escalation at inactive_for >= 2*sad_num_epochs.
+    // set_angry escalation at inactive_for >= 2*sad_num_epochs. 'stale' is
+    // pwnagotchi's is_stale() — we attacked APs last epoch and caught nothing.
     bool sleepy = (p->inactive_epochs >= PERSONA_SLEEP_EPOCHS);
     bool sad = (p->inactive_epochs >= PERSONA_SAD_EPOCHS);
     bool bored = (p->inactive_epochs >= PERSONA_BORED_EPOCHS);
-    bool lonely = (p->secs_since_peer >= LONELY_AFTER_SECS);
-    bool down = sleepy || sad || bored || lonely;
+    bool stale = (p->last_epoch_missed > PERSONA_MAX_MISSES);
+    bool down = sleepy || sad || bored || stale;
 
     // A good friend in range always wins: grateful on a bad day (the support-network
     // override), bonded otherwise (on_new_peer picks the FRIEND face for a bond).
@@ -187,15 +230,18 @@ static PersonaMood persona_baseline_mood(const Persona* p) {
     if(p->active_epochs >= PERSONA_EXCITED_EPOCHS) return MoodExcited;
     if(p->aps_this_epoch >= PERSONA_EPOCH_ACTIVE_APS) return MoodMotivated;
 
+    // Stale: kicked things all epoch, nothing bit -> lonely (agent.next_epoch's
+    // was_stale -> set_lonely). This is the real pwnagotchi 'lonely', and only ever
+    // fires in active/Deauth mode (passive never misses, so it's never lonely).
+    if(stale) return MoodLonely;
+
     // A unit just dropped by -> curious (on_new_peer for a returning unit).
     if(p->secs_since_peer < PERSONA_CURIOUS_SECS) return MoodCurious;
 
-    // The slow decay: sleep (deep) > sad > bored are pure inactivity; then our
-    // social 'lonely' drought (no peers heard for a while).
+    // The slow decay: sleep (deep) > sad > bored, all pure inactivity.
     if(sleepy) return MoodSleep;
     if(sad) return MoodSad;
     if(bored) return MoodBored;
-    if(lonely) return MoodLonely;
 
     return MoodContent; // awake / normal (on_normal)
 }
@@ -270,7 +316,9 @@ void persona_note_ap(Persona* p) {
 void persona_note_miss(Persona* p) {
     // Automata._on_miss -> view.on_miss: an interaction that hit nothing. Upstream
     // flashes a face + "Missed!"; we hold a short DEMOTIVATED nudge, then settle back.
-    // (We don't model max_misses_for_recon -> stale -> lonely/angry; kept simple.)
+    // The miss also feeds this epoch's tally: once it passes max_misses_for_recon
+    // the epoch is "stale" and baseline_mood settles to lonely (agent.next_epoch).
+    p->misses_this_epoch++;
     p->mood = MoodDemotivated;
     p->mood_lock_secs = PERSONA_MISS_REACT_SECS;
 }
@@ -308,22 +356,6 @@ Face persona_face(const Persona* p) {
     default:
         return FaceAwake;
     }
-}
-
-uint32_t persona_level(const Persona* p) {
-    // Grows with time alive, handshakes captured, and friends met. Real pwnd count
-    // the most; then a gentle triangular curve so it slows as it climbs.
-    uint32_t hours = (uint32_t)(p->s.total_uptime / 3600);
-    uint32_t score = hours + p->s.pwnd_tot * 3 + p->s.friends_met;
-    uint32_t level = 1;
-    uint32_t step = 3;
-    uint32_t need = step;
-    while(score >= need) {
-        level++;
-        step++;
-        need += step;
-    }
-    return level;
 }
 
 // One representative line per mood, taken from pwnagotchi's voice.py (upstream

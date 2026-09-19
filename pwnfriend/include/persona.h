@@ -12,7 +12,7 @@
 
 typedef enum {
     // The original five ordinals are kept stable so old logic still lines up.
-    MoodLonely, // no peers around for a while — the whole reason this app exists
+    MoodLonely, // stale: attacked APs but caught nothing (pwnagotchi's on_lonely)
     MoodContent, // awake / idling happily (AWAKE face)
     MoodCurious, // a familiar unit just dropped by
     MoodExcited, // sustained activity, or a fresh capture streak / new friend
@@ -59,6 +59,7 @@ typedef struct {
     uint32_t friends_session; // distinct units met this session
     uint32_t secs_since_peer; // seconds since we last heard any unit
     bool friend_near; // a bonded/good friend is currently in range
+    bool hunting; // advertising + capture armed + APs around: engaged, don't decay to sad
     PersonaMood mood;
 
     // --- full-pwnagotchi brain state (volatile) ---
@@ -71,7 +72,11 @@ typedef struct {
     uint32_t hs_this_epoch; // handshakes in the current epoch
     uint32_t active_epochs; // consecutive "active" epochs
     uint32_t inactive_epochs; // consecutive "quiet" epochs
+    uint32_t quiet_epochs; // consecutive epochs with NO traffic at all (aps/hs/misses)
     uint32_t secs_since_pwnd; // seconds since the last handshake
+
+    uint32_t misses_this_epoch; // deauth/assoc attempts that caught nothing, this epoch
+    uint32_t last_epoch_missed; // misses in the just-closed epoch (drives lonely/stale)
 
     uint32_t mood_lock_secs; // >0: hold a transient reaction face, don't recompute
 } Persona;
@@ -105,5 +110,4 @@ void persona_note_miss(Persona* p);
 
 // Derived getters.
 Face persona_face(const Persona* p);
-uint32_t persona_level(const Persona* p);
 const char* persona_mood_label(const Persona* p);

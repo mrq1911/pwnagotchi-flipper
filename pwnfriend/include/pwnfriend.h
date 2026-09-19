@@ -14,4 +14,14 @@
 // How often (seconds) we persist the persona to SD.
 #define PWNFRIEND_SAVE_SECS 30
 
+// ESP32-absence detection. The board answers with PWNFRIEND_ADV ~2x/sec while
+// advertising; if we hear nothing for LINK_TIMEOUT after having advertised at
+// least LINK_GRACE (covers the board's boot + StartScan), we warn the user.
+#define PWNFRIEND_LINK_TIMEOUT_SECS 5
+#define PWNFRIEND_LINK_GRACE_SECS 10
+
+// The setup link shown as a QR on the "no ESP32" screen: which boards work + how
+// to flash. Kept <=53 bytes so the QR stays version-3 (29x29) at 2px/module.
+#define PWNFRIEND_SETUP_URL "https://github.com/mrq1911/pwnagotchi-flipper"
+
 // FLIPPER_SCREEN_WIDTH / _HEIGHT come from pwn_constants.h (via pwnagotchi.h).

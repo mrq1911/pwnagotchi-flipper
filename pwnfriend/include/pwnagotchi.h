@@ -16,9 +16,10 @@
 #define PWNAGOTCHI_CHANNEL_I 7
 #define PWNAGOTCHI_CHANNEL_J 0
 #define PWNAGOTCHI_APS_I 7
-#define PWNAGOTCHI_APS_J 25
+#define PWNAGOTCHI_APS_J 30
 #define PWNAGOTCHI_UPTIME_I 7
-#define PWNAGOTCHI_UPTIME_J 75
+// UPTIME is drawn right-aligned to the screen edge (see pwnagotchi_draw_uptime), so
+// no fixed J is needed; a full hh:mm:ss can't overrun the edge or hit the AP count.
 #define PWNAGOTCHI_LINE1_START_I 8
 #define PWNAGOTCHI_LINE1_START_J 0
 #define PWNAGOTCHI_LINE1_END_I 8
