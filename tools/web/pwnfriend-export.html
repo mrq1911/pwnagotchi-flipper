@@ -50,6 +50,9 @@
   td.ok { color: var(--grn); } td.no { color: var(--dim); }
   #map { height: 320px; }
   .leaflet-container { background: #000; font-family: inherit; }
+  /* Darken the keyless OSM raster tiles in-browser (markers live in the SVG
+     overlay pane, so they keep their true orange/green). */
+  .leaflet-tile { filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.9); }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #0d0d0c; color: var(--fg);
             border: 1px solid var(--org); border-radius: 0; }
   .leaflet-popup-content { font-size: 12px; }
@@ -93,7 +96,7 @@
 
   <div class="note">
     Capture conversion runs entirely in your browser — pcaps/handshakes are never uploaded. The map
-    loads tiles from CARTO/OpenStreetMap, so only the map viewport (not your AP data) reaches those tile servers.
+    loads tiles from OpenStreetMap, so only the map viewport (not your AP data) reaches the tile servers.
     <br>USB pull uses Web Serial (Chrome/Edge), reading <code>/ext/apps_data/pwnfriend/</code> via the Flipper
     CLI <code>storage</code> command — close qFlipper/lab.flipper.net first (one app owns the port). No USB? Copy
     the <code>pwnfriend</code> folder off the SD with qFlipper and drop it above.
@@ -380,8 +383,8 @@ function renderMap(points, crackSet) {
   wrap.hidden = false;
   if (!_map) {
     _map = L.map('map', { attributionControl: true });
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-      { maxZoom: 20, attribution: '© OpenStreetMap · © CARTO' }).addTo(_map);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+      { maxZoom: 19, subdomains: 'abc', attribution: '© OpenStreetMap contributors' }).addTo(_map);
     _markers = L.layerGroup().addTo(_map);
   }
   _markers.clearLayers();
