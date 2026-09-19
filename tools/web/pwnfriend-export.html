@@ -42,6 +42,8 @@
   .card .lbl { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
   pre#log { background: #000; border: 0; margin: 0; padding: 10px; height: 170px; overflow: auto;
             font-size: 12px; white-space: pre-wrap; color: var(--grn); }
+  pre.art { color: var(--org); font-size: 11px; line-height: 1.15; white-space: pre; margin: 0 0 8px;
+            overflow-x: auto; }
   code { background: #1a1a12; color: var(--org); padding: 1px 5px; }
   .note { color: var(--dim); font-size: 11px; line-height: 1.7; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -93,6 +95,19 @@
     </div></div>
 
   <div class="panel"><div class="bar">Log</div><div class="body" style="padding:0"><pre id="log"></pre></div></div>
+
+  <div class="panel"><div class="bar">About</div><div class="body">
+<pre class="art">         _    __/\_______  _______
+        / \  /  \_____   \/  ___  \
+       /   \/    /  _/  _/     /  /
+=-=-=-/         /   \   \     /  /=-=-=-
+-=-=-/   /\  /\_\___/\   \____   \-=-=-=
+    (___/  \/  &lt;mrq&gt;  \___)   \___)</pre>
+    <div class="note"><b>pwnflipper</b> — a friend for your lonely pwnagotchi, and a full
+    pwnagotchi in its own right. The ESP32 firmware is a complete Marauder build with the
+    <code>pwnfriend</code> command added. by mrq ·
+    <a href="https://github.com/mrq1911/pwnagotchi-flipper">github.com/mrq1911/pwnagotchi-flipper</a></div>
+  </div></div>
 
   <div class="note">
     Capture conversion runs entirely in your browser — pcaps/handshakes are never uploaded. The map

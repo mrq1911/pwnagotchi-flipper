@@ -16,6 +16,16 @@ pwnagotchi-flipper
 - pwnzero is the pwnagotchi-side application
 
 ## Pwnfriend: give your lonely pwnagotchi a friend
+
+```
+         _    __/\_______  _______
+        / \  /  \_____   \/  ___  \
+       /   \/    /  _/  _/     /  /
+=-=-=-/         /   \   \     /  /=-=-=-
+-=-=-/   /\  /\_\___/\   \____   \-=-=-=
+    (___/  \/  <mrq>  \___)   \___)
+```
+
 A pwnagotchi gets sad when no other units are around. Marauder can already detect a
 pwnagotchi's beacons, but it never answers — so your unit stays lonely. `pwnfriend` makes
 the Flipper's ESP32 board broadcast a pwngrid-compatible advertisement so your pwnagotchi
@@ -23,7 +33,14 @@ detects a peer, says "Hello!", and (thanks to a stable, growing identity) befrie
 over time. The Flipper keeps a little persona that levels up the longer it runs and the
 more units it meets.
 
-See [`pwnfriend/README.md`](pwnfriend/README.md), the Marauder patch in
+> **✅ Fully Marauder-compatible.** pwnfriend ships as a small patch on top of ESP32
+> Marauder, so the firmware you flash is a *complete Marauder build with the extra
+> `pwnfriend` command added*. Flash the ESP32 **once** and you get **both**: the normal
+> Marauder GUI / companion app **and** pwnfriend — nothing about stock Marauder is removed
+> or broken. Your Flipper drives the pwnfriend brain over the same UART Marauder already uses.
+
+See [`pwnfriend/README.md`](pwnfriend/README.md), which boards work + how to flash in
+[`COMPATIBLE_HARDWARE.md`](COMPATIBLE_HARDWARE.md), the Marauder patch in
 [`pwnfriend-marauder/PATCH.md`](pwnfriend-marauder/PATCH.md), and the wire format in
 [`doc/PwnfriendProtocol.md`](doc/PwnfriendProtocol.md).
 
@@ -42,11 +59,12 @@ Beyond just saying hi, the friend can now behave like a real pwnagotchi:
 - optional active **deauth** to speed a capture along.
 
 > **⚠️ Authorized use only.** Handshake/PMKID capture and deauth are only legal on Wi-Fi
-> networks you **own or are explicitly authorized to test**. Both are **off by default**
-> and gated behind an explicit opt-in (deauth resets to off every launch and needs its
-> own confirmation). Unauthorized use may be a crime where you live — you alone are
-> responsible for how you use this. Educational purposes only. Plain presence mode (say
-> hi + listen) needs none of this and stays the default.
+> networks you **own or are explicitly authorized to test**. They run a full pwnagotchi by
+> default, but stay **gated behind a one-time authorization screen** shown on first launch
+> (accept to arm capture + deauth; decline to stay presence-only). You can drop back to
+> off/passive any time from the menu, and target/whitelist specific APs. Unauthorized use
+> may be a crime where you live — you alone are responsible for how you use this.
+> Educational purposes only.
 
 ## Setup
 ### Flipagotchi Setup (Flipper side)

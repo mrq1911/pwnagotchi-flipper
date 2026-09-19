@@ -1,13 +1,17 @@
-# Build a Marauder firmware that includes the `pwnfriend` command, so the ESP32
-# can be flashed once and drive both the Marauder GUI and the pwnfriend app.
+# Build Marauder firmware that includes the `pwnfriend` command, for every ESP32
+# board you can hang off a Flipper. Each build is a COMPLETE Marauder image with the
+# extra command added — flash once, get the Marauder GUI + pwnfriend both.
 #
-# It clones a Marauder fork, runs pwnfriend-marauder/apply_pwnfriend.py to add
-# the command, then builds with arduino-cli using the same pinned libraries the
-# Feberis fork's nightly uses. Outputs both the separate bins and a single merged
-# image you flash with ESP Flasher / a web flasher.
+# It clones the Marauder fork, runs pwnfriend-marauder/apply_pwnfriend.py, and builds
+# with arduino-cli. On a `v*` tag it also builds the Flipper .fap and publishes a
+# GitHub Release with every board image + the fap attached.
 #
-# The Feberis Pro is an ESP32-S3 (ESP32-S3-WROOM). The S2 devboard entry is a
-# known-good baseline that proves the pipeline.
+# Board matrix (all defines live in the Feberis fork's configs.h):
+#   feberis-pro / feberis  -> classic ESP32   (VERIFIED on hardware: Feberis Pro)
+#   flipper-devboard       -> official Flipper WiFi devboard, ESP32-S2   (best-effort)
+#   multiboard-s3          -> ESP32-S3 multiboard                        (best-effort)
+#   devboard-pro           -> Marauder Dev Board Pro (Flipper hat), S3   (best-effort)
+# fail-fast is off, so an unsupported board never blocks the others.
 
 name: build-pwnfriend
 
@@ -21,9 +25,10 @@ on:
         description: git ref of that fork
         default: feberis
   push:
-    paths:
-      - pwnfriend-marauder/**
-      - .github/workflows/build-pwnfriend.yml
+    # Tags drive releases. No `paths:` here — a tag push has no reliable path diff,
+    # so a path filter would silently build nothing. Use workflow_dispatch for
+    # ad-hoc/test builds off a branch.
+    tags: ["v*"]
 
 env:
   ESP32_CORE_VER: "2.0.11"
@@ -36,13 +41,31 @@ jobs:
       fail-fast: false
       matrix:
         board:
-          # Feberis Pro — CLASSIC ESP32 (chip_id 0, confirmed from the official
-          # FEBERIS_PRO bootloader). Bootloader lives at 0x1000, not 0x0.
           - name: feberis-pro
             flag: BPMCIRCUITS_FEBERIS_PRO
             chip: esp32
             fqbn: "esp32:esp32:esp32:PartitionScheme=min_spiffs,FlashSize=4M"
             boot_addr: "0x1000"
+          - name: feberis
+            flag: BPMCIRCUITS_FEBERIS
+            chip: esp32
+            fqbn: "esp32:esp32:esp32:PartitionScheme=min_spiffs,FlashSize=4M"
+            boot_addr: "0x1000"
+          - name: flipper-devboard
+            flag: MARAUDER_FLIPPER
+            chip: esp32s2
+            fqbn: "esp32:esp32:esp32s2:PartitionScheme=min_spiffs,FlashSize=4M"
+            boot_addr: "0x1000"
+          - name: multiboard-s3
+            flag: MARAUDER_MULTIBOARD_S3
+            chip: esp32s3
+            fqbn: "esp32:esp32:esp32s3:PartitionScheme=min_spiffs,FlashSize=8M"
+            boot_addr: "0x0"
+          - name: devboard-pro
+            flag: MARAUDER_DEV_BOARD_PRO
+            chip: esp32s3
+            fqbn: "esp32:esp32:esp32s3:PartitionScheme=min_spiffs,FlashSize=8M"
+            boot_addr: "0x0"
     steps:
       - name: Checkout pwnfriend (this repo)
         uses: actions/checkout@v4
@@ -101,7 +124,7 @@ jobs:
             https://github.com/espressif/arduino-esp32/releases/download/${ESP32_CORE_VER}/package_esp32_dev_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@${ESP32_CORE_VER}
-          pip install --quiet esptool
+          pip install --quiet esptool pyserial
 
       - name: Work around Marauder multiple-definition link error
         run: |
@@ -127,8 +150,7 @@ jobs:
           echo "build dir: $BUILD"
           BOOT_APP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/${ESP32_CORE_VER}/tools/partitions -name boot_app0.bin | head -1)
           mkdir -p out
-          cp "$BUILD"/esp32_marauder.ino*.bin out/ || true
-          esptool --chip ${{ matrix.board.chip }} merge_bin -o out/pwnfriend-${{ matrix.board.name }}-merged.bin \
+          esptool --chip ${{ matrix.board.chip }} merge_bin -o out/pwnfriend-${{ matrix.board.name }}.bin \
             ${{ matrix.board.boot_addr }} "$BUILD/esp32_marauder.ino.bootloader.bin" \
             0x8000 "$BUILD/esp32_marauder.ino.partitions.bin" \
             0xe000 "$BOOT_APP0" \
@@ -141,3 +163,40 @@ jobs:
           name: pwnfriend-${{ matrix.board.name }}
           path: out/*.bin
           if-no-files-found: error
+
+  # Build the Flipper app so releases carry the .fap alongside the firmwares.
+  fap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Build pwnfriend.fap (ufbt / Unleashed SDK)
+        run: |
+          pip install --quiet ufbt
+          cd pwnfriend
+          ufbt update --index-url https://up.unleashedflip.com/directory.json --channel dev
+          ufbt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pwnfriend-fap
+          path: pwnfriend/dist/pwnfriend.fap
+          if-no-files-found: error
+
+  # On a v* tag: gather every board image + the fap into a GitHub Release.
+  release:
+    needs: [build, fap]
+    # Publish on any v* tag even if a best-effort board leg failed (fail-fast is off),
+    # as long as the run wasn't cancelled — the verified boards + fap still ship.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
