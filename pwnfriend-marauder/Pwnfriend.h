@@ -64,13 +64,25 @@ class Pwnfriend {
     bool reportAP(const uint8_t* payload, int length, int rssi, int channel,
                   bool has_fix, double lat, double lon);
 
+    // Recon: harvest a client station from a DATA frame (the non-BSSID address of
+    // an AP we already know) into the client table, so active mode can deauth it by
+    // UNICAST. Called from the rx callback on every DATA frame; allocation-free.
+    void reportClient(const uint8_t* payload, int length);
+
     // True once a persona has been loaded (so broadcast() has something to send).
     bool ready() const { return _ready; }
 
     // Clear the per-session capture dedup tables. Called at real scan start
     // (RunPwnfriendScan), NOT on a persona refresh — so re-sending the pwnfriend
     // command every 15s doesn't re-count already-pwnd APs and inflate pwnd_tot.
-    void beginSession() { _n_recon = 0; _n_pwnd_seen = 0; }
+    void beginSession() {
+        _n_recon = 0;
+        _n_pwnd_seen = 0;
+        _n_sta = 0;
+        _inactive_epochs = 0;  // a fresh scan starts at full recon speed
+        _epoch_pwnd = false;
+        resetPhase();
+    }
 
     void reset();
 
@@ -98,25 +110,81 @@ class Pwnfriend {
     bool     _ready;
 
     uint32_t _sent;
-    uint32_t _last_active_ms;  // throttle for the assoc+deauth active burst
+    uint32_t _last_active_ms;  // throttle for the pinned-channel active burst
+
+    // --- pwnagotchi-faithful recon/attack dwell (agent.py's epoch loop) ---
+    // RECON sweeps every channel for recon_time gathering APs (and being heard on
+    // the mesh); ATTACK then visits each AP-bearing channel, fires associate()+
+    // deauth() once, and DWELLS hop_recon_time on it so the solicited 4-way
+    // handshake actually completes before we hop away. The old blind 500ms hop is
+    // exactly why nothing was ever captured.
+    enum Phase { PHASE_RECON, PHASE_ATTACK };
+    Phase    _phase;
+    uint32_t _phase_ms;        // millis() when the phase / channel dwell began
+    uint8_t  _cur_channel;     // channel we're parked on right now
+    uint32_t _last_hop_ms;     // recon-sweep hop cadence timer
+    uint8_t  _attack_list[14]; // AP-bearing channels to attack this epoch
+    int      _n_attack;        // channels in _attack_list
+    int      _attack_idx;      // current channel within _attack_list
+    bool     _chan_attacked;   // fired assoc+deauth on _attack_list[_attack_idx]?
+    bool     _epoch_pwnd;      // captured anything this epoch (activity signal)
+    uint8_t  _inactive_epochs; // consecutive fruitless epochs (recon_time doubling)
+    uint32_t _last_deauth_ms;  // re-deauth cadence within the current channel dwell
+    uint32_t _cur_dwell_ms;    // this channel's dwell, scaled by its target count
+    int8_t   _attack_min_rssi; // don't waste the dwell attacking APs weaker than this
+    uint32_t _recon_time_ms;   // recon_time override (-recon), default 30s
+
+    // Targeting + whitelist (set from the Flipper's options menu). When a target is
+    // set, only that BSSID is attacked (the attack list collapses to its channel);
+    // whitelisted BSSIDs are never attacked (but still recon'd/reported).
+    bool     _target_set;
+    uint8_t  _target[6];
+    static const int MAX_WL = 16;
+    uint8_t  _wl[MAX_WL][6];
+    int      _n_wl;
 
     // Per-session capture bookkeeping (cleared in beginSession(), at scan start).
     struct ReconAP {
         uint8_t bssid[6];
         char ssid[33];
         uint8_t channel;
+        int8_t  rssi;    // first-seen beacon RSSI, for attack targeting (0 = unknown)
         uint8_t attacks; // active-mode assoc/deauth bursts aimed at this AP
         bool missed;     // already emitted a PWNFRIEND_MISS for it
     };
-    static const int MAX_RECON = 64;
-    static const int MAX_PWND  = 64;
+    // A dense area easily tops 80 APs; 64 silently dropped ~16 of them (never
+    // recon'd, never attacked). 128 covers a busy neighbourhood.
+    static const int MAX_RECON = 128;
+    static const int MAX_PWND  = 128;
+    static const int MAX_STA   = 128;   // client stations tracked for unicast deauth
     // Active-mode bursts against an AP with no capture before it counts as a
-    // "miss" (pwnagotchi's on_miss). ACTIVE_INTERVAL_MS apart, so ~4 * 2s = 8s.
+    // "miss" (pwnagotchi's on_miss).
     static const int MISS_ATTEMPTS = 4;
     ReconAP  _recon[MAX_RECON];
     int      _n_recon;
     uint8_t  _pwnd_seen[MAX_PWND][6];
     int      _n_pwnd_seen;
+
+    // Client stations sniffed from DATA frames, so we can deauth them by UNICAST
+    // (spoofing both directions) the way pwnagotchi/bettercap does — broadcast
+    // deauth is ignored by modern clients, which is why yield was so low.
+    struct ClientSta {
+        uint8_t mac[6];
+        uint8_t ap_idx;      // index into _recon of the AP this client belongs to
+        uint32_t last_seen;  // millis(), to age out roamed/departed clients
+    };
+    ClientSta _sta[MAX_STA];
+    int       _n_sta;
+
+    // Recon/attack epoch machine helpers (see broadcast()).
+    void resetPhase();                    // back to a fresh RECON sweep
+    void endEpoch(uint32_t now);          // roll inactive streak, restart RECON
+    void buildAttackList();               // AP-bearing channels, most-populated first
+    void attackChannel(uint8_t channel);  // assoc + full deauth pass on entry
+    void deauthChannelPass(uint8_t channel); // deauth-only re-kick during the dwell
+    uint32_t channelDwellMs(uint8_t channel); // dwell scaled by eligible target count
+    bool attackable(const ReconAP& ap) const; // not pwned, in range, not whitelisted/off-target
+    bool isWhitelisted(const uint8_t* bssid) const;
 
     int  reconIndex(const uint8_t* bssid) const;   // -1 if unseen
     bool markPwnd(const uint8_t* bssid);           // true if newly counted
@@ -125,15 +193,26 @@ class Pwnfriend {
                   const char* type, int channel, int rssi,
                   bool has_fix, double lat, double lon);
     void deauthAP(const uint8_t* bssid);
+    // Unicast deauth of one client, spoofed in BOTH directions (AP->client and
+    // client->AP) — the effective form modern clients honour, mirroring bettercap's
+    // wifi.deauth (and Marauder's sendDeauthFrame).
+    void deauthClient(const uint8_t* bssid, const uint8_t* client);
     // Send a WPA2 association request to a target AP to solicit its RSN PMKID
-    // (EAPOL M1) — pwnagotchi's associate() half, no client needed. Only fired
-    // in active mode (the -deauth opt-in), same as deauthAP.
+    // (EAPOL M1) — pwnagotchi's associate() half, no client needed. Prefixed by an
+    // open-system Authentication so the AP actually processes it. Only fired in
+    // active mode (the -deauth opt-in), same as deauthAP.
     void assocAP(const uint8_t* bssid, const char* ssid);
     // Emit one self-describing "PWNFRIEND_HS <bssid12hex> <framehex>" line for a
     // raw 802.11 frame. The Flipper files the frame under <bssid>.pcap by parsing
     // this line alone (no dependence on a preceding PWND). Raw binary would trip
     // the CLI's CR/XON handling, so we stream lowercase hex.
     void streamFrameHex(const uint8_t* bssid, const uint8_t* frame, int length);
+    // On capture, synthesize a minimal beacon carrying the AP's ESSID and stream it
+    // into the same per-BSSID pcap. hcxpcapngtool/hashcat need the ESSID in the file;
+    // when we caught the EAPOL as DATA frames but never sniffed/kept the real beacon
+    // (e.g. table was full, or a cross-session file), the capture was uncrackable
+    // without this. No-op if the SSID is unknown/hidden.
+    void streamSyntheticBeacon(const uint8_t* bssid, const char* ssid);
 };
 
 // Map a face index (matching flipagotchi's enum PwnagotchiFace) to a glyph.
