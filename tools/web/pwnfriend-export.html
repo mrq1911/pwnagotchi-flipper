@@ -74,6 +74,7 @@
     <button id="pick" class="secondary">Choose folder…</button>
     <input id="dir" type="file" webkitdirectory directory multiple hidden>
     <input id="files" type="file" accept=".pcap,.csv" multiple hidden>
+    <div class="note" id="serialhint" style="margin:2px 0 0">⚠ Close <b>qFlipper</b> and <b>lab.flipper.net</b> first — only one app can hold the USB port, so a USB pull fails until the Flipper is disconnected from everything else.</div>
     <div id="drop">…or drop the Flipper's <code>pwnfriend</code> folder (its <code>.pcap</code> / <code>wardrive.csv</code>) here</div>
   </div></div>
 
@@ -397,7 +398,10 @@ function renderMap(points, crackSet) {
   if (!pts.length) { wrap.hidden = true; return; }
   wrap.hidden = false;
   if (!_map) {
-    _map = L.map('map', { attributionControl: true });
+    // preferCanvas: draw the markers on a single <canvas> instead of one SVG node
+    // each — a big wardrive is thousands of points, and the SVG path per marker is
+    // what made panning/zooming choke and crash the tab.
+    _map = L.map('map', { attributionControl: true, preferCanvas: true });
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
       { maxZoom: 19, subdomains: 'abc', attribution: '© OpenStreetMap contributors' }).addTo(_map);
     _markers = L.layerGroup().addTo(_map);
@@ -420,8 +424,13 @@ function renderMap(points, crackSet) {
     mk.addTo(_markers);
     latlngs.push([p.lat, p.lon]);
   }
-  _map.invalidateSize(); // it was display:none until now
-  _map.fitBounds(latlngs, { padding: [30, 30], maxZoom: 17 });
+  // The panel was display:none until this render, so the map container has no size
+  // yet. Fitting now measures 0px and lands on the whole-world view — defer to after
+  // layout (two rAFs) so invalidateSize sees real dimensions and the fit sticks.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    _map.invalidateSize();
+    if (latlngs.length) _map.fitBounds(latlngs, { padding: [30, 30], maxZoom: 17 });
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -501,17 +510,29 @@ async function serialConnect() {
     const listing = await sendCmd(`storage list ${DIR}/handshakes\r\n`);
     const names = [...listing.matchAll(/\[F\]\s+(\S+\.pcap)\s+\d+b?/g)].map(m => m[1]);
     log(`found ${names.length} pcaps`);
-    let i = 0;
+    let i = 0, failed = 0;
     for (const n of names) {
-      const buf = await storageRead(`${DIR}/handshakes/${n}`);
+      // One retry per file: a single stalled read resyncs the prompt and tries again
+      // instead of aborting the whole pull (that's what forced a manual restart).
+      let buf = await storageRead(`${DIR}/handshakes/${n}`);
+      if (!buf) {
+        await drainTo('>: ', 600).catch(() => {});
+        buf = await storageRead(`${DIR}/handshakes/${n}`);
+      }
       if (buf) addPcap(n, buf);
-      if (++i % 10 === 0) log(`  …${i}/${names.length}`);
+      else { failed++; log('  gave up on', n); }
+      if (++i % 10 === 0 || i === names.length) log(`  …${i}/${names.length}`);
     }
-    const w = await storageRead(`${DIR}/wardrive.csv`);
+    if (failed) log(`${failed} pcap(s) failed to read — the rest are fine.`);
+    let w = await storageRead(`${DIR}/wardrive.csv`);
+    if (!w) { await drainTo('>: ', 600).catch(() => {}); w = await storageRead(`${DIR}/wardrive.csv`); }
     if (w) wardriveText = new TextDecoder().decode(new Uint8Array(w));
     render();
   } catch (e) {
-    log('serial error:', e.message || e);
+    const m = (e && e.message) || String(e);
+    log('serial error:', m);
+    if (/open|access|busy|already|locked|failed to open/i.test(m))
+      log('→ close qFlipper / lab.flipper.net (or any app holding the port) and reconnect.');
   } finally {
     // Each release/close independently guarded so one failure can't skip the rest,
     // and the close is actually awaited so the port frees before the next connect.
