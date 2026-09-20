@@ -24,4 +24,10 @@
 // to flash. Kept <=53 bytes so the QR stays version-3 (29x29) at 2px/module.
 #define PWNFRIEND_SETUP_URL "https://github.com/mrq1911/pwnagotchi-flipper"
 
+// pwnfriend serial-protocol version this app expects the ESP32 firmware to speak
+// (mirrors PWNFRIEND_PROTO in the firmware's Pwnfriend.h). The firmware stamps its
+// own version on every PWNFRIEND_ADV as ver=N; when that's non-zero but below this,
+// the flashed board is too old for the current feature set and we warn the user.
+#define PWNFRIEND_FW_PROTO 4
+
 // FLIPPER_SCREEN_WIDTH / _HEIGHT come from pwn_constants.h (via pwnagotchi.h).

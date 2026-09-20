@@ -11,6 +11,7 @@
 #include <math.h>
 
 #include "../include/pwnfriend.h"
+#include "version.h"
 #include "../include/persona.h"
 #include "../include/peers.h"
 #include "../include/face.h"
@@ -53,6 +54,15 @@ typedef enum {
 #define AP_DB_MAGIC 0x50414E46u // 'FNAP'
 #define AP_DB_VERSION 1
 
+// Dev telemetry: one CSV row per PWNFRIEND_EPOCH, for offline algo tuning.
+#define TELEMETRY_PATH "/ext/apps_data/pwnfriend/telemetry.csv"
+
+// The heartbeat timer fires ANIM_HZ times/sec so the About banner can scroll
+// smoothly; the once-per-second brain work is gated to every ANIM_HZ-th fire.
+#define ANIM_HZ 8
+#define ABOUT_SPEED_DEFAULT 3 // px per animation fire
+#define ABOUT_SPEED_MAX 12
+
 typedef struct {
     char bssid[13]; // 12-hex key (no colons)
     char ssid[33]; // ESSID, empty if hidden/unknown
@@ -71,8 +81,10 @@ typedef struct {
 // handshakes the firmware sniffs; Deauth = also associate + deauth (-deauth 1).
 typedef enum {
     CaptureOff = 0,
-    CapturePassive,
-    CaptureDeauth,
+    CapturePassive, // listen only, no TX
+    CapturePmkid, // associate (solicit PMKID) but no deauth — quieter
+    CaptureDeauth, // associate + deauth (full pwnagotchi)
+    CaptureModeCount,
 } CaptureMode;
 
 // Which stat the persona "speaks" on the home screen; cycled Left/Right.
@@ -84,6 +96,13 @@ typedef enum {
     StatPageCount,
 } StatPage;
 
+// ScreenApList filter modes.
+typedef enum {
+    FilterAll = 0,
+    FilterPwned,
+    FilterWhitelist,
+} ListFilter;
+
 // App screens. Home is the pwnagotchi; OK opens the menu; the rest hang off it.
 typedef enum {
     ScreenHome = 0,
@@ -94,20 +113,24 @@ typedef enum {
     ScreenAbout,
 } Screen;
 
-// Menu rows. The nav rows (OK opens a sub-screen) come first, then the live config
-// rows (Left/Right adjust, or OK toggles/cycles).
+// Menu rows. OK-activated rows (open a screen / editor / one-shot action) come
+// first; then the arrow-adjustable rows (Left/Right changes the value, shown on the
+// right flanked by ◄ ► glyphs). About is pinned last.
 typedef enum {
-    MenuPwnedAps = 0,
-    MenuAllAps,
-    MenuStats,
-    MenuAdvertise,
-    MenuCapture,
-    MenuName,
-    MenuChannel,
-    MenuMinRssi,
-    MenuRecon,
-    MenuSetHome,
-    MenuAbout,
+    MenuPwnedAps = 0, // OK: AP list (pwned)
+    MenuAllAps, // OK: AP list (all)
+    MenuWhitelist, // OK: AP list (whitelisted)
+    MenuStats, // OK: stats
+    MenuName, // OK: name editor
+    MenuSetHome, // OK: capture GPS home
+    // --- below: Left/Right adjusts the value ---
+    MenuAdvertise, // toggle
+    MenuCapture, // cycle
+    MenuChannel, // adjust
+    MenuMinRssi, // adjust
+    MenuRecon, // adjust
+    MenuQuiet, // toggle
+    MenuAbout, // OK: about (pinned last)
     MenuCount,
 } MenuItem;
 
@@ -144,7 +167,7 @@ typedef struct {
     uint8_t menu_idx; // selected row in ScreenMenu
     uint16_t list_idx; // selected AP index (into the filtered list) in ScreenApList
     uint16_t list_top; // scroll window top in ScreenApList
-    bool list_pwned_only; // ScreenApList filter
+    uint8_t list_filter; // ScreenApList filter: 0=all, 1=pwned, 2=whitelisted
     uint16_t detail_ap; // aps[] index shown in ScreenApDetail
 
     // GPS: set once the firmware reports any lat/lon (geotag seen). last_lat/lon
@@ -154,6 +177,15 @@ typedef struct {
     char last_lon[16];
     char gps_place[32]; // distance+direction to home, e.g. "Home 12km SW"
     float home_lat, home_lon; // the point the GPS compass points at (default Prague; settable)
+    bool quiet; // suppress the LED blink + vibro on pwn / new-friend (persisted)
+    int fw_proto; // ESP32 firmware protocol version from PWNFRIEND_ADV (0 = unknown)
+    uint32_t pwn_active; // captures our own attack earned (via=active), this session
+    uint32_t pwn_passive; // captures sniffed passively (via=passive), this session
+
+    // About-screen banner scroll (the mrq art is wider than the screen).
+    uint32_t about_scroll; // monotonic px accumulator, advanced by the timer
+    uint8_t about_speed; // px advanced per animation fire (1..ABOUT_SPEED_MAX)
+    bool about_infinite; // scroll mode: false = bounce, true = infinite wrap
 
     // ESP32-link watchdog: warn when the board stops answering (unplugged, rear
     // switch off ESP32, wrong firmware). All in tick_secs, written under the lock.
@@ -175,6 +207,7 @@ typedef struct {
     FuriStreamBuffer* rx_stream;
     FuriHalSerialHandle* serial_handle;
     FuriTimer* timer;
+    uint32_t anim_tick; // sub-second timer counter (ANIM_HZ fires per second)
     Storage* storage; // for the handshake pcap writer
     TextInput* text_input; // "Set name" editor (view id 1)
     char name_buf[PERSONA_NAME_MAX]; // edit buffer for the name text input
@@ -237,6 +270,8 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
             // sees the truth. Current firmware that doesn't know -cap ignores it.
             int cap = (model->capture_mode != CaptureOff) ? 1 : 0;
             int deauth = (model->capture_mode == CaptureDeauth) ? 1 : 0;
+            // -assoc: solicit PMKID (associate) in both PMKID and Deauth modes.
+            int assoc = (model->capture_mode == CapturePmkid || model->capture_mode == CaptureDeauth) ? 1 : 0;
             // -ch: 0 tells the firmware to auto-hop (the '*' sweep); 1..14 pins it
             // to the channel the user tuned to with Up/Down.
             int ch = (model->tuned_channel >= 1 && model->tuned_channel <= 14) ?
@@ -266,7 +301,7 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
                 cmd,
                 sizeof(cmd),
                 "pwnfriend -n %s -id %s -f %d -pr %lu -pt %lu -u %lu -e %lu -cap %d "
-                "-deauth %d -ch %d -minrssi %d -recon %u -target %s -wl %s\n",
+                "-deauth %d -assoc %d -ch %d -minrssi %d -recon %u -target %s -wl %s\n",
                 safe_name,
                 p->s.identity,
                 (int)persona_face(p),
@@ -276,6 +311,7 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
                 (unsigned long)p->epoch,
                 cap,
                 deauth,
+                assoc,
                 ch,
                 (int)model->min_rssi,
                 (unsigned)model->recon_secs,
@@ -364,15 +400,17 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
 }
 
 static void pwnfriend_handle_adv_line(PwnfriendApp* app, const char* line) {
-    int ch = 0, sent = 0;
+    int ch = 0, sent = 0, ver = 0;
     line_extract_int(line, "ch=", &ch);
     line_extract_int(line, "sent=", &sent);
+    line_extract_int(line, "ver=", &ver); // firmware protocol version (0 on old builds)
     with_view_model(
         app->view,
         PwnfriendModel * model,
         {
             model->adv_channel = (uint8_t)ch;
             model->adv_sent_count = (uint32_t)sent;
+            model->fw_proto = ver;
         },
         true);
 }
@@ -465,11 +503,13 @@ static void ap_db_save(Storage* storage, PwnfriendModel* model) {
     storage_file_free(f);
 }
 
+// Small prefs file: home point + quiet flag (stored together in home.bin).
 typedef struct {
     uint32_t magic;
     uint32_t version;
     float lat;
     float lon;
+    uint8_t quiet;
 } HomeDb;
 
 static void home_load(Storage* storage, PwnfriendModel* model) {
@@ -479,6 +519,7 @@ static void home_load(Storage* storage, PwnfriendModel* model) {
         if(storage_file_read(f, &h, sizeof(h)) == sizeof(h) && h.magic == HOME_DB_MAGIC) {
             model->home_lat = h.lat;
             model->home_lon = h.lon;
+            model->quiet = h.quiet != 0;
         }
     }
     storage_file_close(f);
@@ -489,7 +530,8 @@ static void home_save(Storage* storage, PwnfriendModel* model) {
     storage_common_mkdir(storage, "/ext/apps_data/pwnfriend");
     File* f = storage_file_alloc(storage);
     if(storage_file_open(f, HOME_DB_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        HomeDb h = {HOME_DB_MAGIC, 1, model->home_lat, model->home_lon};
+        HomeDb h = {HOME_DB_MAGIC, 2, model->home_lat, model->home_lon,
+                    (uint8_t)(model->quiet ? 1 : 0)};
         storage_file_write(f, &h, sizeof(h));
     }
     storage_file_close(f);
@@ -542,6 +584,7 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
     char bssid[18] = {0};
     char ssid[33] = {0};
     char type[12] = {0};
+    char via[10] = {0};
     char lat[16] = {0};
     char lon[16] = {0};
     int channel = 0, rssi = 0;
@@ -549,6 +592,7 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
     line_extract_str(line, "\"bssid\":\"", bssid, sizeof(bssid));
     line_extract_str(line, "\"ssid\":\"", ssid, sizeof(ssid));
     line_extract_str(line, "\"type\":\"", type, sizeof(type));
+    line_extract_str(line, "\"via\":\"", via, sizeof(via)); // active|passive (empty on fw<4)
     line_extract_int(line, "\"channel\":", &channel);
     line_extract_int(line, "\"rssi\":", &rssi);
     // lat/lon are present only when the GPS had a fix (contract v2); both or neither.
@@ -571,6 +615,9 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
                 persona_note_pwnd(model->persona);
                 strncpy(model->last_pwnd_ssid, label, sizeof(model->last_pwnd_ssid) - 1);
                 model->last_pwnd_ssid[sizeof(model->last_pwnd_ssid) - 1] = '\0';
+                // Provenance split: did our attack earn it, or did we sniff it passively?
+                if(strcmp(via, "active") == 0) model->pwn_active++;
+                else model->pwn_passive++;
                 counted = true;
             }
             // Record the capture on the AP (browser + progress), regardless of the
@@ -608,6 +655,23 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
     }
 
     if(counted) app->got_pwnd = true; // capture blink
+}
+
+// "PWNFRIEND_RSSI <mac> <dbm>" — a throttled live-signal refresh for an already-known
+// AP (firmware protocol v3). Updates the stored RSSI so the list/detail bar tracks it.
+static void pwnfriend_handle_rssi_line(PwnfriendApp* app, const char* line) {
+    char key[13];
+    bssid_key(key, line + 15); // hex of the mac, colons skipped, stops at 12
+    const char* sp = strchr(line + 15, ' ');
+    if(!sp) return;
+    int rssi = (int)strtol(sp + 1, NULL, 10);
+    with_view_model(
+        app->view, PwnfriendModel * model,
+        {
+            int ai = ap_find(model, key);
+            if(ai >= 0) model->aps[ai].rssi = (int16_t)rssi;
+        },
+        true);
 }
 
 static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
@@ -732,6 +796,54 @@ static void pwnfriend_handle_miss_line(PwnfriendApp* app, const char* line) {
         true);
 }
 
+// "PWNFRIEND_EPOCH {...}" — dev telemetry (fw v4). Append one CSV row per epoch to SD
+// (with uptime + last GPS) so a data dump can be analysed offline to tune the algo.
+static void pwnfriend_handle_epoch_line(PwnfriendApp* app, const char* line) {
+    int n = 0, recon = 0, att = 0, chans = 0, assoc = 0, deauth = 0, uni = 0, sta = 0, hs = 0,
+        pmkid = 0, miss = 0;
+    line_extract_int(line, "\"n\":", &n);
+    line_extract_int(line, "\"recon\":", &recon);
+    line_extract_int(line, "\"attackable\":", &att);
+    line_extract_int(line, "\"chans\":", &chans);
+    line_extract_int(line, "\"assoc\":", &assoc);
+    line_extract_int(line, "\"deauth\":", &deauth);
+    line_extract_int(line, "\"unicast\":", &uni);
+    line_extract_int(line, "\"sta\":", &sta);
+    line_extract_int(line, "\"hs\":", &hs);
+    line_extract_int(line, "\"pmkid\":", &pmkid);
+    line_extract_int(line, "\"miss\":", &miss);
+
+    uint32_t up = 0;
+    char lat[16], lon[16];
+    with_view_model(
+        app->view, PwnfriendModel * model,
+        {
+            up = model->tick_secs;
+            strncpy(lat, model->last_lat, sizeof(lat));
+            lat[sizeof(lat) - 1] = '\0';
+            strncpy(lon, model->last_lon, sizeof(lon));
+            lon[sizeof(lon) - 1] = '\0';
+        },
+        false);
+
+    storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
+    File* f = storage_file_alloc(app->storage);
+    if(storage_file_open(f, TELEMETRY_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
+        if(storage_file_size(f) == 0) {
+            const char* h =
+                "uptime_s,lat,lon,epoch,recon,attackable,chans,assoc,deauth,unicast,sta,hs,pmkid,miss\n";
+            storage_file_write(f, h, strlen(h));
+        }
+        char row[176];
+        snprintf(
+            row, sizeof(row), "%lu,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", (unsigned long)up,
+            lat, lon, n, recon, att, chans, assoc, deauth, uni, sta, hs, pmkid, miss);
+        storage_file_write(f, row, strlen(row));
+    }
+    storage_file_close(f);
+    storage_file_free(f);
+}
+
 static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
     // PWNFRIEND_PWND and PWNFRIEND_PEER share the PWNFRIEND_P prefix, so both
     // full comparisons are needed.
@@ -743,6 +855,10 @@ static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
         pwnfriend_handle_hs_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_AP ", 13) == 0) {
         pwnfriend_handle_ap_line(app, line);
+    } else if(strncmp(line, "PWNFRIEND_RSSI ", 15) == 0) {
+        pwnfriend_handle_rssi_line(app, line);
+    } else if(strncmp(line, "PWNFRIEND_EPOCH ", 16) == 0) {
+        pwnfriend_handle_epoch_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_ADV ", 14) == 0) {
         pwnfriend_handle_adv_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_MISS ", 15) == 0) {
@@ -948,13 +1064,20 @@ static bool ap_crackable(const ApRec* a) {
     return a->has_essid && (a->pmkid || a->handshake);
 }
 
-// Capture progress 1..4: discovered -> named -> key material -> crackable.
-static int ap_progress(const ApRec* a) {
-    int s = 1; // a record exists at all -> discovered
-    if(a->has_essid) s++; // know its name (a hashline needs it)
-    if(a->pmkid || a->handshake) s++; // grabbed key material
-    if(ap_crackable(a)) s++; // both -> crackable
-    return s;
+// RSSI -> 0..50 bar units (total=50): -90 dBm (floor) empty .. -40 dBm full.
+static int rssi_level(int rssi) {
+    int v = rssi + 90;
+    if(v < 0) v = 0;
+    if(v > 50) v = 50;
+    return v;
+}
+
+// Compact capture flags for a list row: E(SSID)/P(MKID)/H(andshake), '-' if absent.
+static void ap_flags_str(const ApRec* a, char out[4]) {
+    out[0] = a->has_essid ? 'E' : '-';
+    out[1] = a->pmkid ? 'P' : '-';
+    out[2] = a->handshake ? 'H' : '-';
+    out[3] = '\0';
 }
 
 // Draw text truncated with the current font to fit `maxw` px at (x,y).
@@ -996,7 +1119,9 @@ static void fmt_bssid_colons(const char* k, char out[18]) {
 }
 
 static const char* capture_name(CaptureMode m) {
-    return m == CaptureDeauth ? "DEAUTH" : m == CapturePassive ? "CAP" : "off";
+    return m == CaptureDeauth ? "DEAUTH" : m == CapturePmkid ? "PMKID" :
+           m == CapturePassive ? "CAP" :
+                                 "off";
 }
 
 // Tiny d-pad/button glyphs drawn inline (this SDK exports no firmware button icons).
@@ -1006,6 +1131,16 @@ static void icon_left(Canvas* c, int x, int yc) { // solid ◄, 4x7
 }
 static void icon_right(Canvas* c, int x, int yc) { // solid ►, 4x7
     for(int i = 0; i < 4; i++) canvas_draw_line(c, x + 3 - i, yc - i, x + 3 - i, yc + i);
+}
+// Right-aligned "◄ value ►" for an arrow-adjustable menu row: the glyphs signal it's
+// changed with Left/Right (no literal < > text). `y` is the text baseline.
+static void draw_adjust_value(Canvas* c, int y, const char* value) {
+    int yc = y - 3; // glyph centre vs the text baseline
+    int vw = (int)canvas_string_width(c, value);
+    icon_right(c, FLIPPER_SCREEN_WIDTH - 5, yc); // ► apex at the right edge (col 126)
+    int vx = FLIPPER_SCREEN_WIDTH - 5 - 2 - vw; // value sits left of the ►
+    canvas_draw_str(c, vx, y, value);
+    icon_left(c, vx - 6, yc); // ◄ left of the value
 }
 // Title bar (inverted): title left, optional right-aligned text. Back is a universal
 // Flipper button, so we don't waste pixels hinting it.
@@ -1023,7 +1158,8 @@ static void draw_titlebar(Canvas* c, const char* title, const char* right) {
 static uint16_t ap_filtered(const PwnfriendModel* m, uint16_t* out) {
     uint16_t n = 0;
     for(uint16_t i = 0; i < m->ap_count; i++) {
-        if(m->list_pwned_only && !(m->aps[i].pmkid || m->aps[i].handshake)) continue;
+        if(m->list_filter == FilterPwned && !(m->aps[i].pmkid || m->aps[i].handshake)) continue;
+        if(m->list_filter == FilterWhitelist && !m->aps[i].whitelisted) continue;
         out[n++] = i;
     }
     return n;
@@ -1036,55 +1172,102 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
     draw_titlebar(canvas, "pwnfriend menu", NULL);
     canvas_set_font(canvas, FontSecondary);
 
-    uint16_t pwned = 0;
-    for(uint16_t i = 0; i < model->ap_count; i++)
+    uint16_t pwned = 0, wl = 0;
+    for(uint16_t i = 0; i < model->ap_count; i++) {
         if(model->aps[i].pmkid || model->aps[i].handshake) pwned++;
+        if(model->aps[i].whitelisted) wl++;
+    }
 
     int rows = APLIST_ROWS;
     int top = 0;
     if(model->menu_idx >= rows) top = model->menu_idx - rows + 1;
     for(int r = 0; r < rows && top + r < MenuCount; r++) {
         int it = top + r;
-        char row[30];
+        const char* label = "";
+        char value[24];
+        value[0] = '\0';
+        bool adjustable = false; // draws ◄ value ► instead of a plain right-aligned value
         switch(it) {
-        case MenuPwnedAps: snprintf(row, sizeof(row), "Pwned APs (%u)", pwned); break;
-        case MenuAllAps: snprintf(row, sizeof(row), "All APs (%u)", model->ap_count); break;
-        case MenuStats: snprintf(row, sizeof(row), "Stats"); break;
-        case MenuName: snprintf(row, sizeof(row), "Name: %s", model->persona->s.name); break;
+        // OK-activated rows: a plain right-aligned value (count / name / hint).
+        case MenuPwnedAps: label = "Pwned APs"; snprintf(value, sizeof(value), "%u", pwned); break;
+        case MenuAllAps:
+            label = "All APs";
+            snprintf(value, sizeof(value), "%u", model->ap_count);
+            break;
+        case MenuWhitelist: label = "Ignore"; snprintf(value, sizeof(value), "%u", wl); break;
+        case MenuStats: label = "Stats"; break;
+        case MenuName:
+            label = "Name";
+            snprintf(value, sizeof(value), "%s", model->persona->s.name);
+            break;
+        case MenuSetHome:
+            label = "Set home";
+            if(!model->gps_seen) snprintf(value, sizeof(value), "no gps");
+            break;
+        // Arrow-adjustable rows: value flanked by ◄ ► glyphs.
         case MenuAdvertise:
-            snprintf(row, sizeof(row), "Advertise: %s", model->advertising ? "ON" : "off");
+            label = "Advertise";
+            adjustable = true;
+            snprintf(value, sizeof(value), "%s", model->advertising ? "ON" : "off");
             break;
         case MenuCapture:
-            snprintf(row, sizeof(row), "Capture: %s", capture_name(model->capture_mode));
+            label = "Capture";
+            adjustable = true;
+            snprintf(value, sizeof(value), "%s", capture_name(model->capture_mode));
             break;
         case MenuChannel:
+            label = "Channel";
+            adjustable = true;
             if(model->tuned_channel >= 1 && model->tuned_channel <= 14)
-                snprintf(row, sizeof(row), "Channel: %d", model->tuned_channel);
+                snprintf(value, sizeof(value), "%d", model->tuned_channel);
             else
-                snprintf(row, sizeof(row), "Channel: *");
+                snprintf(value, sizeof(value), "*");
             break;
-        case MenuMinRssi: snprintf(row, sizeof(row), "Min RSSI: %d", model->min_rssi); break;
-        case MenuRecon: snprintf(row, sizeof(row), "Recon: %us", model->recon_secs); break;
-        case MenuSetHome:
-            snprintf(row, sizeof(row), "Set home %s", model->gps_seen ? "(here)" : "(no GPS)");
+        case MenuMinRssi:
+            label = "Min RSSI";
+            adjustable = true;
+            snprintf(value, sizeof(value), "%d", model->min_rssi);
             break;
-        case MenuAbout: snprintf(row, sizeof(row), "About"); break;
-        default: row[0] = '\0';
+        case MenuRecon:
+            label = "Recon";
+            adjustable = true;
+            snprintf(value, sizeof(value), "%us", model->recon_secs);
+            break;
+        case MenuQuiet:
+            label = "Quiet";
+            adjustable = true;
+            snprintf(value, sizeof(value), "%s", model->quiet ? "on" : "off");
+            break;
+        case MenuAbout: label = "About"; break;
+        default: break;
         }
         int y = 11 + (r + 1) * 10; // baseline of this row
-        if(it == model->menu_idx) {
+        bool sel = it == model->menu_idx;
+        if(sel) {
             canvas_draw_box(canvas, 0, y - 9, FLIPPER_SCREEN_WIDTH, 10);
             canvas_set_color(canvas, ColorWhite);
         }
-        canvas_draw_str(canvas, 3, y, row);
-        if(it == model->menu_idx) canvas_set_color(canvas, ColorBlack);
+        canvas_draw_str(canvas, 3, y, label);
+        if(value[0]) {
+            if(adjustable) {
+                draw_adjust_value(canvas, y, value);
+            } else {
+                int vw = (int)canvas_string_width(canvas, value);
+                canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - 3 - vw, y, value);
+            }
+        }
+        if(sel) canvas_set_color(canvas, ColorBlack);
     }
 }
 
 static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     char title[24];
-    snprintf(title, sizeof(title), "%s", model->list_pwned_only ? "PWNED APS" : "ALL APS");
+    snprintf(
+        title, sizeof(title), "%s",
+        model->list_filter == FilterPwned    ? "PWNED APS" :
+        model->list_filter == FilterWhitelist ? "IGNORED" :
+                                                "ALL APS");
     uint16_t idx[AP_MAX];
     uint16_t n = ap_filtered(model, idx);
     char hint[10];
@@ -1093,7 +1276,10 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
     canvas_set_font(canvas, FontSecondary);
     if(n == 0) {
         canvas_draw_str(
-            canvas, 2, 36, model->list_pwned_only ? "no pwned APs yet" : "no APs seen yet");
+            canvas, 2, 36,
+            model->list_filter == FilterPwned    ? "no pwned APs yet" :
+            model->list_filter == FilterWhitelist ? "no ignored APs" :
+                                                    "no APs seen yet");
         return;
     }
     for(uint16_t r = 0; r < APLIST_ROWS && model->list_top + r < n; r++) {
@@ -1104,11 +1290,30 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
             canvas_draw_box(canvas, 0, y - 9, FLIPPER_SCREEN_WIDTH, 10);
             canvas_set_color(canvas, ColorWhite);
         }
+        // Pwned view: name + [T/I] + capture status only (signal/flags aren't useful
+        // once it's caught). Other views: name + [T/I] + signal bar + E/P/H flags.
         const char* name = a->ssid[0] ? a->ssid : a->bssid;
-        draw_str_trunc(canvas, 3, y, name, 80);
-        if(a->targeted) canvas_draw_str(canvas, 84, y, "T");
-        if(a->whitelisted) canvas_draw_str(canvas, 84, y, "W");
-        draw_progress(canvas, 92, y - 7, 34, 7, ap_progress(a), 4);
+        bool pwned_view = model->list_filter == FilterPwned;
+        char right[8];
+        if(pwned_view)
+            snprintf(right, sizeof(right), "%s", ap_crackable(a) ? "CRACK" : "cap");
+        else
+            ap_flags_str(a, right);
+        int fw = (int)canvas_string_width(canvas, right);
+        int fx = FLIPPER_SCREEN_WIDTH - 2 - fw; // right element hugs the right edge
+        int marker_x = pwned_view ? fx - 10 : 0;
+        if(!pwned_view) {
+            int bar_w = 26;
+            int bar_x = fx - 4 - bar_w;
+            marker_x = bar_x - 8;
+            draw_progress(canvas, bar_x, y - 7, bar_w, 7, rssi_level(a->rssi), 50);
+        }
+        draw_str_trunc(canvas, 3, y, name, marker_x - 5);
+        if(a->targeted)
+            canvas_draw_str(canvas, marker_x, y, "T");
+        else if(a->whitelisted)
+            canvas_draw_str(canvas, marker_x, y, "I");
+        canvas_draw_str(canvas, fx, y, right);
         if(sel) canvas_set_color(canvas, ColorBlack);
     }
 }
@@ -1116,21 +1321,23 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
 static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     const ApRec* a = &model->aps[model->detail_ap];
-    draw_titlebar(canvas, "AP", NULL);
+    // SSID goes in the title bar (clipped at the edge if long) so the body has room.
+    draw_titlebar(canvas, a->ssid[0] ? a->ssid : "(hidden)", NULL);
     canvas_set_font(canvas, FontSecondary);
-    draw_str_trunc(canvas, 2, 21, a->ssid[0] ? a->ssid : "(hidden)", 124);
+    char l[40];
     char mac[18];
     fmt_bssid_colons(a->bssid, mac);
-    char l[40];
-    snprintf(l, sizeof(l), "%s  ch%d  %ddBm", mac, a->channel, a->rssi);
-    canvas_draw_str(canvas, 2, 31, l);
-    // progress bar (narrow enough that the stage word to its right still fits 128px)
-    int stg = ap_progress(a);
-    const char* word = ap_crackable(a) ? "CRACKABLE" :
+    snprintf(l, sizeof(l), "%s  ch%d", mac, a->channel);
+    canvas_draw_str(canvas, 2, 22, l);
+    // signal: bar + the RSSI value beside it + the capture state word (state only here)
+    const char* word = ap_crackable(a) ? "CRACK" :
                        (a->pmkid || a->handshake) ? "captured" :
                        a->missed ? "missed" : "seen";
-    draw_progress(canvas, 2, 36, 60, 8, stg, 4);
-    canvas_draw_str(canvas, 66, 43, word);
+    draw_progress(canvas, 2, 30, 34, 8, rssi_level(a->rssi), 50);
+    snprintf(l, sizeof(l), "%ddBm", a->rssi);
+    canvas_draw_str(canvas, 40, 37, l);
+    int ww = (int)canvas_string_width(canvas, word);
+    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - 2 - ww, 37, word);
     // flags line
     snprintf(
         l,
@@ -1139,14 +1346,14 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
         a->has_essid ? 'y' : '-',
         a->pmkid ? 'y' : '-',
         a->handshake ? 'y' : '-');
-    canvas_draw_str(canvas, 2, 53, l);
-    // actions: ◄ target[x]   ► wlist[x]  (glyphs instead of "L:/R:")
-    icon_left(canvas, 2, 60);
-    snprintf(l, sizeof(l), " tgt[%c]", a->targeted ? 'x' : ' ');
-    canvas_draw_str(canvas, 8, 63, l);
-    icon_right(canvas, 66, 60);
-    snprintf(l, sizeof(l), " wl[%c]", a->whitelisted ? 'x' : ' ');
-    canvas_draw_str(canvas, 72, 63, l);
+    canvas_draw_str(canvas, 2, 49, l);
+    // target/ignore are set from the list; show the status read-only here, with a hint.
+    snprintf(
+        l, sizeof(l), "status: %s",
+        a->targeted ? "targeted" : a->whitelisted ? "ignored" : "-");
+    canvas_draw_str(canvas, 2, 63, l);
+    const char* hint = "set in list";
+    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - 2 - canvas_string_width(canvas, hint), 63, hint);
 }
 
 static void pwnfriend_draw_stats(Canvas* canvas, const PwnfriendModel* model) {
@@ -1174,12 +1381,16 @@ static void pwnfriend_draw_stats(Canvas* canvas, const PwnfriendModel* model) {
     } else {
         canvas_draw_str(canvas, 2, 51, "GPS: no fix");
     }
-    snprintf(l, sizeof(l), "tx %lu beacons", (unsigned long)model->adv_sent_count);
+    // tx beacons + the capture provenance split (dev telemetry): active = our attack
+    // earned it, passive = we just sniffed it.
+    snprintf(
+        l, sizeof(l), "tx %lu  pwn a%lu/p%lu", (unsigned long)model->adv_sent_count,
+        (unsigned long)model->pwn_active, (unsigned long)model->pwn_passive);
     canvas_draw_str(canvas, 2, 61, l);
 }
 
-// The <mrq> mark as actual text (from ~/mrq.min.ascii). It's mostly thin glyphs
-// (/ \ _ spaces), so the proportional FontSecondary renders it well within 128px.
+// The <mrq> mark as text (from ~/mrq.min.ascii). The stock fonts are proportional,
+// which skews the columns, so draw_mono() renders it at a fixed cell pitch instead.
 static const char* MRQ_ART[] = {
     "     _    __/\\_______  _______",
     "    / \\  /  \\_____   \\/  ___  \\",
@@ -1189,13 +1400,63 @@ static const char* MRQ_ART[] = {
     "(___/  \\/  <mrq>  \\___)   \\___)",
 };
 
-static void pwnfriend_draw_about(Canvas* canvas) {
+// Draw an ASCII-art line at a fixed cell pitch `cw` so its columns line up (a
+// proportional font would give spaces/slashes/letters different widths and skew it).
+static void draw_mono(Canvas* c, int x, int y, const char* s, int cw) {
+    for(const char* p = s; *p; p++, x += cw) {
+        if(*p == ' ') continue; // blank cell — just advance
+        char ch[2] = {*p, '\0'};
+        canvas_draw_str(c, x, y, ch);
+    }
+}
+
+static void pwnfriend_draw_about(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
-    for(size_t i = 0; i < sizeof(MRQ_ART) / sizeof(MRQ_ART[0]); i++) {
-        canvas_draw_str(canvas, 1, 8 + (int)i * 9, MRQ_ART[i]);
+    // The mrq banner is wider than 128px, so it scrolls (the timer advances
+    // about_scroll; OK toggles bounce/infinite; Left/Right change the speed). Art on
+    // 8px rows (baselines 7..47) to free the bottom for two version lines.
+    const size_t art_n = sizeof(MRQ_ART) / sizeof(MRQ_ART[0]);
+    int cw = (int)canvas_string_width(canvas, "_"); // pitch: seamless underscore runs
+    if(cw < 1) cw = 5;
+    int cols = 0;
+    for(size_t i = 0; i < art_n; i++) {
+        int len = (int)strlen(MRQ_ART[i]);
+        if(len > cols) cols = len;
     }
-    canvas_draw_str(canvas, 2, 63, "pwnfriend  v1.0");
+    int art_w = cols * cw;
+    const int GAP = 16; // blank run between the wrapped copies in infinite mode
+    int x0; // left x of the first art copy
+    if(model->about_infinite) {
+        int period = art_w + GAP;
+        x0 = -(int)(model->about_scroll % (uint32_t)period);
+    } else {
+        int span = art_w - FLIPPER_SCREEN_WIDTH; // overflow to reveal on the right
+        if(span < 0) span = 0;
+        if(span == 0) {
+            x0 = 0;
+        } else {
+            int phase = (int)(model->about_scroll % (uint32_t)(2 * span));
+            x0 = -(phase <= span ? phase : 2 * span - phase); // triangle wave = bounce
+        }
+    }
+    for(size_t i = 0; i < art_n; i++) {
+        int y = 7 + (int)i * 8;
+        draw_mono(canvas, x0, y, MRQ_ART[i], cw);
+        if(model->about_infinite) draw_mono(canvas, x0 + art_w + GAP, y, MRQ_ART[i], cw);
+    }
+    char line[32];
+    // App: version + short git hash (baked in at build; "nogit" outside a checkout).
+    snprintf(line, sizeof(line), "app %s %s", PWNFRIEND_APP_VERSION, PWNFRIEND_GIT_HASH);
+    canvas_draw_str(canvas, 2, 56, line);
+    // Firmware: the ESP32's stamped protocol version, or a nudge when it's stale/absent.
+    if(model->fw_proto == 0)
+        snprintf(line, sizeof(line), "fw  none (want v%d)", PWNFRIEND_FW_PROTO);
+    else if(model->fw_proto < PWNFRIEND_FW_PROTO)
+        snprintf(line, sizeof(line), "fw  v%d old (want v%d)", model->fw_proto, PWNFRIEND_FW_PROTO);
+    else
+        snprintf(line, sizeof(line), "fw  v%d ok", model->fw_proto);
+    canvas_draw_str(canvas, 2, 64, line);
 }
 
 static void pwnfriend_draw_home(Canvas* canvas, PwnfriendModel* model) {
@@ -1234,7 +1495,7 @@ static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
     case ScreenApList: pwnfriend_draw_aplist(canvas, model); return;
     case ScreenApDetail: pwnfriend_draw_apdetail(canvas, model); return;
     case ScreenStats: pwnfriend_draw_stats(canvas, model); return;
-    case ScreenAbout: pwnfriend_draw_about(canvas); return;
+    case ScreenAbout: pwnfriend_draw_about(canvas, model); return;
     case ScreenHome:
     default: pwnfriend_draw_home(canvas, model); return;
     }
@@ -1356,85 +1617,22 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
             with_view_model(
                 app->view, PwnfriendModel * model,
                 {
-                    if(event->key == InputKeyDown) {
-                        if(model->menu_idx + 1 < MenuCount) model->menu_idx++;
-                    } else if(model->menu_idx > 0) {
-                        model->menu_idx--;
-                    }
+                    // Wrap around both ways: Down off the end -> first, Up off the top -> last.
+                    if(event->key == InputKeyDown)
+                        model->menu_idx = (uint8_t)((model->menu_idx + 1) % MenuCount);
+                    else
+                        model->menu_idx = (uint8_t)((model->menu_idx + MenuCount - 1) % MenuCount);
                 },
                 true);
             return true;
         }
         if(event->key == InputKeyLeft || event->key == InputKeyRight) {
             int dir = (event->key == InputKeyRight) ? 1 : -1;
-            with_view_model(
-                app->view, PwnfriendModel * model,
-                {
-                    if(model->menu_idx == MenuChannel) {
-                        int v = model->tuned_channel + dir;
-                        if(v < 0) v = 0;
-                        if(v > 14) v = 14;
-                        if(v != model->tuned_channel) {
-                            model->tuned_channel = (int8_t)v;
-                            need_advertise = model->advertising;
-                        }
-                    } else if(model->menu_idx == MenuMinRssi) {
-                        int v = model->min_rssi + dir * 2;
-                        if(v < -90) v = -90;
-                        if(v > -40) v = -40;
-                        if(v != model->min_rssi) {
-                            model->min_rssi = (int8_t)v;
-                            need_advertise = model->advertising;
-                        }
-                    } else if(model->menu_idx == MenuRecon) {
-                        int v = (int)model->recon_secs + dir * 5;
-                        if(v < 10) v = 10;
-                        if(v > 120) v = 120;
-                        if(v != (int)model->recon_secs) {
-                            model->recon_secs = (uint16_t)v;
-                            need_advertise = model->advertising;
-                        }
-                    }
-                },
-                true);
-            if(need_advertise) pwnfriend_send_advertise(app);
-            return true;
-        }
-        if(event->key == InputKeyOk) {
-            bool toggled_adv = false, now_adv = false, prompted = false, open_name = false;
+            bool toggled_adv = false, now_adv = false, prompted = false;
             with_view_model(
                 app->view, PwnfriendModel * model,
                 {
                     switch(model->menu_idx) {
-                    case MenuName:
-                        // Prime the editor with the current name, opened below.
-                        strncpy(app->name_buf, model->persona->s.name, sizeof(app->name_buf) - 1);
-                        app->name_buf[sizeof(app->name_buf) - 1] = '\0';
-                        open_name = true;
-                        break;
-                    case MenuPwnedAps:
-                        model->screen = ScreenApList;
-                        model->list_pwned_only = true;
-                        model->list_idx = 0;
-                        model->list_top = 0;
-                        break;
-                    case MenuAllAps:
-                        model->screen = ScreenApList;
-                        model->list_pwned_only = false;
-                        model->list_idx = 0;
-                        model->list_top = 0;
-                        break;
-                    case MenuStats: model->screen = ScreenStats; break;
-                    case MenuAbout: model->screen = ScreenAbout; break;
-                    case MenuSetHome:
-                        // Capture the current fix as home (persisted). Needs a fix.
-                        if(model->gps_seen) {
-                            model->home_lat = parse_deg(model->last_lat);
-                            model->home_lon = parse_deg(model->last_lon);
-                            pwnfriend_update_place(model);
-                            home_save(app->storage, model);
-                        }
-                        break;
                     case MenuAdvertise:
                         model->advertising = !model->advertising;
                         now_adv = model->advertising;
@@ -1451,11 +1649,106 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                             model->showing_consent = true;
                             prompted = true;
                         } else {
-                            model->capture_mode = (model->capture_mode + 1) % 3;
+                            int v = ((int)model->capture_mode + dir + CaptureModeCount) %
+                                    CaptureModeCount;
+                            model->capture_mode = (uint8_t)v;
                             need_advertise = model->advertising;
                         }
                         break;
-                    default: break; // Channel/MinRssi/Recon adjust with Left/Right
+                    case MenuChannel: {
+                        int v = model->tuned_channel + dir;
+                        if(v < 0) v = 0;
+                        if(v > 14) v = 14;
+                        if(v != model->tuned_channel) {
+                            model->tuned_channel = (int8_t)v;
+                            // A manual channel override drops any target (they'd fight:
+                            // targeting pins a channel, so setting one by hand un-targets).
+                            for(uint16_t i = 0; i < model->ap_count; i++)
+                                model->aps[i].targeted = false;
+                            need_advertise = model->advertising;
+                        }
+                        break;
+                    }
+                    case MenuMinRssi: {
+                        int v = model->min_rssi + dir * 2;
+                        if(v < -90) v = -90;
+                        if(v > -40) v = -40;
+                        if(v != model->min_rssi) {
+                            model->min_rssi = (int8_t)v;
+                            need_advertise = model->advertising;
+                        }
+                        break;
+                    }
+                    case MenuRecon: {
+                        int v = (int)model->recon_secs + dir * 5;
+                        if(v < 10) v = 10;
+                        if(v > 120) v = 120;
+                        if(v != (int)model->recon_secs) {
+                            model->recon_secs = (uint16_t)v;
+                            need_advertise = model->advertising;
+                        }
+                        break;
+                    }
+                    case MenuQuiet:
+                        model->quiet = !model->quiet;
+                        home_save(app->storage, model);
+                        break;
+                    default: break; // nav rows act on OK
+                    }
+                },
+                true);
+            if(toggled_adv) {
+                if(now_adv)
+                    pwnfriend_send_advertise(app);
+                else
+                    pwnfriend_send_stop(app);
+            } else if(need_advertise && !prompted) {
+                pwnfriend_send_advertise(app);
+            }
+            return true;
+        }
+        if(event->key == InputKeyOk) {
+            bool open_name = false;
+            with_view_model(
+                app->view, PwnfriendModel * model,
+                {
+                    switch(model->menu_idx) {
+                    case MenuName:
+                        // Prime the editor with the current name, opened below.
+                        strncpy(app->name_buf, model->persona->s.name, sizeof(app->name_buf) - 1);
+                        app->name_buf[sizeof(app->name_buf) - 1] = '\0';
+                        open_name = true;
+                        break;
+                    case MenuPwnedAps:
+                        model->screen = ScreenApList;
+                        model->list_filter = FilterPwned;
+                        model->list_idx = 0;
+                        model->list_top = 0;
+                        break;
+                    case MenuAllAps:
+                        model->screen = ScreenApList;
+                        model->list_filter = FilterAll;
+                        model->list_idx = 0;
+                        model->list_top = 0;
+                        break;
+                    case MenuWhitelist:
+                        model->screen = ScreenApList;
+                        model->list_filter = FilterWhitelist;
+                        model->list_idx = 0;
+                        model->list_top = 0;
+                        break;
+                    case MenuStats: model->screen = ScreenStats; break;
+                    case MenuAbout: model->screen = ScreenAbout; break;
+                    case MenuSetHome:
+                        // Capture the current fix as home (persisted). Needs a fix.
+                        if(model->gps_seen) {
+                            model->home_lat = parse_deg(model->last_lat);
+                            model->home_lon = parse_deg(model->last_lon);
+                            pwnfriend_update_place(model);
+                            home_save(app->storage, model);
+                        }
+                        break;
+                    default: break; // Advertise/Capture/Channel/MinRssi/Recon/Quiet use Left/Right
                     }
                 },
                 true);
@@ -1465,13 +1758,6 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                     app->text_input, pwnfriend_name_result, app, app->name_buf,
                     sizeof(app->name_buf), false);
                 view_dispatcher_switch_to_view(app->view_dispatcher, 1);
-            } else if(toggled_adv) {
-                if(now_adv)
-                    pwnfriend_send_advertise(app);
-                else
-                    pwnfriend_send_stop(app);
-            } else if(need_advertise && !prompted) {
-                pwnfriend_send_advertise(app);
             }
             return true;
         }
@@ -1503,6 +1789,52 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                 true);
             return true;
         }
+        if(event->key == InputKeyLeft || event->key == InputKeyRight) {
+            bool is_left = event->key == InputKeyLeft; // Left = target, Right = ignore
+            with_view_model(
+                app->view, PwnfriendModel * model,
+                {
+                    uint16_t idx[AP_MAX];
+                    uint16_t n = ap_filtered(model, idx);
+                    if(n && model->list_idx < n) {
+                        ApRec* a = &model->aps[idx[model->list_idx]];
+                        if(is_left) { // exclusive: one focus AP, clears ignore
+                            bool on = !a->targeted;
+                            for(uint16_t i = 0; i < model->ap_count; i++)
+                                model->aps[i].targeted = false;
+                            a->targeted = on;
+                            if(on) {
+                                a->whitelisted = false;
+                                // Pin the hunt to the target's channel so the attack
+                                // actually lands there (else auto-sweep hunts it slowly).
+                                if(a->channel >= 1 && a->channel <= 14)
+                                    model->tuned_channel = (int8_t)a->channel;
+                            } else {
+                                model->tuned_channel = 0; // untarget -> back to auto sweep
+                            }
+                        } else { // ignore, exclusive with target
+                            a->whitelisted = !a->whitelisted;
+                            if(a->whitelisted) a->targeted = false;
+                        }
+                        // Toggling may drop this row from a filtered view — reclamp.
+                        uint16_t n2 = ap_filtered(model, idx);
+                        if(n2 == 0) {
+                            model->list_idx = 0;
+                            model->list_top = 0;
+                        } else {
+                            if(model->list_idx >= n2) model->list_idx = n2 - 1;
+                            if(model->list_idx < model->list_top)
+                                model->list_top = model->list_idx;
+                            if(model->list_idx >= model->list_top + APLIST_ROWS)
+                                model->list_top = model->list_idx - APLIST_ROWS + 1;
+                        }
+                        need_advertise = model->advertising;
+                    }
+                },
+                true);
+            if(need_advertise) pwnfriend_send_advertise(app);
+            return true;
+        }
         if(event->key == InputKeyOk) {
             with_view_model(
                 app->view, PwnfriendModel * model,
@@ -1525,40 +1857,50 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                 app->view, PwnfriendModel * model, { model->screen = ScreenApList; }, true);
             return true;
         }
-        if(event->key == InputKeyLeft) { // toggle target (exclusive — one focus AP)
+        if(event->key == InputKeyLeft || event->key == InputKeyRight) {
+            // target/ignore are set from the list now; here the arrows just pop back.
             with_view_model(
-                app->view, PwnfriendModel * model,
-                {
-                    bool on = !model->aps[model->detail_ap].targeted;
-                    for(uint16_t i = 0; i < model->ap_count; i++) model->aps[i].targeted = false;
-                    model->aps[model->detail_ap].targeted = on;
-                    if(on) model->aps[model->detail_ap].whitelisted = false; // exclusive
-                    need_advertise = model->advertising;
-                },
-                true);
-            if(need_advertise) pwnfriend_send_advertise(app);
-            return true;
-        }
-        if(event->key == InputKeyRight) { // toggle whitelist (never attack)
-            with_view_model(
-                app->view, PwnfriendModel * model,
-                {
-                    ApRec* a = &model->aps[model->detail_ap];
-                    a->whitelisted = !a->whitelisted;
-                    if(a->whitelisted) a->targeted = false; // exclusive with target
-                    need_advertise = model->advertising;
-                },
-                true);
-            if(need_advertise) pwnfriend_send_advertise(app);
+                app->view, PwnfriendModel * model, { model->screen = ScreenApList; }, true);
             return true;
         }
         return true;
 
     case ScreenStats:
+        if(event->key == InputKeyBack) {
+            with_view_model(
+                app->view, PwnfriendModel * model, { model->screen = ScreenMenu; }, true);
+            return true;
+        }
+        return true;
+
     case ScreenAbout:
         if(event->key == InputKeyBack) {
             with_view_model(
                 app->view, PwnfriendModel * model, { model->screen = ScreenMenu; }, true);
+            return true;
+        }
+        // OK toggles bounce/infinite scroll; Left speeds the banner up, Right slows it.
+        if(event->key == InputKeyOk) {
+            with_view_model(
+                app->view, PwnfriendModel * model,
+                {
+                    model->about_infinite = !model->about_infinite;
+                    model->about_scroll = 0; // restart cleanly in the new mode
+                },
+                true);
+            return true;
+        }
+        if(event->key == InputKeyLeft || event->key == InputKeyRight) {
+            int dir = (event->key == InputKeyLeft) ? 1 : -1; // Left = faster
+            with_view_model(
+                app->view, PwnfriendModel * model,
+                {
+                    int s = (int)model->about_speed + dir;
+                    if(s < 1) s = 1;
+                    if(s > ABOUT_SPEED_MAX) s = ABOUT_SPEED_MAX;
+                    model->about_speed = (uint8_t)s;
+                },
+                true);
             return true;
         }
         return true;
@@ -1573,7 +1915,8 @@ static uint32_t pwnfriend_exit(void* ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// Timer: 1 Hz heartbeat that ages the persona, prunes peers, resends & saves.
+// Timer: fires ANIM_HZ/sec. Every ANIM_HZ-th fire is the 1 Hz heartbeat that ages the
+// persona, prunes peers, resends & saves; the in-between fires just scroll About.
 // ---------------------------------------------------------------------------
 
 static void pwnfriend_timer_callback(void* ctx) {
@@ -1581,39 +1924,52 @@ static void pwnfriend_timer_callback(void* ctx) {
     bool resend = false;
     bool save = false;
 
+    app->anim_tick++;
+    bool second = (app->anim_tick % ANIM_HZ) == 0; // one real second has elapsed
+
+    // Idle sub-second fires only exist to animate the About banner; skip them (and
+    // the redraw) on every other screen so the home face still refreshes at ~1 Hz.
+    Screen screen = ScreenHome;
+    with_view_model(app->view, PwnfriendModel * model, { screen = model->screen; }, false);
+    if(!second && screen != ScreenAbout) return;
+
     with_view_model(
         app->view,
         PwnfriendModel * model,
         {
-            model->tick_secs++;
-            peers_prune(&model->peers, model->tick_secs);
-            bool bonded = peers_any_bonded(&model->peers, model->tick_secs);
-            model->persona->friend_near = bonded;
-            // "Engaged" = advertising + capture armed + APs around. Keeps the friend
-            // content while it works a populated area (the firmware reports each AP
-            // only once, so per-epoch discovery dries up even mid-hunt).
-            model->persona->hunting =
-                model->advertising && model->capture_mode != CaptureOff && model->ap_count > 0;
-            persona_tick(model->persona, 1);
+            if(model->screen == ScreenAbout) model->about_scroll += model->about_speed;
+            if(second) {
+                model->tick_secs++;
+                peers_prune(&model->peers, model->tick_secs);
+                bool bonded = peers_any_bonded(&model->peers, model->tick_secs);
+                model->persona->friend_near = bonded;
+                // "Engaged" = advertising + capture armed + APs around. Keeps the friend
+                // content while it works a populated area (the firmware reports each AP
+                // only once, so per-epoch discovery dries up even mid-hunt).
+                model->persona->hunting = model->advertising &&
+                                          model->capture_mode != CaptureOff &&
+                                          model->ap_count > 0;
+                persona_tick(model->persona, 1);
 
-            // ESP32-link watchdog: warn only while advertising, only after the boot
-            // grace, and only once the board has been silent past the timeout.
-            // Unsigned subtraction is safe: both stamps are always <= tick_secs.
-            if(model->advertising) {
-                uint32_t since_rx = model->tick_secs - model->last_rx_secs;
-                uint32_t since_adv = model->tick_secs - model->advertising_since;
-                model->link_down = (since_rx >= PWNFRIEND_LINK_TIMEOUT_SECS) &&
-                                   (since_adv >= PWNFRIEND_LINK_GRACE_SECS);
-            } else {
-                model->link_down = false; // paused never warns
-            }
+                // ESP32-link watchdog: warn only while advertising, only after the boot
+                // grace, and only once the board has been silent past the timeout.
+                // Unsigned subtraction is safe: both stamps are always <= tick_secs.
+                if(model->advertising) {
+                    uint32_t since_rx = model->tick_secs - model->last_rx_secs;
+                    uint32_t since_adv = model->tick_secs - model->advertising_since;
+                    model->link_down = (since_rx >= PWNFRIEND_LINK_TIMEOUT_SECS) &&
+                                       (since_adv >= PWNFRIEND_LINK_GRACE_SECS);
+                } else {
+                    model->link_down = false; // paused never warns
+                }
 
-            if(model->advertising &&
-               (model->tick_secs - model->last_adv_sent >= PWNFRIEND_ADV_RESEND_SECS)) {
-                resend = true;
-            }
-            if(model->tick_secs % PWNFRIEND_SAVE_SECS == 0) {
-                save = true;
+                if(model->advertising &&
+                   (model->tick_secs - model->last_adv_sent >= PWNFRIEND_ADV_RESEND_SECS)) {
+                    resend = true;
+                }
+                if(model->tick_secs % PWNFRIEND_SAVE_SECS == 0) {
+                    save = true;
+                }
             }
         },
         true);
@@ -1681,13 +2037,18 @@ static int32_t pwnfriend_worker(void* context) {
                 }
             }
 
-            if(app->got_new_friend) {
-                app->got_new_friend = false;
-                notification_message(app->notification, &sequence_new_friend);
-            }
-            if(app->got_pwnd) {
-                app->got_pwnd = false;
-                notification_message(app->notification, &sequence_pwnd);
+            if(app->got_new_friend || app->got_pwnd) {
+                bool quiet = false;
+                with_view_model(
+                    app->view, PwnfriendModel * model, { quiet = model->quiet; }, false);
+                if(app->got_new_friend) {
+                    app->got_new_friend = false;
+                    if(!quiet) notification_message(app->notification, &sequence_new_friend);
+                }
+                if(app->got_pwnd) {
+                    app->got_pwnd = false;
+                    if(!quiet) notification_message(app->notification, &sequence_pwnd);
+                }
             }
         }
     }
@@ -1744,15 +2105,22 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->menu_idx = 0;
             model->list_idx = 0;
             model->list_top = 0;
-            model->list_pwned_only = false;
+            model->list_filter = FilterAll;
             model->detail_ap = 0;
+            model->fw_proto = 0; // unknown until the first PWNFRIEND_ADV with ver=
+            model->pwn_active = 0;
+            model->pwn_passive = 0;
+            model->quiet = false;
+            model->about_scroll = 0;
+            model->about_speed = ABOUT_SPEED_DEFAULT;
+            model->about_infinite = false; // default to bounce
             model->gps_seen = false;
             model->last_lat[0] = '\0';
             model->last_lon[0] = '\0';
             model->gps_place[0] = '\0';
             model->home_lat = HOME_LAT; // default; overridden by home.bin / "Set home"
             model->home_lon = HOME_LON;
-            home_load(app->storage, model);
+            home_load(app->storage, model); // may restore quiet
             model->last_rx_secs = 0;
             model->advertising_since = 0; // advertising starts now (tick 0) -> grace runs
             model->link_down = false;
@@ -1784,9 +2152,10 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
     furi_thread_set_callback(app->worker_thread, pwnfriend_worker);
     furi_thread_start(app->worker_thread);
 
-    // 1 Hz heartbeat
+    // ANIM_HZ heartbeat: the per-second brain work is gated inside the callback; the
+    // extra fires only animate the About banner.
     app->timer = furi_timer_alloc(pwnfriend_timer_callback, FuriTimerTypePeriodic, app);
-    furi_timer_start(app->timer, furi_kernel_get_tick_frequency());
+    furi_timer_start(app->timer, furi_kernel_get_tick_frequency() / ANIM_HZ);
 
     // Auto-start: start saying hi immediately (model->advertising is true). The timer
     // re-pushes every PWNFRIEND_ADV_RESEND_SECS; this is the initial greeting so the
