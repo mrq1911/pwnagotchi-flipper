@@ -1003,24 +1003,15 @@ static void icon_left(Canvas* c, int x, int yc) { // solid ◄, 4x7
 static void icon_right(Canvas* c, int x, int yc) { // solid ►, 4x7
     for(int i = 0; i < 4; i++) canvas_draw_line(c, x + 3 - i, yc - i, x + 3 - i, yc + i);
 }
-static void icon_back(Canvas* c, int x, int yc) { // ◄— (arrow head + shaft), 8 wide
-    icon_left(c, x, yc);
-    canvas_draw_line(c, x + 4, yc, x + 7, yc);
-}
-
-// Title bar (inverted): title left; optional right-aligned text; optional back glyph
-// at the far right (so sub-screens show a button icon instead of "Bk=back").
-static void draw_titlebar(Canvas* c, const char* title, const char* right, bool back) {
+// Title bar (inverted): title left, optional right-aligned text. Back is a universal
+// Flipper button, so we don't waste pixels hinting it.
+static void draw_titlebar(Canvas* c, const char* title, const char* right) {
     canvas_draw_box(c, 0, 0, FLIPPER_SCREEN_WIDTH, 11);
     canvas_set_color(c, ColorWhite);
     canvas_set_font(c, FontSecondary);
     canvas_draw_str(c, 2, 9, title);
-    int edge = FLIPPER_SCREEN_WIDTH - 2;
-    if(back) {
-        icon_back(c, edge - 8, 5);
-        edge -= 12;
-    }
-    if(right) canvas_draw_str(c, edge - canvas_string_width(c, right), 9, right);
+    if(right)
+        canvas_draw_str(c, FLIPPER_SCREEN_WIDTH - 2 - canvas_string_width(c, right), 9, right);
     canvas_set_color(c, ColorBlack);
 }
 
@@ -1038,7 +1029,7 @@ static uint16_t ap_filtered(const PwnfriendModel* m, uint16_t* out) {
 
 static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
-    draw_titlebar(canvas, "pwnfriend menu", NULL, true);
+    draw_titlebar(canvas, "pwnfriend menu", NULL);
     canvas_set_font(canvas, FontSecondary);
 
     uint16_t pwned = 0;
@@ -1093,7 +1084,7 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
     uint16_t n = ap_filtered(model, idx);
     char hint[10];
     snprintf(hint, sizeof(hint), "%u", n);
-    draw_titlebar(canvas, title, hint, true);
+    draw_titlebar(canvas, title, hint);
     canvas_set_font(canvas, FontSecondary);
     if(n == 0) {
         canvas_draw_str(
@@ -1120,7 +1111,7 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
 static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     const ApRec* a = &model->aps[model->detail_ap];
-    draw_titlebar(canvas, "AP", NULL, true);
+    draw_titlebar(canvas, "AP", NULL);
     canvas_set_font(canvas, FontSecondary);
     draw_str_trunc(canvas, 2, 21, a->ssid[0] ? a->ssid : "(hidden)", 124);
     char mac[18];
@@ -1156,7 +1147,7 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
 static void pwnfriend_draw_stats(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     const Persona* p = model->persona;
-    draw_titlebar(canvas, "STATS", NULL, true);
+    draw_titlebar(canvas, "STATS", NULL);
     canvas_set_font(canvas, FontSecondary);
     uint32_t up = (uint32_t)p->session_uptime;
     char l[40];
@@ -1200,7 +1191,6 @@ static void pwnfriend_draw_about(Canvas* canvas) {
         canvas_draw_str(canvas, 1, 8 + (int)i * 9, MRQ_ART[i]);
     }
     canvas_draw_str(canvas, 2, 63, "pwnfriend  v1.0");
-    icon_back(canvas, FLIPPER_SCREEN_WIDTH - 10, 60);
 }
 
 static void pwnfriend_draw_home(Canvas* canvas, PwnfriendModel* model) {
