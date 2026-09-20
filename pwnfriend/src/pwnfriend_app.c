@@ -52,7 +52,7 @@ typedef enum {
 // Persisted AP table (so you can browse APs/pwns from previous sessions).
 #define AP_DB_PATH "/ext/apps_data/pwnfriend/aps.bin"
 #define AP_DB_MAGIC 0x50414E46u // 'FNAP'
-#define AP_DB_VERSION 2 // bumped: ApRec gained first_seq (old browse history resets once)
+#define AP_DB_VERSION 3 // bumped: ApRec gained lat/lon/loc_rssi (persist AP location)
 
 // Dev telemetry: one CSV row per PWNFRIEND_EPOCH, for offline algo tuning.
 #define TELEMETRY_PATH "/ext/apps_data/pwnfriend/telemetry.csv"
@@ -82,7 +82,9 @@ typedef struct {
     bool missed; // firmware reported a MISS (attacked, nothing caught)
     bool whitelisted; // user: never attack this one
     bool targeted; // user: focus the hunt on this one
-    uint32_t first_seq; // discovery order (set once); stable newest-discovered-first sort
+    uint32_t first_seq; // discovery order (set once); stable tiebreak in the list sort
+    float lat, lon; // where the AP was heard strongest (1e9 = unknown); persisted for the map QR
+    int8_t loc_rssi; // RSSI at which lat/lon was recorded (keep the closest fix)
 } ApRec;
 
 // Capture escalation. Default is Deauth (a full pwnagotchi), gated behind the
@@ -168,9 +170,6 @@ typedef struct {
     bool ap_overflow; // table hit AP_MAX and started recycling -> show the count as "N+"
     uint32_t ap_seq; // monotonic counter stamped into ApRec.first_seq on each sighting
     uint32_t ap_seen_tick[AP_MAX]; // tick_secs each AP was last heard (0 = not this session)
-    float ap_lat[AP_MAX]; // our position when the AP was heard strongest (1e9 = unknown)
-    float ap_lon[AP_MAX]; // (session-only, parallel to aps[]; not persisted)
-    int8_t ap_loc_rssi[AP_MAX]; // RSSI at which ap_lat/lon was recorded (keep the closest)
 
     // Channel tuning: 0 = auto (the pwnagotchi '*' sweep, default); 1..14 = pinned.
     int8_t tuned_channel;
@@ -518,9 +517,9 @@ static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
     model->aps[i].bssid[12] = '\0';
     model->aps[i].first_seq = ++model->ap_seq; // set once at discovery -> stable ordering
     model->ap_seen_tick[i] = model->tick_secs;
-    model->ap_lat[i] = 1e9f; // no location until a geotagged line arrives
-    model->ap_lon[i] = 1e9f;
-    model->ap_loc_rssi[i] = -128; // reset for a recycled slot
+    model->aps[i].lat = 1e9f; // no location until a geotagged line arrives
+    model->aps[i].lon = 1e9f;
+    model->aps[i].loc_rssi = -128; // reset for a recycled slot
     *is_new = true;
     return i;
 }
@@ -759,11 +758,11 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
                 if(strcmp(type, "pmkid") == 0) a->pmkid = true;
                 else a->handshake = true;
                 // Stash where it was heard strongest (gains/refines the location estimate).
-                if(have_gps && (model->ap_lat[ai] >= 1e8f ||
-                                (rssi != 0 && (int8_t)rssi > model->ap_loc_rssi[ai]))) {
-                    model->ap_lat[ai] = parse_deg(lat);
-                    model->ap_lon[ai] = parse_deg(lon);
-                    model->ap_loc_rssi[ai] = (int8_t)rssi;
+                if(have_gps && (model->aps[ai].lat >= 1e8f ||
+                                (rssi != 0 && (int8_t)rssi > model->aps[ai].loc_rssi))) {
+                    model->aps[ai].lat = parse_deg(lat);
+                    model->aps[ai].lon = parse_deg(lon);
+                    model->aps[ai].loc_rssi = (int8_t)rssi;
                 }
             }
             if(have_gps) {
@@ -862,11 +861,11 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
                 }
                 // Remember where it was heard STRONGEST (best position estimate). Gains a
                 // location the first time we see it with a fix; refines if a closer one comes.
-                if(have_gps && (model->ap_lat[ai] >= 1e8f ||
-                                (rssi != 0 && (int8_t)rssi > model->ap_loc_rssi[ai]))) {
-                    model->ap_lat[ai] = parse_deg(lat);
-                    model->ap_lon[ai] = parse_deg(lon);
-                    model->ap_loc_rssi[ai] = (int8_t)rssi;
+                if(have_gps && (model->aps[ai].lat >= 1e8f ||
+                                (rssi != 0 && (int8_t)rssi > model->aps[ai].loc_rssi))) {
+                    model->aps[ai].lat = parse_deg(lat);
+                    model->aps[ai].lon = parse_deg(lon);
+                    model->aps[ai].loc_rssi = (int8_t)rssi;
                 }
             }
             if(is_new_ap) persona_note_ap(model->persona);
@@ -1193,9 +1192,9 @@ static void pwnfriend_draw_ap_qr(Canvas* canvas, const PwnfriendModel* model) {
         draw_str_trunc(canvas, tx, 12, a->ssid[0] ? a->ssid : "(hidden)", tw);
         canvas_set_font(canvas, FontSecondary);
         char cbuf[16];
-        fmt_coord(model->ap_lat[model->detail_ap], cbuf, sizeof(cbuf));
+        fmt_coord(model->aps[model->detail_ap].lat, cbuf, sizeof(cbuf));
         canvas_draw_str(canvas, tx, 30, cbuf);
-        fmt_coord(model->ap_lon[model->detail_ap], cbuf, sizeof(cbuf));
+        fmt_coord(model->aps[model->detail_ap].lon, cbuf, sizeof(cbuf));
         canvas_draw_str(canvas, tx, 42, cbuf);
         canvas_draw_str(canvas, tx, 56, "scan me");
     } else {
@@ -1338,9 +1337,9 @@ static void draw_titlebar(Canvas* c, const char* title, const char* right) {
 }
 
 // Fill out[] with aps[] indices matching the ScreenApList filter. Order: APs with a
-// live signal first, then stale ones; within each group, newest-DISCOVERED first (by
-// first_seq desc). Recency is a coarse group (not a churning key), so rows only move
-// when an AP actually goes stale — no per-refresh reshuffle. Insertion sort, n<=256.
+// live signal first, then stale ones; within each group, STRONGEST signal first (RSSI
+// desc), with discovery order as a stable tiebreaker for equal signal. Insertion sort,
+// n<=256.
 static uint16_t ap_filtered(const PwnfriendModel* m, uint16_t* out) {
     uint16_t n = 0;
     for(uint16_t i = 0; i < m->ap_count; i++) {
@@ -1351,13 +1350,17 @@ static uint16_t ap_filtered(const PwnfriendModel* m, uint16_t* out) {
     for(uint16_t i = 1; i < n; i++) {
         uint16_t v = out[i];
         bool rv = ap_signal_recent(m, v);
+        int16_t rssiv = m->aps[v].rssi;
         uint32_t sv = m->aps[v].first_seq;
         int j = (int)i - 1;
         while(j >= 0) {
             uint16_t u = out[j];
             bool ru = ap_signal_recent(m, u);
-            // v outranks u if it's live and u isn't, or (same liveness) discovered later.
-            bool v_first = (rv && !ru) || (rv == ru && sv > m->aps[u].first_seq);
+            int16_t rssiu = m->aps[u].rssi;
+            // v outranks u if it's live and u isn't; else (same liveness) stronger signal,
+            // and for equal signal the earlier-discovered wins (stable).
+            bool v_first = (rv && !ru) ||
+                           (rv == ru && (rssiv > rssiu || (rssiv == rssiu && sv > m->aps[u].first_seq)));
             if(!v_first) break;
             out[j + 1] = out[j];
             j--;
@@ -1541,7 +1544,7 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
     // Distance from us to where the AP was heard strongest — shown on row 2 (right),
     // computed here. Needs a current fix + a stored AP location.
     float clat = parse_deg(model->last_lat), clon = parse_deg(model->last_lon);
-    float alat = model->ap_lat[model->detail_ap], alon = model->ap_lon[model->detail_ap];
+    float alat = model->aps[model->detail_ap].lat, alon = model->aps[model->detail_ap].lon;
     char dist[14];
     dist[0] = '\0';
     if(model->gps_seen && clat < 1e8f && alat < 1e8f) {
@@ -2165,8 +2168,8 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
             with_view_model(
                 app->view, PwnfriendModel * model,
                 {
-                    float alat = model->ap_lat[model->detail_ap];
-                    float alon = model->ap_lon[model->detail_ap];
+                    float alat = model->aps[model->detail_ap].lat;
+                    float alon = model->aps[model->detail_ap].lon;
                     if(alat < 1e8f && alon < 1e8f) {
                         char lats[16];
                         char lons[16];
@@ -2467,9 +2470,9 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             // set for every slot (loaded APs never pass through ap_get).
             for(uint16_t i = 0; i < AP_MAX; i++) {
                 model->ap_seen_tick[i] = 0;
-                model->ap_lat[i] = 1e9f;
-                model->ap_lon[i] = 1e9f;
-                model->ap_loc_rssi[i] = -128; // weakest, so the first real fix always wins
+                model->aps[i].lat = 1e9f;
+                model->aps[i].lon = 1e9f;
+                model->aps[i].loc_rssi = -128; // weakest, so the first real fix always wins
             }
             ap_db_load(app->storage, model); // browse APs/pwns from previous sessions
             model->tuned_channel = 0; // auto (*) — the recon sweep
