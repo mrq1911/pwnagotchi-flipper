@@ -166,7 +166,7 @@ void pwnagotchi_draw_aps(Pwnagotchi* pwn, Canvas* canvas) {
 void pwnagotchi_draw_uptime(Pwnagotchi* pwn, Canvas* canvas) {
     // Right-aligned to the screen edge so a full hh:mm:ss (even 3-digit hours) can
     // neither run off the right nor collide with the AP count to its left.
-    FuriString* tmp = furi_string_alloc_printf("UP %s", furi_string_get_cstr(pwn->uptime));
+    FuriString* tmp = furi_string_alloc_printf("BAT %s", furi_string_get_cstr(pwn->uptime));
     canvas_set_font(canvas, PWNAGOTCHI_FONT);
     uint16_t w = canvas_string_width(canvas, furi_string_get_cstr(tmp));
     canvas_draw_str(

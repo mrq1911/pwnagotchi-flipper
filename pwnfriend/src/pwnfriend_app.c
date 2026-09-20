@@ -52,16 +52,24 @@ typedef enum {
 // Persisted AP table (so you can browse APs/pwns from previous sessions).
 #define AP_DB_PATH "/ext/apps_data/pwnfriend/aps.bin"
 #define AP_DB_MAGIC 0x50414E46u // 'FNAP'
-#define AP_DB_VERSION 1
+#define AP_DB_VERSION 2 // bumped: ApRec gained first_seq (old browse history resets once)
 
 // Dev telemetry: one CSV row per PWNFRIEND_EPOCH, for offline algo tuning.
 #define TELEMETRY_PATH "/ext/apps_data/pwnfriend/telemetry.csv"
+// Dev telemetry: one CSV row per capture (bssid/type/provenance/rssi/gps).
+#define CAPTURES_PATH "/ext/apps_data/pwnfriend/captures.csv"
 
 // The heartbeat timer fires ANIM_HZ times/sec so the About banner can scroll
 // smoothly; the once-per-second brain work is gated to every ANIM_HZ-th fire.
 #define ANIM_HZ 8
 #define ABOUT_SPEED_DEFAULT 3 // px per animation fire
 #define ABOUT_SPEED_MAX 12
+
+// Home stat panel: seconds of no Left/Right before it reverts to the persona voice.
+#define HOME_STATS_TIMEOUT_SECS 8
+
+// An AP not heard for this long has a stale RSSI: hide its signal meter (it may be gone).
+#define AP_SIGNAL_TTL_SECS 60
 
 typedef struct {
     char bssid[13]; // 12-hex key (no colons)
@@ -74,6 +82,7 @@ typedef struct {
     bool missed; // firmware reported a MISS (attacked, nothing caught)
     bool whitelisted; // user: never attack this one
     bool targeted; // user: focus the hunt on this one
+    uint32_t first_seq; // discovery order (set once); stable newest-discovered-first sort
 } ApRec;
 
 // Capture escalation. Default is Deauth (a full pwnagotchi), gated behind the
@@ -109,6 +118,7 @@ typedef enum {
     ScreenMenu,
     ScreenApList,
     ScreenApDetail,
+    ScreenApQr, // QR of the AP's location (Up on the detail screen) to scan with a phone
     ScreenStats,
     ScreenAbout,
 } Screen;
@@ -155,10 +165,18 @@ typedef struct {
     // Every AP we've seen this session (the browser reads this).
     ApRec aps[AP_MAX];
     uint16_t ap_count;
+    bool ap_overflow; // table hit AP_MAX and started recycling -> show the count as "N+"
+    uint32_t ap_seq; // monotonic counter stamped into ApRec.first_seq on each sighting
+    uint32_t ap_seen_tick[AP_MAX]; // tick_secs each AP was last heard (0 = not this session)
+    float ap_lat[AP_MAX]; // our position when the AP was heard strongest (1e9 = unknown)
+    float ap_lon[AP_MAX]; // (session-only, parallel to aps[]; not persisted)
+    int8_t ap_loc_rssi[AP_MAX]; // RSSI at which ap_lat/lon was recorded (keep the closest)
 
     // Channel tuning: 0 = auto (the pwnagotchi '*' sweep, default); 1..14 = pinned.
     int8_t tuned_channel;
-    uint8_t stat_page; // home persona stat, cycled Left/Right
+    uint8_t stat_page; // home stat panel, cycled Left/Right (0 = persona voice)
+    uint32_t stat_touch_secs; // tick of the last Left/Right on home (for auto-revert)
+    uint8_t battery_pct; // cached battery %, refreshed once/sec (shown in the BAT slot)
     int8_t min_rssi; // attack floor sent as -minrssi (default -78)
     uint16_t recon_secs; // recon_time sent as -recon (default 30)
 
@@ -176,7 +194,9 @@ typedef struct {
     char last_lat[16];
     char last_lon[16];
     char gps_place[32]; // distance+direction to home, e.g. "Home 12km SW"
+    char gps_course[16]; // bearing to home, e.g. "225°" (its own row so it fits)
     float home_lat, home_lon; // the point the GPS compass points at (default Prague; settable)
+    bool home_set; // user set a home (else the default is the persona's Prague "mother")
     bool quiet; // suppress the LED blink + vibro on pwn / new-friend (persisted)
     int fw_proto; // ESP32 firmware protocol version from PWNFRIEND_ADV (0 = unknown)
     uint32_t pwn_active; // captures our own attack earned (via=active), this session
@@ -196,6 +216,11 @@ typedef struct {
     // Setup QR (encoded once at alloc; the draw callback only reads modules).
     uint8_t qr[qrcodegen_BUFFER_LEN_FOR_VERSION(4)];
     bool qr_ok;
+
+    // AP-location QR (encoded on demand when Up is pressed on an AP with a known
+    // location); holds a geo: URI to scan with a phone.
+    uint8_t ap_qr[qrcodegen_BUFFER_LEN_FOR_VERSION(4)];
+    bool ap_qr_ok;
 } PwnfriendModel;
 
 typedef struct {
@@ -462,12 +487,40 @@ static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
     *is_new = false;
     if(!key[0]) return -1;
     int i = ap_find(model, key);
-    if(i >= 0) return i;
-    if(model->ap_count >= AP_MAX) return -1;
-    i = (int)model->ap_count++;
+    if(i >= 0) {
+        model->ap_seen_tick[i] = model->tick_secs; // refresh last-seen (NOT the order)
+        return i;
+    }
+    if(model->ap_count >= AP_MAX) {
+        // Table full: recycle the least-recently-heard slot, but PROTECT captured APs —
+        // evict a non-pwned entry first so loot stays in the browser. Full history still
+        // lives in wardrive.csv / pcaps; this only recycles the on-device view.
+        int victim = -1;
+        for(uint16_t k = 0; k < model->ap_count; k++) {
+            const ApRec* e = &model->aps[k];
+            // Keep captures and user-flagged (ignore/target) APs — evicting an ignored
+            // one would also drop it from the -wl list sent to the firmware.
+            if(e->pmkid || e->handshake || e->whitelisted || e->targeted) continue;
+            if(victim < 0 || model->ap_seen_tick[k] < model->ap_seen_tick[victim]) victim = (int)k;
+        }
+        if(victim < 0) { // everything captured (unlikely) -> fall back to overall oldest
+            victim = 0;
+            for(uint16_t k = 1; k < model->ap_count; k++)
+                if(model->ap_seen_tick[k] < model->ap_seen_tick[victim]) victim = (int)k;
+        }
+        i = victim;
+        model->ap_overflow = true;
+    } else {
+        i = (int)model->ap_count++;
+    }
     memset(&model->aps[i], 0, sizeof(ApRec));
     strncpy(model->aps[i].bssid, key, 12);
     model->aps[i].bssid[12] = '\0';
+    model->aps[i].first_seq = ++model->ap_seq; // set once at discovery -> stable ordering
+    model->ap_seen_tick[i] = model->tick_secs;
+    model->ap_lat[i] = 1e9f; // no location until a geotagged line arrives
+    model->ap_lon[i] = 1e9f;
+    model->ap_loc_rssi[i] = -128; // reset for a recycled slot
     *is_new = true;
     return i;
 }
@@ -484,7 +537,13 @@ static void ap_db_load(Storage* storage, PwnfriendModel* model) {
             uint32_t n = hdr[2] > AP_MAX ? AP_MAX : hdr[2];
             size_t got = storage_file_read(f, model->aps, n * sizeof(ApRec));
             model->ap_count = (uint16_t)(got / sizeof(ApRec));
-            for(uint16_t i = 0; i < model->ap_count; i++) model->aps[i].targeted = false;
+            for(uint16_t i = 0; i < model->ap_count; i++) {
+                model->aps[i].targeted = false;
+                // Continue the sighting sequence above anything loaded, so this session's
+                // sightings still sort as most-recent over restored history.
+                if(model->aps[i].first_seq >= model->ap_seq)
+                    model->ap_seq = model->aps[i].first_seq + 1;
+            }
         }
     }
     storage_file_close(f);
@@ -510,6 +569,7 @@ typedef struct {
     float lat;
     float lon;
     uint8_t quiet;
+    uint8_t home_set; // v3: user actually set a home (vs the default Prague birthplace)
 } HomeDb;
 
 static void home_load(Storage* storage, PwnfriendModel* model) {
@@ -520,6 +580,7 @@ static void home_load(Storage* storage, PwnfriendModel* model) {
             model->home_lat = h.lat;
             model->home_lon = h.lon;
             model->quiet = h.quiet != 0;
+            model->home_set = h.home_set != 0;
         }
     }
     storage_file_close(f);
@@ -530,8 +591,8 @@ static void home_save(Storage* storage, PwnfriendModel* model) {
     storage_common_mkdir(storage, "/ext/apps_data/pwnfriend");
     File* f = storage_file_alloc(storage);
     if(storage_file_open(f, HOME_DB_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        HomeDb h = {HOME_DB_MAGIC, 2, model->home_lat, model->home_lon,
-                    (uint8_t)(model->quiet ? 1 : 0)};
+        HomeDb h = {HOME_DB_MAGIC, 3, model->home_lat, model->home_lon,
+                    (uint8_t)(model->quiet ? 1 : 0), (uint8_t)(model->home_set ? 1 : 0)};
         storage_file_write(f, &h, sizeof(h));
     }
     storage_file_close(f);
@@ -554,29 +615,88 @@ static float parse_deg(const char* s) {
     return sign * v;
 }
 
+// Sanity-check a lat/lon string pair before we trust it (log / map / QR): rejects a
+// corrupt sample like lon=1.3e14. Belt-and-suspenders with the firmware's fmt_geo check.
+static bool coord_ok(const char* lat, const char* lon) {
+    float la = parse_deg(lat), lo = parse_deg(lon);
+    return la >= -90.0f && la <= 90.0f && lo >= -180.0f && lo <= 180.0f;
+}
+
+// Compact "age" string (Ns / Nm / Nh) for a duration in seconds — the AP's last-seen.
+static void fmt_age(uint32_t secs, char* out, size_t n) {
+    if(secs < 60)
+        snprintf(out, n, "%lus", (unsigned long)secs);
+    else if(secs < 3600)
+        snprintf(out, n, "%lum", (unsigned long)(secs / 60));
+    else
+        snprintf(out, n, "%luh", (unsigned long)(secs / 3600));
+}
+
+// Format a coordinate to "sdd.dddddd" (6 decimals) WITHOUT printf %f (newlib-nano has
+// none). Used to build the maps URL for the AP-location QR.
+static void fmt_coord(float v, char* out, size_t n) {
+    if(n == 0) return;
+    char* p = out;
+    size_t rem = n;
+    if(v < 0.0f) {
+        if(rem > 1) { *p++ = '-'; rem--; }
+        v = -v;
+    }
+    long ip = (long)v;
+    float frac = v - (float)ip;
+    int w = snprintf(p, rem, "%ld", ip); // integer part (no float)
+    if(w > 0 && (size_t)w < rem) {
+        p += w;
+        rem -= (size_t)w;
+    }
+    if(rem > 1) { *p++ = '.'; rem--; }
+    for(int i = 0; i < 6 && rem > 1; i++) {
+        frac *= 10.0f;
+        int d = (int)frac;
+        if(d < 0) d = 0;
+        if(d > 9) d = 9;
+        *p++ = (char)('0' + d);
+        rem--;
+        frac -= (float)d;
+    }
+    if(rem > 0) *p = '\0';
+}
+
 // Format model->gps_place as distance + 8-point compass direction from the last fix
 // to HOME (e.g. "Prague 12km SW", "Prague 320m NE", "At Prague!"). Single-precision
 // math only (Cortex-M4F builds with -Werror=double-promotion).
 static void pwnfriend_update_place(PwnfriendModel* model) {
     float lat = parse_deg(model->last_lat), lon = parse_deg(model->last_lon);
-    if(lat >= 1e8f || lon >= 1e8f) { model->gps_place[0] = '\0'; return; }
+    if(lat >= 1e8f || lon >= 1e8f) {
+        model->gps_place[0] = '\0';
+        model->gps_course[0] = '\0';
+        return;
+    }
     float coslat = cosf(lat * 3.14159265f / 180.0f);
     float north = model->home_lat - lat; // degrees north to home
     float east = (model->home_lon - lon) * coslat; // degrees east to home (longitude-corrected)
     float km = sqrtf(north * north + east * east) * 111.0f; // ~111 km / degree
     static const char* DIRS[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
     // atan2f: 0 = due north, +pi/2 = east. Round to eighths; &7 wraps negatives correctly.
-    const char* dir = DIRS[((int)roundf(atan2f(east, north) / 0.78539816f)) & 7];
+    float ang = atan2f(east, north);
+    const char* dir = DIRS[((int)roundf(ang / 0.78539816f)) & 7];
+    int brg = (int)roundf(ang * 57.29578f); // radians -> degrees, 0 = N, 90 = E
+    if(brg < 0) brg += 360;
+    // Until the user sets a home, the persona points back at its default Prague birthplace
+    // and calls it "Mother"; after "Set home" it's "Home".
+    const char* hn = model->home_set ? HOME_NAME : "Mother";
+    // Distance + direction on gps_place; the course (degrees) goes to gps_course so the
+    // home panel can put it on its own row (the combined line was too wide).
+    model->gps_course[0] = '\0';
     if(km < 0.3f) {
-        snprintf(model->gps_place, sizeof(model->gps_place), "At %s!", HOME_NAME);
-    } else if(km < 1.0f) {
-        snprintf(
-            model->gps_place, sizeof(model->gps_place), "%s %dm %s", HOME_NAME,
-            (int)(km * 1000.0f), dir);
+        snprintf(model->gps_place, sizeof(model->gps_place), "At %s!", hn);
     } else {
-        snprintf(
-            model->gps_place, sizeof(model->gps_place), "%s %dkm %s", HOME_NAME, (int)(km + 0.5f),
-            dir);
+        // Row 1: name + distance. Row 2: direction + course (e.g. "SW 225°").
+        if(km < 1.0f)
+            snprintf(model->gps_place, sizeof(model->gps_place), "%s %dm", hn, (int)(km * 1000.0f));
+        else
+            snprintf(model->gps_place, sizeof(model->gps_place), "%s %dkm", hn, (int)(km + 0.5f));
+        snprintf(model->gps_course, sizeof(model->gps_course), "%s %d\xc2\xb0", dir, brg);
     }
 }
 
@@ -597,17 +717,19 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
     line_extract_int(line, "\"rssi\":", &rssi);
     // lat/lon are present only when the GPS had a fix (contract v2); both or neither.
     bool have_gps = line_extract_number(line, "\"lat\":", lat, sizeof(lat)) &&
-                    line_extract_number(line, "\"lon\":", lon, sizeof(lon));
+                    line_extract_number(line, "\"lon\":", lon, sizeof(lon)) && coord_ok(lat, lon);
 
     const char* label = ssid[0] ? ssid : bssid;
     char key[13];
     bssid_key(key, bssid);
 
     bool counted = false;
+    uint32_t up = 0;
     with_view_model(
         app->view,
         PwnfriendModel * model,
         {
+            up = model->tick_secs;
             // Gate the earned count behind the consent + capture opt-in: without
             // it we ignore whatever the firmware happens to report. Dedup by BSSID
             // across the session so a re-emitted PWND (every 15s) counts only once.
@@ -636,6 +758,13 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
                 }
                 if(strcmp(type, "pmkid") == 0) a->pmkid = true;
                 else a->handshake = true;
+                // Stash where it was heard strongest (gains/refines the location estimate).
+                if(have_gps && (model->ap_lat[ai] >= 1e8f ||
+                                (rssi != 0 && (int8_t)rssi > model->ap_loc_rssi[ai]))) {
+                    model->ap_lat[ai] = parse_deg(lat);
+                    model->ap_lon[ai] = parse_deg(lon);
+                    model->ap_loc_rssi[ai] = (int8_t)rssi;
+                }
             }
             if(have_gps) {
                 model->gps_seen = true;
@@ -654,6 +783,26 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
             app->storage, bssid, ssid, "[WPA2-PSK-CCMP][ESS]", channel, rssi, lat, lon);
     }
 
+    // Dev telemetry: one row per capture with provenance + RSSI, for offline analysis
+    // of where captures actually come from (active vs passive, at what signal).
+    if(counted) {
+        storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
+        File* f = storage_file_alloc(app->storage);
+        if(storage_file_open(f, CAPTURES_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
+            if(storage_file_size(f) == 0) {
+                const char* h = "uptime_s,bssid,ssid,type,via,rssi,channel,lat,lon\n";
+                storage_file_write(f, h, strlen(h));
+            }
+            char row[128];
+            snprintf(
+                row, sizeof(row), "%lu,%s,%s,%s,%s,%d,%d,%s,%s\n", (unsigned long)up, bssid, ssid,
+                type, via[0] ? via : "?", rssi, channel, lat, lon);
+            storage_file_write(f, row, strlen(row));
+        }
+        storage_file_close(f);
+        storage_file_free(f);
+    }
+
     if(counted) app->got_pwnd = true; // capture blink
 }
 
@@ -669,7 +818,10 @@ static void pwnfriend_handle_rssi_line(PwnfriendApp* app, const char* line) {
         app->view, PwnfriendModel * model,
         {
             int ai = ap_find(model, key);
-            if(ai >= 0) model->aps[ai].rssi = (int16_t)rssi;
+            if(ai >= 0) {
+                model->aps[ai].rssi = (int16_t)rssi;
+                model->ap_seen_tick[ai] = model->tick_secs; // refresh last-seen, keep order
+            }
         },
         true);
 }
@@ -686,7 +838,7 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
     line_extract_int(line, "\"channel\":", &channel);
     line_extract_int(line, "\"rssi\":", &rssi);
     bool have_gps = line_extract_number(line, "\"lat\":", lat, sizeof(lat)) &&
-                    line_extract_number(line, "\"lon\":", lon, sizeof(lon));
+                    line_extract_number(line, "\"lon\":", lon, sizeof(lon)) && coord_ok(lat, lon);
 
     char key[13];
     bssid_key(key, bssid);
@@ -707,6 +859,14 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
                     strncpy(a->ssid, ssid, sizeof(a->ssid) - 1);
                     a->ssid[sizeof(a->ssid) - 1] = '\0';
                     a->has_essid = true;
+                }
+                // Remember where it was heard STRONGEST (best position estimate). Gains a
+                // location the first time we see it with a fix; refines if a closer one comes.
+                if(have_gps && (model->ap_lat[ai] >= 1e8f ||
+                                (rssi != 0 && (int8_t)rssi > model->ap_loc_rssi[ai]))) {
+                    model->ap_lat[ai] = parse_deg(lat);
+                    model->ap_lon[ai] = parse_deg(lon);
+                    model->ap_loc_rssi[ai] = (int8_t)rssi;
                 }
             }
             if(is_new_ap) persona_note_ap(model->persona);
@@ -800,7 +960,7 @@ static void pwnfriend_handle_miss_line(PwnfriendApp* app, const char* line) {
 // (with uptime + last GPS) so a data dump can be analysed offline to tune the algo.
 static void pwnfriend_handle_epoch_line(PwnfriendApp* app, const char* line) {
     int n = 0, recon = 0, att = 0, chans = 0, assoc = 0, deauth = 0, uni = 0, sta = 0, hs = 0,
-        pmkid = 0, miss = 0;
+        pmkid = 0, miss = 0, dpmf = 0, dnocli = 0;
     line_extract_int(line, "\"n\":", &n);
     line_extract_int(line, "\"recon\":", &recon);
     line_extract_int(line, "\"attackable\":", &att);
@@ -812,6 +972,8 @@ static void pwnfriend_handle_epoch_line(PwnfriendApp* app, const char* line) {
     line_extract_int(line, "\"hs\":", &hs);
     line_extract_int(line, "\"pmkid\":", &pmkid);
     line_extract_int(line, "\"miss\":", &miss);
+    line_extract_int(line, "\"dpmf\":", &dpmf); // deauths skipped: PMF-protected
+    line_extract_int(line, "\"dnocli\":", &dnocli); // deauths skipped: no client
 
     uint32_t up = 0;
     char lat[16], lon[16];
@@ -831,13 +993,15 @@ static void pwnfriend_handle_epoch_line(PwnfriendApp* app, const char* line) {
     if(storage_file_open(f, TELEMETRY_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
         if(storage_file_size(f) == 0) {
             const char* h =
-                "uptime_s,lat,lon,epoch,recon,attackable,chans,assoc,deauth,unicast,sta,hs,pmkid,miss\n";
+                "uptime_s,lat,lon,epoch,recon,attackable,chans,assoc,deauth,unicast,sta,hs,pmkid,"
+                "miss,dpmf,dnocli\n";
             storage_file_write(f, h, strlen(h));
         }
-        char row[176];
+        char row[200];
         snprintf(
-            row, sizeof(row), "%lu,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", (unsigned long)up,
-            lat, lon, n, recon, att, chans, assoc, deauth, uni, sta, hs, pmkid, miss);
+            row, sizeof(row), "%lu,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+            (unsigned long)up, lat, lon, n, recon, att, chans, assoc, deauth, uni, sta, hs, pmkid,
+            miss, dpmf, dnocli);
         storage_file_write(f, row, strlen(row));
     }
     storage_file_close(f);
@@ -906,15 +1070,9 @@ static void pwnfriend_populate(PwnfriendModel* model) {
     // (CH/AP/UP) inside 128px even with a 3-digit count; lifetime stays in save data.
     furi_string_printf(pwn->apStat, "%lu", (unsigned long)p->aps_session);
 
-    // UP: this session's uptime as hh:mm:ss (resets each app launch). Lifetime total
-    // still lives in save data and is advertised via -u.
-    uint32_t up = (uint32_t)p->session_uptime;
-    furi_string_printf(
-        pwn->uptime,
-        "%02lu:%02lu:%02lu",
-        (unsigned long)(up / 3600),
-        (unsigned long)((up % 3600) / 60),
-        (unsigned long)(up % 60));
+    // BAT: battery %, cached from the 1 Hz tick (more useful at a glance than uptime;
+    // full uptime still lives on the Stats screen).
+    furi_string_printf(pwn->uptime, "%u%%", (unsigned)model->battery_pct);
 
     // PWND: real handshakes captured, this session (lifetime).
     furi_string_printf(
@@ -923,40 +1081,24 @@ static void pwnfriend_populate(PwnfriendModel* model) {
         (unsigned long)p->pwnd_run,
         (unsigned long)p->s.pwnd_tot);
 
-    // Message area: paused hint, else the stat page chosen with Left/Right. Page 0
-    // (Mood) is the pwnagotchi voice line, with a fresh-catch shout taking over it.
+    // Message bubble — shown only on the Mood page (Left/Right pages draw their own
+    // multi-line panel via pwnfriend_draw_home_stats). Paused hint and a fresh-catch
+    // shout take priority; otherwise the persona speaks its mood and, now and then,
+    // brags a stat so the idle screen still surfaces numbers.
     if(!model->advertising) {
         furi_string_set(pwn->message, "paused - OK for menu");
     } else if((p->mood == MoodHappy || p->mood == MoodCool) && model->last_pwnd_ssid[0]) {
         furi_string_printf(pwn->message, "pwnd %s!", model->last_pwnd_ssid);
     } else {
-        // The persona SPEAKS the stat you scrolled to (Left/Right), in its own voice,
-        // kept short so it never overflows the bubble. Precise figures (GPS coords,
-        // beacons, epoch) live full-width on the Stats screen (OK -> Stats).
-        switch(model->stat_page) {
-        case StatPageCounts:
-            furi_string_printf(pwn->message, "I ate %lu shakes!", (unsigned long)p->pwnd_run);
-            break;
-        case StatPageSocial:
-            if(p->s.friends_met == 0)
-                furi_string_set(pwn->message, "No friends yet...");
-            else
-                furi_string_printf(
-                    pwn->message, "Met %lu friends!", (unsigned long)p->s.friends_met);
-            break;
-        case StatPageGps:
-            if(model->gps_seen && model->gps_place[0])
-                furi_string_set(pwn->message, model->gps_place); // "Near Prague"
-            else if(model->gps_seen)
-                furi_string_set(pwn->message, "I'm here!");
-            else
-                furi_string_set(pwn->message, "No GPS...");
-            break;
-        case StatPageMood:
-        default:
+        uint32_t slot = (model->tick_secs / 5) % 6; // rotate every 5s
+        if(slot == 1 && p->pwnd_run)
+            furi_string_printf(pwn->message, "%lu shakes!", (unsigned long)p->pwnd_run);
+        else if(slot == 3 && p->aps_session)
+            furi_string_printf(pwn->message, "%lu APs seen", (unsigned long)p->aps_session);
+        else if(slot == 5)
+            furi_string_set(pwn->message, "Hack the planet!"); // wraps to 2 lines in the bubble
+        else
             furi_string_set(pwn->message, persona_mood_label(p));
-            break;
-        }
     }
 
     // Friend slot: the closest (strongest) unit, with signal bars.
@@ -1004,6 +1146,8 @@ static void pwnfriend_qr_encode(PwnfriendModel* model) {
 // "No ESP32" full-screen warning shown when the board stops answering. The setup
 // QR (left) points at the compatible-hardware + firmware doc; the text (right)
 // says what to check. Modules are drawn as boxes so it scales crisply.
+static void draw_str_trunc(Canvas* c, int x, int y, const char* s, int maxw); // defined below
+
 static void pwnfriend_draw_link_down(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     if(model->qr_ok) {
@@ -1025,6 +1169,39 @@ static void pwnfriend_draw_link_down(Canvas* canvas, const PwnfriendModel* model
     canvas_draw_str(canvas, 66, 33, "the board.");
     canvas_draw_str(canvas, 66, 45, "Scan: setup");
     canvas_draw_str(canvas, 66, 54, "& firmware.");
+}
+
+// QR of the selected AP's location (a maps URL) — Up on the AP detail screen. Scan it
+// with a phone to open the spot where the AP was seen.
+static void pwnfriend_draw_ap_qr(Canvas* canvas, const PwnfriendModel* model) {
+    canvas_clear(canvas);
+    const ApRec* a = &model->aps[model->detail_ap];
+    if(model->ap_qr_ok) {
+        int size = qrcodegen_getSize(model->ap_qr);
+        int scale = (FLIPPER_SCREEN_HEIGHT - 2) / size; // fit the height, keep a quiet zone
+        if(scale < 1) scale = 1;
+        int px = size * scale;
+        int oy = (FLIPPER_SCREEN_HEIGHT - px) / 2;
+        for(int y = 0; y < size; y++)
+            for(int x = 0; x < size; x++)
+                if(qrcodegen_getModule(model->ap_qr, x, y))
+                    canvas_draw_box(canvas, 2 + x * scale, oy + y * scale, scale, scale);
+        int tx = 2 + px + 5;
+        int tw = FLIPPER_SCREEN_WIDTH - tx - 2;
+        // AP name as the heading, its coordinates beside the QR.
+        canvas_set_font(canvas, FontPrimary);
+        draw_str_trunc(canvas, tx, 12, a->ssid[0] ? a->ssid : "(hidden)", tw);
+        canvas_set_font(canvas, FontSecondary);
+        char cbuf[16];
+        fmt_coord(model->ap_lat[model->detail_ap], cbuf, sizeof(cbuf));
+        canvas_draw_str(canvas, tx, 30, cbuf);
+        fmt_coord(model->ap_lon[model->detail_ap], cbuf, sizeof(cbuf));
+        canvas_draw_str(canvas, tx, 42, cbuf);
+        canvas_draw_str(canvas, tx, 56, "scan me");
+    } else {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 4, 32, "no location for this AP");
+    }
 }
 
 // Bottom-right status cluster, in the corner freed by dropping the AI/AUTO/MANU
@@ -1070,6 +1247,12 @@ static int rssi_level(int rssi) {
     if(v < 0) v = 0;
     if(v > 50) v = 50;
     return v;
+}
+
+// True if this AP's RSSI is fresh enough to show a signal meter (heard within the TTL
+// this session). Stale/loaded APs have an out-of-date RSSI, so we hide the bar.
+static bool ap_signal_recent(const PwnfriendModel* m, uint16_t i) {
+    return m->ap_seen_tick[i] != 0 && (m->tick_secs - m->ap_seen_tick[i]) <= AP_SIGNAL_TTL_SECS;
 }
 
 // Compact capture flags for a list row: E(SSID)/P(MKID)/H(andshake), '-' if absent.
@@ -1154,13 +1337,32 @@ static void draw_titlebar(Canvas* c, const char* title, const char* right) {
     canvas_set_color(c, ColorBlack);
 }
 
-// Fill out[] with aps[] indices matching the ScreenApList filter; return the count.
+// Fill out[] with aps[] indices matching the ScreenApList filter. Order: APs with a
+// live signal first, then stale ones; within each group, newest-DISCOVERED first (by
+// first_seq desc). Recency is a coarse group (not a churning key), so rows only move
+// when an AP actually goes stale — no per-refresh reshuffle. Insertion sort, n<=256.
 static uint16_t ap_filtered(const PwnfriendModel* m, uint16_t* out) {
     uint16_t n = 0;
     for(uint16_t i = 0; i < m->ap_count; i++) {
         if(m->list_filter == FilterPwned && !(m->aps[i].pmkid || m->aps[i].handshake)) continue;
         if(m->list_filter == FilterWhitelist && !m->aps[i].whitelisted) continue;
         out[n++] = i;
+    }
+    for(uint16_t i = 1; i < n; i++) {
+        uint16_t v = out[i];
+        bool rv = ap_signal_recent(m, v);
+        uint32_t sv = m->aps[v].first_seq;
+        int j = (int)i - 1;
+        while(j >= 0) {
+            uint16_t u = out[j];
+            bool ru = ap_signal_recent(m, u);
+            // v outranks u if it's live and u isn't, or (same liveness) discovered later.
+            bool v_first = (rv && !ru) || (rv == ru && sv > m->aps[u].first_seq);
+            if(!v_first) break;
+            out[j + 1] = out[j];
+            j--;
+        }
+        out[j + 1] = v;
     }
     return n;
 }
@@ -1192,7 +1394,8 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
         case MenuPwnedAps: label = "Pwned APs"; snprintf(value, sizeof(value), "%u", pwned); break;
         case MenuAllAps:
             label = "All APs";
-            snprintf(value, sizeof(value), "%u", model->ap_count);
+            snprintf(
+                value, sizeof(value), "%u%s", model->ap_count, model->ap_overflow ? "+" : "");
             break;
         case MenuWhitelist: label = "Ignore"; snprintf(value, sizeof(value), "%u", wl); break;
         case MenuStats: label = "Stats"; break;
@@ -1271,7 +1474,10 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
     uint16_t idx[AP_MAX];
     uint16_t n = ap_filtered(model, idx);
     char hint[10];
-    snprintf(hint, sizeof(hint), "%u", n);
+    // "N+" on the All view once we've started recycling (more seen than the table holds).
+    snprintf(
+        hint, sizeof(hint), "%u%s", n,
+        (model->list_filter == FilterAll && model->ap_overflow) ? "+" : "");
     draw_titlebar(canvas, title, hint);
     canvas_set_font(canvas, FontSecondary);
     if(n == 0) {
@@ -1283,7 +1489,8 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
         return;
     }
     for(uint16_t r = 0; r < APLIST_ROWS && model->list_top + r < n; r++) {
-        const ApRec* a = &model->aps[idx[model->list_top + r]];
+        uint16_t apidx = idx[model->list_top + r];
+        const ApRec* a = &model->aps[apidx];
         int y = 11 + (r + 1) * 10;
         bool sel = (model->list_top + r == model->list_idx);
         if(sel) {
@@ -1306,7 +1513,9 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
             int bar_w = 26;
             int bar_x = fx - 4 - bar_w;
             marker_x = bar_x - 8;
-            draw_progress(canvas, bar_x, y - 7, bar_w, 7, rssi_level(a->rssi), 50);
+            // Only draw the meter if the signal is fresh; a stale AP shows no bar.
+            if(ap_signal_recent(model, apidx))
+                draw_progress(canvas, bar_x, y - 7, bar_w, 7, rssi_level(a->rssi), 50);
         }
         draw_str_trunc(canvas, 3, y, name, marker_x - 5);
         if(a->targeted)
@@ -1329,31 +1538,67 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
     fmt_bssid_colons(a->bssid, mac);
     snprintf(l, sizeof(l), "%s  ch%d", mac, a->channel);
     canvas_draw_str(canvas, 2, 22, l);
-    // signal: bar + the RSSI value beside it + the capture state word (state only here)
-    const char* word = ap_crackable(a) ? "CRACK" :
-                       (a->pmkid || a->handshake) ? "captured" :
-                       a->missed ? "missed" : "seen";
-    draw_progress(canvas, 2, 30, 34, 8, rssi_level(a->rssi), 50);
-    snprintf(l, sizeof(l), "%ddBm", a->rssi);
-    canvas_draw_str(canvas, 40, 37, l);
-    int ww = (int)canvas_string_width(canvas, word);
-    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - 2 - ww, 37, word);
-    // flags line
-    snprintf(
-        l,
-        sizeof(l),
-        "ESSID:%c PMKID:%c HS:%c",
-        a->has_essid ? 'y' : '-',
-        a->pmkid ? 'y' : '-',
-        a->handshake ? 'y' : '-');
-    canvas_draw_str(canvas, 2, 49, l);
-    // target/ignore are set from the list; show the status read-only here, with a hint.
-    snprintf(
-        l, sizeof(l), "status: %s",
-        a->targeted ? "targeted" : a->whitelisted ? "ignored" : "-");
-    canvas_draw_str(canvas, 2, 63, l);
-    const char* hint = "set in list";
-    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - 2 - canvas_string_width(canvas, hint), 63, hint);
+    // Distance from us to where the AP was heard strongest — shown on row 2 (right),
+    // computed here. Needs a current fix + a stored AP location.
+    float clat = parse_deg(model->last_lat), clon = parse_deg(model->last_lon);
+    float alat = model->ap_lat[model->detail_ap], alon = model->ap_lon[model->detail_ap];
+    char dist[14];
+    dist[0] = '\0';
+    if(model->gps_seen && clat < 1e8f && alat < 1e8f) {
+        float coslat = cosf(clat * 3.14159265f / 180.0f);
+        float dn = alat - clat, de = (alon - clon) * coslat;
+        float km = sqrtf(dn * dn + de * de) * 111.0f;
+        if(km < 1.0f)
+            snprintf(dist, sizeof(dist), "~%dm", (int)(km * 1000.0f));
+        else
+            snprintf(dist, sizeof(dist), "~%dkm", (int)(km + 0.5f));
+    }
+    // Row 2: bar (only if fresh) + RSSI + age, with the DISTANCE right-aligned.
+    char age[10];
+    uint32_t seen = model->ap_seen_tick[model->detail_ap];
+    if(seen)
+        fmt_age(model->tick_secs - seen, age, sizeof(age));
+    else
+        snprintf(age, sizeof(age), "old");
+    if(ap_signal_recent(model, model->detail_ap)) {
+        draw_progress(canvas, 2, 30, 34, 8, rssi_level(a->rssi), 50);
+        snprintf(l, sizeof(l), "%ddBm %s", a->rssi, age);
+        canvas_draw_str(canvas, 40, 37, l);
+    } else {
+        snprintf(l, sizeof(l), "%ddBm %s", a->rssi, age);
+        canvas_draw_str(canvas, 2, 37, l);
+    }
+    if(dist[0])
+        canvas_draw_str(
+            canvas, FLIPPER_SCREEN_WIDTH - 2 - (int)canvas_string_width(canvas, dist), 37, dist);
+    // Up-hint: a centered ▲ map when this AP has a known location, so it's clear Up
+    // pops the map QR. Only drawn when there IS one (Up is a no-op otherwise).
+    if(alat < 1e8f) {
+        const char* h = "map";
+        int hw = (int)canvas_string_width(canvas, h);
+        int gx = (FLIPPER_SCREEN_WIDTH - (5 + 3 + hw)) / 2;
+        canvas_draw_triangle(canvas, gx + 2, 45, 5, 4, CanvasDirectionBottomToTop);
+        canvas_draw_str(canvas, gx + 8, 45, h);
+    }
+    // Crackability as a plain-language formula (what we have -> whether it cracks).
+    const char* key = a->pmkid ? "PMKID" : a->handshake ? "HS" : NULL;
+    if(a->has_essid && key)
+        snprintf(l, sizeof(l), "ESSID + %s = CRACKABLE", key);
+    else if(key)
+        snprintf(l, sizeof(l), "%s but no ESSID", key);
+    else if(a->has_essid)
+        snprintf(l, sizeof(l), "ESSID, no key yet");
+    else
+        snprintf(l, sizeof(l), "nothing caught yet");
+    canvas_draw_str(canvas, 2, 53, l);
+    // actions: ◄  target[x]   ignore[x]  ► — set here or in the list; picking pops back.
+    icon_left(canvas, 2, 60);
+    snprintf(l, sizeof(l), "target[%c]", a->targeted ? 'x' : ' ');
+    canvas_draw_str(canvas, 11, 63, l);
+    snprintf(l, sizeof(l), "ignore[%c]", a->whitelisted ? 'x' : ' ');
+    int rw = (int)canvas_string_width(canvas, l);
+    icon_right(canvas, FLIPPER_SCREEN_WIDTH - 6, 60); // ► hard against the right edge
+    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - 6 - 4 - rw, 63, l);
 }
 
 static void pwnfriend_draw_stats(Canvas* canvas, const PwnfriendModel* model) {
@@ -1459,6 +1704,56 @@ static void pwnfriend_draw_about(Canvas* canvas, const PwnfriendModel* model) {
     canvas_draw_str(canvas, 2, 64, line);
 }
 
+// A multi-line stat panel drawn in the message region (right of the face) when the
+// user has scrolled off the Mood page with Left/Right. Fills the space the single-line
+// bubble left empty; auto-reverts to the persona voice after HOME_STATS_TIMEOUT_SECS.
+static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* model) {
+    canvas_set_font(canvas, FontSecondary);
+    const Persona* p = model->persona;
+    const int x = 61;
+    int y = 17;
+    char l[40];
+#define HS_ROW(...)                              \
+    do {                                         \
+        snprintf(l, sizeof(l), __VA_ARGS__);     \
+        canvas_draw_str(canvas, x, y, l);        \
+        y += 9;                                  \
+    } while(0)
+    switch(model->stat_page) {
+    case StatPageCounts: {
+        uint16_t crack = 0;
+        for(uint16_t i = 0; i < model->ap_count; i++)
+            if(model->aps[i].has_essid && (model->aps[i].pmkid || model->aps[i].handshake)) crack++;
+        HS_ROW("pwnd %lu/%lu", (unsigned long)p->pwnd_run, (unsigned long)p->s.pwnd_tot);
+        HS_ROW("aps %lu", (unsigned long)p->aps_session);
+        HS_ROW("crack %u", (unsigned)crack);
+        HS_ROW("epoch %lu", (unsigned long)p->epoch);
+        break;
+    }
+    case StatPageSocial: {
+        int near = 0;
+        for(int i = 0; i < MAX_PEERS; i++)
+            if(model->peers.items[i].used) near++;
+        HS_ROW("friends %lu", (unsigned long)p->s.friends_met);
+        HS_ROW("won a%lu p%lu", (unsigned long)model->pwn_active, (unsigned long)model->pwn_passive);
+        HS_ROW("near %d", near);
+        break;
+    }
+    case StatPageGps:
+    default:
+        // Distance/direction on one row, the course on its own so neither overflows.
+        // (No raw coords here — those live on the Stats screen.)
+        if(model->gps_seen) {
+            HS_ROW("%s", model->gps_place[0] ? model->gps_place : "locating...");
+            if(model->gps_course[0]) HS_ROW("%s", model->gps_course);
+        } else {
+            HS_ROW("no GPS fix");
+        }
+        break;
+    }
+#undef HS_ROW
+}
+
 static void pwnfriend_draw_home(Canvas* canvas, PwnfriendModel* model) {
     pwnfriend_populate(model);
     // Draw the pwnagotchi screen piece by piece, skipping pwnagotchi_draw_mode: the
@@ -1473,7 +1768,11 @@ static void pwnfriend_draw_home(Canvas* canvas, PwnfriendModel* model) {
     pwnagotchi_draw_lines(pwn, canvas);
     pwnagotchi_draw_friend(pwn, canvas);
     pwnagotchi_draw_handshakes(pwn, canvas);
-    pwnagotchi_draw_message(pwn, canvas);
+    // Mood page (or paused) speaks; other pages show the multi-line stat panel.
+    if(model->advertising && model->stat_page != StatPageMood)
+        pwnfriend_draw_home_stats(canvas, model);
+    else
+        pwnagotchi_draw_message(pwn, canvas);
     pwnfriend_draw_last_pwnd(canvas, model);
 }
 
@@ -1494,6 +1793,7 @@ static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
     case ScreenMenu: pwnfriend_draw_menu(canvas, model); return;
     case ScreenApList: pwnfriend_draw_aplist(canvas, model); return;
     case ScreenApDetail: pwnfriend_draw_apdetail(canvas, model); return;
+    case ScreenApQr: pwnfriend_draw_ap_qr(canvas, model); return;
     case ScreenStats: pwnfriend_draw_stats(canvas, model); return;
     case ScreenAbout: pwnfriend_draw_about(canvas, model); return;
     case ScreenHome:
@@ -1585,6 +1885,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         model->stat_page = (model->stat_page + 1) % StatPageCount;
                     else
                         model->stat_page = (model->stat_page + StatPageCount - 1) % StatPageCount;
+                    model->stat_touch_secs = model->tick_secs; // arm the auto-revert timer
                 },
                 true);
             return true;
@@ -1744,6 +2045,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         if(model->gps_seen) {
                             model->home_lat = parse_deg(model->last_lat);
                             model->home_lon = parse_deg(model->last_lon);
+                            model->home_set = true; // now it's "Home", not "Mother"
                             pwnfriend_update_place(model);
                             home_save(app->storage, model);
                         }
@@ -1776,11 +2078,11 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                     uint16_t idx[AP_MAX];
                     uint16_t n = ap_filtered(model, idx);
                     if(n) {
-                        if(event->key == InputKeyDown) {
-                            if(model->list_idx + 1 < n) model->list_idx++;
-                        } else if(model->list_idx > 0) {
-                            model->list_idx--;
-                        }
+                        // Wrap both ways so you can run off either end to the other.
+                        if(event->key == InputKeyDown)
+                            model->list_idx = (uint16_t)((model->list_idx + 1) % n);
+                        else
+                            model->list_idx = (uint16_t)((model->list_idx + n - 1) % n);
                         if(model->list_idx < model->list_top) model->list_top = model->list_idx;
                         if(model->list_idx >= model->list_top + APLIST_ROWS)
                             model->list_top = model->list_idx - APLIST_ROWS + 1;
@@ -1857,13 +2159,71 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                 app->view, PwnfriendModel * model, { model->screen = ScreenApList; }, true);
             return true;
         }
-        if(event->key == InputKeyLeft || event->key == InputKeyRight) {
-            // target/ignore are set from the list now; here the arrows just pop back.
+        if(event->key == InputKeyUp) {
+            // Up: QR of this AP's location (a maps URL) to scan with a phone. Only if we
+            // recorded where it was seen.
             with_view_model(
-                app->view, PwnfriendModel * model, { model->screen = ScreenApList; }, true);
+                app->view, PwnfriendModel * model,
+                {
+                    float alat = model->ap_lat[model->detail_ap];
+                    float alon = model->ap_lon[model->detail_ap];
+                    if(alat < 1e8f && alon < 1e8f) {
+                        char lats[16];
+                        char lons[16];
+                        char url[64];
+                        uint8_t tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(4)];
+                        fmt_coord(alat, lats, sizeof(lats));
+                        fmt_coord(alon, lons, sizeof(lons));
+                        // Vendor-neutral geo: URI — the phone opens it in whatever map app
+                        // the user has (Organic Maps / OsmAnd / Apple / …), not forced Google.
+                        snprintf(url, sizeof(url), "geo:%s,%s", lats, lons);
+                        model->ap_qr_ok = qrcodegen_encodeText(
+                            url, tmp, model->ap_qr, qrcodegen_Ecc_LOW, 1, 4, qrcodegen_Mask_AUTO,
+                            true);
+                        model->screen = ScreenApQr;
+                    }
+                },
+                true);
+            return true;
+        }
+        if(event->key == InputKeyLeft || event->key == InputKeyRight) {
+            bool is_left = event->key == InputKeyLeft; // Left = target, Right = ignore
+            with_view_model(
+                app->view, PwnfriendModel * model,
+                {
+                    ApRec* a = &model->aps[model->detail_ap];
+                    if(is_left) { // exclusive: one focus AP, clears ignore, pins channel
+                        bool on = !a->targeted;
+                        for(uint16_t i = 0; i < model->ap_count; i++)
+                            model->aps[i].targeted = false;
+                        a->targeted = on;
+                        if(on) {
+                            a->whitelisted = false;
+                            if(a->channel >= 1 && a->channel <= 14)
+                                model->tuned_channel = (int8_t)a->channel;
+                        } else {
+                            model->tuned_channel = 0;
+                        }
+                    } else { // ignore, exclusive with target
+                        a->whitelisted = !a->whitelisted;
+                        if(a->whitelisted) a->targeted = false;
+                    }
+                    model->screen = ScreenApList; // picked -> pop back to the list
+                    need_advertise = model->advertising;
+                },
+                true);
+            if(need_advertise) pwnfriend_send_advertise(app);
             return true;
         }
         return true;
+
+    case ScreenApQr:
+        if(event->key == InputKeyBack) {
+            with_view_model(
+                app->view, PwnfriendModel * model, { model->screen = ScreenApDetail; }, true);
+            return true;
+        }
+        return true; // swallow everything else on the QR screen
 
     case ScreenStats:
         if(event->key == InputKeyBack) {
@@ -1940,6 +2300,11 @@ static void pwnfriend_timer_callback(void* ctx) {
             if(model->screen == ScreenAbout) model->about_scroll += model->about_speed;
             if(second) {
                 model->tick_secs++;
+                model->battery_pct = furi_hal_power_get_pct(); // for the home BAT slot
+                // Home stat panel auto-reverts to the persona voice after a quiet spell.
+                if(model->stat_page != StatPageMood &&
+                   model->tick_secs - model->stat_touch_secs >= HOME_STATS_TIMEOUT_SECS)
+                    model->stat_page = StatPageMood;
                 peers_prune(&model->peers, model->tick_secs);
                 bool bonded = peers_any_bonded(&model->peers, model->tick_secs);
                 model->persona->friend_near = bonded;
@@ -2096,6 +2461,16 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->last_pwnd_ssid[0] = '\0';
             model->pwnd_seen_count = 0;
             model->ap_count = 0;
+            model->ap_overflow = false;
+            model->ap_seq = 1;
+            // Parallel per-AP session arrays: no signal yet, no known location. Must be
+            // set for every slot (loaded APs never pass through ap_get).
+            for(uint16_t i = 0; i < AP_MAX; i++) {
+                model->ap_seen_tick[i] = 0;
+                model->ap_lat[i] = 1e9f;
+                model->ap_lon[i] = 1e9f;
+                model->ap_loc_rssi[i] = -128; // weakest, so the first real fix always wins
+            }
             ap_db_load(app->storage, model); // browse APs/pwns from previous sessions
             model->tuned_channel = 0; // auto (*) — the recon sweep
             model->stat_page = StatPageMood;
@@ -2118,9 +2493,11 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->last_lat[0] = '\0';
             model->last_lon[0] = '\0';
             model->gps_place[0] = '\0';
+            model->gps_course[0] = '\0';
             model->home_lat = HOME_LAT; // default; overridden by home.bin / "Set home"
             model->home_lon = HOME_LON;
-            home_load(app->storage, model); // may restore quiet
+            model->home_set = false; // default Prague = the persona's "Mother" until set
+            home_load(app->storage, model); // may restore quiet + home_set
             model->last_rx_secs = 0;
             model->advertising_since = 0; // advertising starts now (tick 0) -> grace runs
             model->link_down = false;
