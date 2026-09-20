@@ -88,6 +88,9 @@ void persona_free(Persona* p);
 // Persist to SD. Call periodically and on exit.
 bool persona_save(Persona* p);
 
+// Set the display name (empty -> "flippy"). Persisted on the next persona_save.
+void persona_set_name(Persona* p, const char* name);
+
 // Advance one tick. dt = seconds elapsed. Recomputes mood/face.
 void persona_tick(Persona* p, uint32_t dt);
 

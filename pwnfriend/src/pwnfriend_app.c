@@ -3,6 +3,7 @@
 #include <gui/gui.h>
 #include <gui/view.h>
 #include <gui/view_dispatcher.h>
+#include <gui/modules/text_input.h>
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
 #include <stdlib.h>
@@ -101,6 +102,7 @@ typedef enum {
     MenuStats,
     MenuAdvertise,
     MenuCapture,
+    MenuName,
     MenuChannel,
     MenuMinRssi,
     MenuRecon,
@@ -174,6 +176,8 @@ typedef struct {
     FuriHalSerialHandle* serial_handle;
     FuriTimer* timer;
     Storage* storage; // for the handshake pcap writer
+    TextInput* text_input; // "Set name" editor (view id 1)
+    char name_buf[PERSONA_NAME_MAX]; // edit buffer for the name text input
 
     // Line assembly — touched only by the worker thread. Sized to hold a whole
     // hex-encoded EAPOL frame line (PWNFRIEND_HS <bssid> <~600 hex>), not just JSON.
@@ -1046,6 +1050,7 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
         case MenuPwnedAps: snprintf(row, sizeof(row), "Pwned APs (%u)", pwned); break;
         case MenuAllAps: snprintf(row, sizeof(row), "All APs (%u)", model->ap_count); break;
         case MenuStats: snprintf(row, sizeof(row), "Stats"); break;
+        case MenuName: snprintf(row, sizeof(row), "Name: %s", model->persona->s.name); break;
         case MenuAdvertise:
             snprintf(row, sizeof(row), "Advertise: %s", model->advertising ? "ON" : "off");
             break;
@@ -1239,6 +1244,30 @@ static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
 // Input
 // ---------------------------------------------------------------------------
 
+// "Set name" text-input result (OK): apply + persist the new name, return to the
+// menu, and refresh the beacon so the mesh sees the new name.
+static void pwnfriend_name_result(void* ctx) {
+    PwnfriendApp* app = ctx;
+    bool advertising = false;
+    with_view_model(
+        app->view,
+        PwnfriendModel * model,
+        {
+            persona_set_name(model->persona, app->name_buf);
+            persona_save(model->persona);
+            advertising = model->advertising;
+        },
+        true);
+    view_dispatcher_switch_to_view(app->view_dispatcher, 0);
+    if(advertising) pwnfriend_send_advertise(app);
+}
+
+// Back from the name editor -> the main view (which is sitting on the menu).
+static uint32_t pwnfriend_name_prev(void* ctx) {
+    UNUSED(ctx);
+    return 0;
+}
+
 static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
     PwnfriendApp* app = ctx;
 
@@ -1372,11 +1401,17 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
             return true;
         }
         if(event->key == InputKeyOk) {
-            bool toggled_adv = false, now_adv = false, prompted = false;
+            bool toggled_adv = false, now_adv = false, prompted = false, open_name = false;
             with_view_model(
                 app->view, PwnfriendModel * model,
                 {
                     switch(model->menu_idx) {
+                    case MenuName:
+                        // Prime the editor with the current name, opened below.
+                        strncpy(app->name_buf, model->persona->s.name, sizeof(app->name_buf) - 1);
+                        app->name_buf[sizeof(app->name_buf) - 1] = '\0';
+                        open_name = true;
+                        break;
                     case MenuPwnedAps:
                         model->screen = ScreenApList;
                         model->list_pwned_only = true;
@@ -1424,7 +1459,13 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                     }
                 },
                 true);
-            if(toggled_adv) {
+            if(open_name) {
+                text_input_set_header_text(app->text_input, "Persona name");
+                text_input_set_result_callback(
+                    app->text_input, pwnfriend_name_result, app, app->name_buf,
+                    sizeof(app->name_buf), false);
+                view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+            } else if(toggled_adv) {
                 if(now_adv)
                     pwnfriend_send_advertise(app);
                 else
@@ -1721,6 +1762,12 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
 
     view_set_previous_callback(app->view, pwnfriend_exit);
     view_dispatcher_add_view(app->view_dispatcher, 0, app->view);
+
+    // Name editor (view id 1): Back returns to the main view/menu.
+    app->text_input = text_input_alloc();
+    view_set_previous_callback(text_input_get_view(app->text_input), pwnfriend_name_prev);
+    view_dispatcher_add_view(app->view_dispatcher, 1, text_input_get_view(app->text_input));
+
     view_dispatcher_switch_to_view(app->view_dispatcher, 0);
 
     // Serial
@@ -1775,6 +1822,8 @@ static void pwnfriend_app_free(PwnfriendApp* app) {
     furi_thread_join(app->worker_thread);
     furi_thread_free(app->worker_thread);
 
+    view_dispatcher_remove_view(app->view_dispatcher, 1);
+    text_input_free(app->text_input);
     view_dispatcher_remove_view(app->view_dispatcher, 0);
     with_view_model(
         app->view,

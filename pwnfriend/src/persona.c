@@ -71,13 +71,13 @@ static void persona_gen_identity(char* out /* PERSONA_ID_HEX_LEN+1 */) {
     out[PERSONA_ID_HEX_LEN] = '\0';
 }
 
-// The display name is the Flipper's own device name (e.g. "Tr1te"), so a friend on
-// the mesh sees the unit it's actually looking at. The persistent 64-hex identity
-// (the friendship key) is untouched — only this shown name tracks the device.
-static void persona_set_device_name(Persona* p) {
-    const char* dev = furi_hal_version_get_name_ptr();
-    if(!dev || !dev[0]) dev = "pwn"; // no name programmed -> a sane default
-    strncpy(p->s.name, dev, PERSONA_NAME_MAX - 1);
+// The display name shown on the mesh. Defaults to "flippy" for a fresh persona and
+// is user-editable (persona_set_name, persisted); the 64-hex identity is separate.
+#define PERSONA_DEFAULT_NAME "flippy"
+
+void persona_set_name(Persona* p, const char* name) {
+    if(!name || !name[0]) name = PERSONA_DEFAULT_NAME;
+    strncpy(p->s.name, name, PERSONA_NAME_MAX - 1);
     p->s.name[PERSONA_NAME_MAX - 1] = '\0';
 }
 
@@ -85,7 +85,7 @@ static void persona_mint(Persona* p) {
     memset(p, 0, sizeof(Persona));
     p->s.magic = PERSONA_SAVE_MAGIC;
     p->s.version = PERSONA_SAVE_VERSION;
-    persona_set_device_name(p);
+    persona_set_name(p, PERSONA_DEFAULT_NAME);
     persona_gen_identity(p->s.identity);
     p->s.born_unix = persona_now_unix();
     p->s.total_uptime = 0;
@@ -113,9 +113,8 @@ Persona* persona_alloc(void) {
             // Guard against a corrupt name/identity from a truncated write.
             p->s.name[PERSONA_NAME_MAX - 1] = '\0';
             p->s.identity[PERSONA_ID_HEX_LEN] = '\0';
-            // The shown name always tracks the Flipper's own device name, even for
-            // a persona saved under the old hardcoded name. Identity stays as saved.
-            persona_set_device_name(p);
+            if(!p->s.name[0]) persona_set_name(p, PERSONA_DEFAULT_NAME); // guard empty
+            // Keep the saved (user-chosen) name; identity stays as saved.
             // The memset above zeroed every volatile epoch counter before p->s = saved.
             p->mood = MoodContent;
             p->secs_since_peer = 0;
