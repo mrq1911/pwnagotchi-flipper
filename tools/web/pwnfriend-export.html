@@ -377,7 +377,10 @@ function parseWardrive(text) {
     const f = splitCsv(lines[i]);
     if (f.length < 8) continue;
     const lat = parseFloat(f[6]), lon = parseFloat(f[7]);
-    if (!isFinite(lat) || !isFinite(lon) || (lat === 0 && lon === 0)) continue;
+    // Reject non-finite, null-island, AND out-of-range coords: one corrupt GPS sample
+    // (e.g. a garbage lon like 1.3e14) is finite but would explode fitBounds/the map.
+    if (!isFinite(lat) || !isFinite(lon) || (lat === 0 && lon === 0) ||
+        Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
     pts.push({ mac: (f[0] || '').toLowerCase(), ssid: f[1] || '', auth: f[2] || '',
                ch: f[4] || '', rssi: f[5] || '', lat, lon });
   }
