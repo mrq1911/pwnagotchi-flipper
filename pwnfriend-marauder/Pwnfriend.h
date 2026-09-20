@@ -14,6 +14,18 @@
 
 #pragma once
 
+// pwnfriend serial-protocol version, stamped on every PWNFRIEND_ADV line (ver=N) so
+// the Flipper app can warn when the flashed firmware is older than it needs. Bump on
+// any protocol change. v2 = dwell recon + unicast/repeat deauth + PMKID auth + ESSID
+// embed + target/whitelist/recon/assoc flags. v3 = live RSSI refresh (PWNFRIEND_RSSI).
+// v4 = per-epoch telemetry (PWNFRIEND_EPOCH) + capture provenance (via=) + floor-free
+// PMKID solicitation.
+#define PWNFRIEND_PROTO 4
+
+// Min interval between PWNFRIEND_RSSI updates for one AP, so re-heard beacons refresh
+// the signal without flooding the serial link.
+#define PWNFRIEND_RSSI_EMIT_MS 3000
+
 #include <Arduino.h>
 #include <esp_wifi.h>
 #include <LinkedList.h>
@@ -81,6 +93,8 @@ class Pwnfriend {
         _n_sta = 0;
         _inactive_epochs = 0;  // a fresh scan starts at full recon speed
         _epoch_pwnd = false;
+        _epoch_seq = 0;
+        _ep_assoc = _ep_deauth = _ep_unicast = _ep_hs = _ep_pmkid = _ep_miss = 0;
         resetPhase();
     }
 
@@ -98,6 +112,7 @@ class Pwnfriend {
     uint32_t _uptime;
     uint32_t _epoch;
     bool     _deauth_policy;
+    bool     _assoc_policy;   // associate (solicit PMKID) without deauth — "PMKID-only"
     uint8_t  _session_id[6];  // Addr3, stable per persona
 
     // Channel hopping
@@ -131,8 +146,13 @@ class Pwnfriend {
     uint8_t  _inactive_epochs; // consecutive fruitless epochs (recon_time doubling)
     uint32_t _last_deauth_ms;  // re-deauth cadence within the current channel dwell
     uint32_t _cur_dwell_ms;    // this channel's dwell, scaled by its target count
-    int8_t   _attack_min_rssi; // don't waste the dwell attacking APs weaker than this
+    int8_t   _attack_min_rssi; // deauth floor: don't bother deauthing APs weaker than this
     uint32_t _recon_time_ms;   // recon_time override (-recon), default 30s
+
+    // Per-epoch telemetry (emitted as PWNFRIEND_EPOCH at endEpoch, then reset).
+    uint32_t _epoch_seq;       // running epoch index since beginSession
+    uint16_t _ep_assoc, _ep_deauth, _ep_unicast; // frames fired this epoch
+    uint16_t _ep_hs, _ep_pmkid, _ep_miss;        // outcomes this epoch
 
     // Targeting + whitelist (set from the Flipper's options menu). When a target is
     // set, only that BSSID is attacked (the attack list collapses to its channel);
@@ -148,9 +168,10 @@ class Pwnfriend {
         uint8_t bssid[6];
         char ssid[33];
         uint8_t channel;
-        int8_t  rssi;    // first-seen beacon RSSI, for attack targeting (0 = unknown)
+        int8_t  rssi;    // latest beacon RSSI, refreshed as we re-hear it (0 = unknown)
         uint8_t attacks; // active-mode assoc/deauth bursts aimed at this AP
         bool missed;     // already emitted a PWNFRIEND_MISS for it
+        uint32_t last_rssi_ms; // millis() of the last PWNFRIEND_RSSI we streamed for it
     };
     // A dense area easily tops 80 APs; 64 silently dropped ~16 of them (never
     // recon'd, never attacked). 128 covers a busy neighbourhood.
@@ -183,7 +204,8 @@ class Pwnfriend {
     void attackChannel(uint8_t channel);  // assoc + full deauth pass on entry
     void deauthChannelPass(uint8_t channel); // deauth-only re-kick during the dwell
     uint32_t channelDwellMs(uint8_t channel); // dwell scaled by eligible target count
-    bool attackable(const ReconAP& ap) const; // not pwned, in range, not whitelisted/off-target
+    bool attackable(const ReconAP& ap) const; // eligible for assoc: not pwned/whitelisted/off-target
+    bool deauthable(const ReconAP& ap) const;  // + strong enough to bother deauthing (RSSI floor)
     bool isWhitelisted(const uint8_t* bssid) const;
 
     int  reconIndex(const uint8_t* bssid) const;   // -1 if unseen
@@ -191,7 +213,7 @@ class Pwnfriend {
     bool isPwnd(const uint8_t* bssid) const;       // already captured this session?
     void emitPwnd(const uint8_t* bssid, const char* ssid,
                   const char* type, int channel, int rssi,
-                  bool has_fix, double lat, double lon);
+                  bool has_fix, double lat, double lon, bool active);
     void deauthAP(const uint8_t* bssid);
     // Unicast deauth of one client, spoofed in BOTH directions (AP->client and
     // client->AP) — the effective form modern clients honour, mirroring bettercap's
