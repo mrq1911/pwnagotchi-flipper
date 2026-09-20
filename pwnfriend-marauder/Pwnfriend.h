@@ -95,6 +95,7 @@ class Pwnfriend {
         _epoch_pwnd = false;
         _epoch_seq = 0;
         _ep_assoc = _ep_deauth = _ep_unicast = _ep_hs = _ep_pmkid = _ep_miss = 0;
+        _ep_dpmf = _ep_dnocli = 0;
         resetPhase();
     }
 
@@ -153,6 +154,7 @@ class Pwnfriend {
     uint32_t _epoch_seq;       // running epoch index since beginSession
     uint16_t _ep_assoc, _ep_deauth, _ep_unicast; // frames fired this epoch
     uint16_t _ep_hs, _ep_pmkid, _ep_miss;        // outcomes this epoch
+    uint16_t _ep_dpmf, _ep_dnocli;               // deauths skipped: PMF-protected / no client
 
     // Targeting + whitelist (set from the Flipper's options menu). When a target is
     // set, only that BSSID is attacked (the attack list collapses to its channel);
@@ -171,6 +173,7 @@ class Pwnfriend {
         int8_t  rssi;    // latest beacon RSSI, refreshed as we re-hear it (0 = unknown)
         uint8_t attacks; // active-mode assoc/deauth bursts aimed at this AP
         bool missed;     // already emitted a PWNFRIEND_MISS for it
+        bool pmf;        // 802.11w PMF required (RSN MFPR) -> deauth is futile, PMKID only
         uint32_t last_rssi_ms; // millis() of the last PWNFRIEND_RSSI we streamed for it
     };
     // A dense area easily tops 80 APs; 64 silently dropped ~16 of them (never
@@ -206,7 +209,14 @@ class Pwnfriend {
     uint32_t channelDwellMs(uint8_t channel); // dwell scaled by eligible target count
     bool attackable(const ReconAP& ap) const; // eligible for assoc: not pwned/whitelisted/off-target
     bool deauthable(const ReconAP& ap) const;  // + strong enough to bother deauthing (RSSI floor)
+    bool hasClient(int ap_idx) const;           // a fresh associated client -> deauth can work
     bool isWhitelisted(const uint8_t* bssid) const;
+    // Directed probe request (wildcard SSID) to make a nameless AP reveal its ESSID,
+    // so a keymat-only capture can still be cracked (hcxdumptool-style).
+    void probeAP(const uint8_t* bssid);
+    // Clients older than this (no data frame seen) are treated as gone: don't deauth
+    // an AP on their behalf.
+    static const uint32_t STA_TTL_MS = 180000;
 
     int  reconIndex(const uint8_t* bssid) const;   // -1 if unseen
     bool markPwnd(const uint8_t* bssid);           // true if newly counted

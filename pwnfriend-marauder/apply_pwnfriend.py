@@ -85,7 +85,7 @@ def main():
     print(f"patching Marauder at {src}")
 
     # 0. Copy the module in.
-    for name in ("Pwnfriend.h", "Pwnfriend.cpp"):
+    for name in ("Pwnfriend.h", "Pwnfriend.cpp", "pwnfriend_frames.h"):
         shutil.copy2(HERE / name, src / name)
         print(f"  copied {name}")
 
