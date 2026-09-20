@@ -175,6 +175,7 @@ jobs:
         run: |
           pip install --quiet ufbt
           cd pwnfriend
+          sh gen_version.sh
           ufbt update --index-url https://up.unleashedflip.com/directory.json --channel dev
           ufbt
       - uses: actions/upload-artifact@v4
