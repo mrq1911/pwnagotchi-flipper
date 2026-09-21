@@ -55,7 +55,10 @@ class Pwnfriend {
 
     // Emit one PWNFRIEND_PEER line for a sniffed Pwnagotchi beacon. `payload`
     // is the raw 802.11 frame, `rssi`/`channel` come from the rx metadata.
-    void reportPeer(const uint8_t* payload, int length, int rssi, int channel);
+    // `has_fix`/`lat`/`lon` geotag the line so the Flipper can log where each
+    // sighting was heard (RSSI + position → triangulate the friend offline).
+    void reportPeer(const uint8_t* payload, int length, int rssi, int channel,
+                    bool has_fix, double lat, double lon);
 
     // Capture path (called from the pwnfriend rx callback on DATA frames).
     // Detects a crackable EAPOL M2 handshake or an RSN PMKID (M1) and, once per

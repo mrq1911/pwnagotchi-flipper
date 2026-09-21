@@ -1,5 +1,6 @@
 #include "Pwnfriend.h"
 #include "pwnfriend_frames.h" // pure, host-testable 802.11 parsers (see tests/)
+#include "pwnfriend_commit.h" // PWNFRIEND_FW_COMMIT, baked at build (see apply_pwnfriend.py)
 
 #include <LinkedList.h>
 #include <ArduinoJson.h>
@@ -658,14 +659,16 @@ void Pwnfriend::broadcast() {
     // One atomic write so this main-loop line can't interleave with the rx
     // callback's PWNFRIEND_* prints.
     char line[96];
-    int n = snprintf(line, sizeof(line), "PWNFRIEND_ADV name=%s ch=%u sent=%u ver=%d\n",
-                     _name, (unsigned)_cur_channel, (unsigned)_sent, PWNFRIEND_PROTO);
+    int n = snprintf(line, sizeof(line), "PWNFRIEND_ADV name=%s ch=%u sent=%u ver=%d fw=%s\n",
+                     _name, (unsigned)_cur_channel, (unsigned)_sent, PWNFRIEND_PROTO,
+                     PWNFRIEND_FW_COMMIT);
     if (n < 0) return;
     if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
     Serial.write((const uint8_t*)line, n);
 }
 
-void Pwnfriend::reportPeer(const uint8_t* payload, int length, int rssi, int channel) {
+void Pwnfriend::reportPeer(const uint8_t* payload, int length, int rssi, int channel,
+                           bool has_fix, double lat, double lon) {
     // Locate the JSON the same way Marauder's processPwnagotchiBeacon does.
     int start = 36, end = length;
     while (start < length && payload[start] != '{') start++;
@@ -690,15 +693,18 @@ void Pwnfriend::reportPeer(const uint8_t* payload, int length, int rssi, int cha
     sanitize(name, safe_name, sizeof(safe_name));
     sanitize(ident, safe_ident, sizeof(safe_ident));
 
+    char geo[48];
+    fmt_geo(geo, sizeof(geo), has_fix, lat, lon);
+
     // One structured line the Flipper filters on its PWNFRIEND_ prefix. Built
     // into a single buffer and emitted as ONE write so it can't interleave with
     // broadcast()'s prints running in the main-loop task.
     char line[320];
     int n = snprintf(line, sizeof(line),
         "PWNFRIEND_PEER {\"name\":\"%s\",\"identity\":\"%s\",\"pwnd_tot\":%d,"
-        "\"pwnd_run\":%d,\"uptime\":%ld,\"rssi\":%d,\"channel\":%d,\"deauth\":%s}\n",
+        "\"pwnd_run\":%d,\"uptime\":%ld,\"rssi\":%d,\"channel\":%d,\"deauth\":%s%s}\n",
         safe_name, safe_ident, pwnd_tot, pwnd_run, uptime, rssi, channel,
-        deauth ? "true" : "false");
+        deauth ? "true" : "false", geo);
     if (n < 0) return;
     if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
     Serial.write((const uint8_t*)line, n);

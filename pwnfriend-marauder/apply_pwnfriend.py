@@ -85,7 +85,19 @@ def main():
     print(f"patching Marauder at {src}")
 
     # 0. Copy the module in.
-    for name in ("Pwnfriend.h", "Pwnfriend.cpp", "pwnfriend_frames.h"):
+    # Bake our repo's short commit into pwnfriend_commit.h so the firmware can report
+    # exactly which build is flashed (stamped on PWNFRIEND_ADV as fw=<hash>).
+    import subprocess
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(HERE), "rev-parse", "--short=7", "HEAD"], text=True).strip()
+    except Exception:
+        commit = "nogit"
+    (HERE / "pwnfriend_commit.h").write_text(
+        '#pragma once\n#define PWNFRIEND_FW_COMMIT "%s"\n' % commit)
+    print(f"  fw commit: {commit}")
+
+    for name in ("Pwnfriend.h", "Pwnfriend.cpp", "pwnfriend_frames.h", "pwnfriend_commit.h"):
         shutil.copy2(HERE / name, src / name)
         print(f"  copied {name}")
 
@@ -199,10 +211,17 @@ def main():
     t, d = replace_once(
         t,
         "          wifi_scan_obj.processPwnagotchiBeacon(snifferPacket->payload, len);",
-        "          if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND)\n"
+        "          if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) {\n"
+        "            #ifdef HAS_GPS\n"
+        "              bool pf_fix = gps_obj.getFixStatus();\n"
+        "              double pf_lat = pf_fix ? atof(gps_obj.getLat().c_str()) : 0.0;\n"
+        "              double pf_lon = pf_fix ? atof(gps_obj.getLon().c_str()) : 0.0;\n"
+        "            #else\n"
+        "              bool pf_fix = false; double pf_lat = 0.0; double pf_lon = 0.0;\n"
+        "            #endif\n"
         "            pwnfriend_obj.reportPeer(snifferPacket->payload, len, "
-        "snifferPacket->rx_ctrl.rssi, snifferPacket->rx_ctrl.channel);\n"
-        "          else\n"
+        "snifferPacket->rx_ctrl.rssi, snifferPacket->rx_ctrl.channel, pf_fix, pf_lat, pf_lon);\n"
+        "          } else\n"
         "            wifi_scan_obj.processPwnagotchiBeacon(snifferPacket->payload, len);",
         tag="pwnfriend_obj.reportPeer(")
     steps += d
