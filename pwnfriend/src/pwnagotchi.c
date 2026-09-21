@@ -226,54 +226,61 @@ void pwnagotchi_draw_mode(Pwnagotchi* pwn, Canvas* canvas) {
     }
 }
 
+// Greedy word-wrap the message into the region right of the face (x = MESSAGE_J), up to a
+// few lines. The old stock version memcpy'd a fixed charSpaces+2 slab regardless of the
+// message length and then cut at the first space in the (over-read) buffer — so a short
+// message like "6 shakes!" collapsed to "6" and "Hack the planet!" lost "planet!". This
+// measures by pixel width and never reads past the string.
 void pwnagotchi_draw_message(Pwnagotchi* pwn, Canvas* canvas) {
     canvas_set_font(canvas, FontSecondary);
-    int fontHeight = canvas_current_font_height(canvas);
-    const char* message = furi_string_get_cstr(pwn->message);
+    const char* msg = furi_string_get_cstr(pwn->message);
+    const int x = PWNAGOTCHI_MESSAGE_J;
+    const int maxw = FLIPPER_SCREEN_WIDTH - x - 1; // px available per line
+    const int step = 9; // row pitch (matches the home stat panel)
+    const int maxlines = 4;
+    int y = PWNAGOTCHI_MESSAGE_I;
+    int drawn = 0;
+    char line[48];
+    size_t ll = 0; // chars in the current line
+    line[0] = '\0';
 
-    // Apparently W is the widest character (USING a for a more average approach)
-    size_t charLength = canvas_string_width(canvas, "a");
+    const char* p = msg;
+    while(*p && drawn < maxlines) {
+        while(*p == ' ') p++; // skip the run of spaces between words
+        if(!*p) break;
+        const char* ws = p;
+        while(*p && *p != ' ') p++; // [ws, p) is one word
+        size_t wlen = (size_t)(p - ws);
 
-    size_t horizSpace = FLIPPER_SCREEN_WIDTH - PWNAGOTCHI_MESSAGE_J;
-    size_t charSpaces = floor(((double)horizSpace) / charLength);
-    size_t messagePixLen = canvas_string_width(canvas, message);
-    size_t maxLines =
-        floor((PWNAGOTCHI_MESSAGE_I - PWNAGOTCHI_LINE2_END_I) / ((double)fontHeight));
-
-    size_t requiredLines = ceil(((double)messagePixLen) / horizSpace);
-
-    size_t charIndex = 0;
-    for(size_t i = 0; i < requiredLines && i < maxLines - 1; i++) {
-        // Allocate the line with room for two more characters (a space and then another char)
-        size_t allocSize = charSpaces + 2;
-        char* line = malloc(sizeof(char) * allocSize);
-
-        // Copy the allotted characters into line
-        memcpy(line, (message + charIndex), allocSize);
-
-        // Now loop backwards and cut it off at a space if we end with a letter
-        size_t backspaceCount = 0;
-        if(line[allocSize - 1] != ' ' && line[allocSize - 1] != '\0') {
-            for(int j = allocSize - 1; j >= 0; j--) {
-                if(line[j] == ' ') {
-                    line[j] = '\0';
-                    break;
-                }
-                backspaceCount++;
-            }
+        // Build "line + space + word" and see if it still fits.
+        char cand[48];
+        size_t cl = 0;
+        if(ll > 0) {
+            memcpy(cand, line, ll);
+            cl = ll;
+            cand[cl++] = ' ';
         }
+        size_t room = sizeof(cand) - 1 - cl;
+        size_t copy = wlen < room ? wlen : room;
+        memcpy(cand + cl, ws, copy);
+        cl += copy;
+        cand[cl] = '\0';
 
-        // Lets make sure if backspaceCount is too large that we cut the word instead of drawing off the screen
-        if(backspaceCount >= charSpaces) {
-            backspaceCount = 0;
+        if(ll > 0 && (int)canvas_string_width(canvas, cand) > maxw) {
+            // Doesn't fit: flush the current line, start a fresh one with this word.
+            canvas_draw_str(canvas, x, y, line);
+            y += step;
+            if(++drawn >= maxlines) return;
+            copy = wlen < sizeof(line) - 1 ? wlen : sizeof(line) - 1;
+            memcpy(line, ws, copy);
+            line[copy] = '\0';
+            ll = copy;
+        } else {
+            memcpy(line, cand, cl + 1);
+            ll = cl;
         }
-
-        canvas_draw_str(
-            canvas, PWNAGOTCHI_MESSAGE_J, PWNAGOTCHI_MESSAGE_I + (i * fontHeight), line);
-
-        charIndex += (charSpaces - backspaceCount + 1);
-        free(line);
     }
+    if(ll > 0 && drawn < maxlines) canvas_draw_str(canvas, x, y, line);
 }
 
 void pwnagotchi_draw_all(Pwnagotchi* pwn, Canvas* canvas) {

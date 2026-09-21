@@ -538,6 +538,21 @@ static bool coord_ok(const char* lat, const char* lon); // defined below (map/lo
 static float parse_deg(const char* s); // defined below (decimal-degree string -> float)
 static int friend_get(PwnfriendModel* model, const char* identity, bool* is_new); // below
 
+// A real pwngrid identity is exactly 64 hex chars (a SHA256 key fingerprint). A garbled or
+// truncated sniffed beacon parses into something else (raw frame bytes, a run-on into the
+// next JSON key, a short stub) — pwngrid's own receiver rejects those, and so do we, so a
+// mis-parse can't spawn a bogus peer. Mirrors pwngrid NewPeer's ^[a-fA-F0-9]{64}$ gate.
+static bool identity_is_64hex(const char* s) {
+    int n = 0;
+    for(; s[n]; n++) {
+        if(n >= 64) return false;
+        char c = s[n];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if(!hex) return false;
+    }
+    return n == 64;
+}
+
 static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
     char name[PEER_NAME_MAX] = {0};
     char identity[PEER_ID_MAX] = {0};
@@ -549,6 +564,9 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
     line_extract_int(line, "\"rssi\":", &rssi);
     line_extract_int(line, "\"channel\":", &channel);
 
+    // Drop garbled/truncated captures up front: only a clean 64-hex identity is a real peer.
+    if(!identity_is_64hex(identity)) return;
+
     // Where we stood when we heard it. Prefer a fix carried on the PEER line
     // itself (newer firmware); otherwise fall back to the most recent fix from
     // the recon AP stream (a few seconds stale at most). Logged per sighting so
@@ -559,6 +577,7 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
                     line_extract_number(line, "\"lon\":", lon, sizeof(lon)) && coord_ok(lat, lon);
 
     bool is_new = false;
+    bool fnew = false; // a genuinely-new, established friend was recorded this line
     uint32_t up = 0;
     bool tri = false;
     with_view_model(
@@ -571,15 +590,18 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
             is_new = peers_update(
                 &model->peers, name, identity, pwnd_tot, rssi, channel, now);
             bool bonded = peers_any_bonded(&model->peers, now);
-            persona_note_peer(model->persona, is_new, bonded);
             if(!have_gps && model->last_lat[0] && coord_ok(model->last_lat, model->last_lon)) {
                 strncpy(lat, model->last_lat, sizeof(lat) - 1);
                 strncpy(lon, model->last_lon, sizeof(lon) - 1);
                 have_gps = true;
             }
-            // Upsert the persistent friend record the browser reads (keyed by identity).
-            bool fnew = false;
-            int fi = friend_get(model, identity, &fnew);
+            // Only persist + count a peer we've heard BEFORE (established in the nearby list):
+            // a real pwnagotchi re-advertises constantly, while a garbled frame that slipped
+            // past the hex check is a one-off, so this keeps a bad parse out of friends.bin.
+            // "Met a friend" then counts distinct established identities, not every 30s-TTL
+            // re-appearance, so one lingering peer no longer inflates friends_met.
+            int fi = is_new ? -1 : friend_get(model, identity, &fnew);
+            persona_note_peer(model->persona, fnew, bonded);
             if(fi >= 0) {
                 FriendRec* fr = &model->friends[fi];
                 strncpy(fr->name, name[0] ? name : "???", PEER_NAME_MAX - 1);
@@ -611,11 +633,12 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
         },
         true);
 
-    if(is_new) app->got_new_friend = true;
+    if(fnew) app->got_new_friend = true; // chirp only for a genuinely new, established friend
 
-    // One row per sighting: (uptime, identity, name, rssi, channel, lat, lon).
-    // lat/lon empty when we had no fix. Needs a real identity; skipped if triangulation off.
-    if(tri && identity[0]) {
+    // One triangulation row per sighting of an ESTABLISHED peer (uptime, identity, name,
+    // rssi, channel, lat, lon). Gated like the friend record so a one-off bad frame can't
+    // pollute peers.csv. lat/lon empty when we had no fix.
+    if(tri && !is_new) {
         storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
         File* f = storage_file_alloc(app->storage);
         if(storage_file_open(f, PEERS_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
@@ -818,10 +841,18 @@ static void friend_db_load(Storage* storage, PwnfriendModel* model) {
            hdr[1] == FRIEND_DB_VERSION) {
             uint32_t n = hdr[2] > FRIEND_MAX ? FRIEND_MAX : hdr[2];
             size_t got = storage_file_read(f, model->friends, n * sizeof(FriendRec));
-            model->friend_count = (uint16_t)(got / sizeof(FriendRec));
-            for(uint16_t i = 0; i < model->friend_count; i++)
-                if(model->friends[i].first_seq >= model->friend_seq)
-                    model->friend_seq = model->friends[i].first_seq + 1;
+            uint16_t loaded = (uint16_t)(got / sizeof(FriendRec));
+            // Self-heal: drop any record whose identity isn't a clean 64-hex fingerprint
+            // (legacy garbage from before the parse guard). Compact in place.
+            uint16_t w = 0;
+            for(uint16_t i = 0; i < loaded; i++) {
+                if(!identity_is_64hex(model->friends[i].identity)) continue;
+                if(w != i) model->friends[w] = model->friends[i];
+                if(model->friends[w].first_seq >= model->friend_seq)
+                    model->friend_seq = model->friends[w].first_seq + 1;
+                w++;
+            }
+            model->friend_count = w;
         }
     }
     storage_file_close(f);
@@ -973,8 +1004,11 @@ static void pwnfriend_update_place(PwnfriendModel* model) {
     // Distance + direction on gps_place; the course (degrees) goes to gps_course so the
     // home panel can put it on its own row (the combined line was too wide).
     model->gps_course[0] = '\0';
-    if(km < 0.3f) {
-        snprintf(model->gps_place, sizeof(model->gps_place), "At %s!", hn);
+    if(km < 0.03f) { // only the "we're here" line within ~30m; otherwise keep showing distance
+        if(model->home_set)
+            snprintf(model->gps_place, sizeof(model->gps_place), "At %s!", hn);
+        else
+            snprintf(model->gps_place, sizeof(model->gps_place), "look up to Mother");
     } else {
         // Row 1: name + distance. Row 2: direction + course (e.g. "SW 225°").
         if(km < 1.0f)
