@@ -2111,15 +2111,6 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
     if(dist[0])
         canvas_draw_str(
             canvas, FLIPPER_SCREEN_WIDTH - 2 - (int)canvas_string_width(canvas, dist), 37, dist);
-    // OK-hint: a centered OK glyph (small disc) + "map" when this AP has a known location,
-    // so it's clear OK opens the map QR. Only drawn when there IS one (OK is a no-op else).
-    if(alat < 1e8f) {
-        const char* h = "map";
-        int hw = (int)canvas_string_width(canvas, h);
-        int gx = (FLIPPER_SCREEN_WIDTH - (7 + 3 + hw)) / 2;
-        canvas_draw_disc(canvas, gx + 3, 42, 3);
-        canvas_draw_str(canvas, gx + 10, 45, h);
-    }
     // Crackability as a plain-language formula (what we have -> whether it cracks).
     const char* key = a->pmkid ? "PMKID" : a->handshake ? "HS" : NULL;
     if(a->has_essid && key)
@@ -2131,14 +2122,21 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
     else
         snprintf(l, sizeof(l), "nothing caught yet");
     canvas_draw_str(canvas, 2, 53, l);
-    // actions: ◄  target[x]   ignore[x]  ► — set here or in the list; picking pops back.
-    icon_left(canvas, 2, 60);
+    // Bottom row: target[x] (left, Left toggles), ignore[x] (right, Right toggles), and the
+    // OK-map hint (a small disc + "map") centred between them when a location is known — OK
+    // opens the map QR.
     snprintf(l, sizeof(l), "target[%c]", a->targeted ? 'x' : ' ');
-    canvas_draw_str(canvas, 11, 63, l);
+    canvas_draw_str(canvas, 2, 63, l);
     snprintf(l, sizeof(l), "ignore[%c]", a->whitelisted ? 'x' : ' ');
     int rw = (int)canvas_string_width(canvas, l);
-    icon_right(canvas, FLIPPER_SCREEN_WIDTH - 6, 60); // ► hard against the right edge
-    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - 6 - 4 - rw, 63, l);
+    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - 2 - rw, 63, l);
+    if(alat < 1e8f) {
+        const char* h = "map";
+        int gw = 7 + 2 + (int)canvas_string_width(canvas, h);
+        int gx = (FLIPPER_SCREEN_WIDTH - gw) / 2;
+        canvas_draw_disc(canvas, gx + 3, 60, 3);
+        canvas_draw_str(canvas, gx + 9, 63, h);
+    }
 }
 
 static void pwnfriend_draw_friendlist(Canvas* canvas, const PwnfriendModel* model) {
@@ -2225,17 +2223,17 @@ static void pwnfriend_draw_frienddetail(Canvas* canvas, const PwnfriendModel* mo
     if(dist[0])
         canvas_draw_str(
             canvas, FLIPPER_SCREEN_WIDTH - 2 - (int)canvas_string_width(canvas, dist), 37, dist);
-    // OK-hint: a centered OK glyph (small disc) + "map" when this friend has a known location.
-    if(alat < 1e8f) {
-        const char* h = "map";
-        int hw = (int)canvas_string_width(canvas, h);
-        int gx = (FLIPPER_SCREEN_WIDTH - (7 + 3 + hw)) / 2;
-        canvas_draw_disc(canvas, gx + 3, 42, 3);
-        canvas_draw_str(canvas, gx + 10, 45, h);
-    }
     // Row: their capture count + how many times we've heard them (triangulation samples).
     snprintf(l, sizeof(l), "pwned %ld   seen %ux", (long)fr->pwnd_tot, fr->times_seen);
-    canvas_draw_str(canvas, 2, 57, l);
+    canvas_draw_str(canvas, 2, 50, l);
+    // OK-map hint on the bottom row (a small disc + "map"), centred, when a location is known.
+    if(alat < 1e8f) {
+        const char* h = "map";
+        int gw = 7 + 2 + (int)canvas_string_width(canvas, h);
+        int gx = (FLIPPER_SCREEN_WIDTH - gw) / 2;
+        canvas_draw_disc(canvas, gx + 3, 60, 3);
+        canvas_draw_str(canvas, gx + 9, 63, h);
+    }
 }
 
 // QR of the selected friend's last location — Up on the friend detail screen. Reuses the

@@ -199,11 +199,14 @@ void pwnagotchi_draw_handshakes(Pwnagotchi* pwn, Canvas* canvas) {
 
 void pwnagotchi_draw_friend(Pwnagotchi* pwn, Canvas* canvas) {
     // The closest detected unit, shown in the bottom-left friend slot as
-    // "<bars> name pwnd" — the pwnagotchi's own friend readout.
+    // "<face> <bars> name pwnd" — the pwnagotchi's own friend readout.
     if(furi_string_empty(pwn->friendStat)) {
         return;
     }
     canvas_set_font(canvas, PWNAGOTCHI_FONT);
+    // A compact ASCII face for the friend. Real pwngrid faces are unicode the Flipper font
+    // can't render, and the full face icons don't fit this corner, so we use a small stand-in.
+    canvas_draw_str(canvas, PWNAGOTCHI_FRIEND_FACE_J, PWNAGOTCHI_FRIEND_FACE_I, "^_^");
     canvas_draw_str(
         canvas,
         PWNAGOTCHI_FRIEND_STAT_J,

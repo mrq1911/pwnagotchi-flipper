@@ -12,8 +12,10 @@
 // A peer counts as a "good friend" once we've kept hearing it for this long — a
 // lingering buddy, not a passer-by. Drives the bonded (<3) mood.
 #define PEER_BONDED_AFTER_SECS 60
-// Drop a peer we haven't heard from in this long.
-#define PEER_TTL_SECS 30
+// Drop a peer we haven't heard from in this long. Generous because we only hear a peer
+// when our channel hop lands on its channel (~every recon sweep), so a shorter TTL made a
+// present friend flicker in and out of the home screen between sightings.
+#define PEER_TTL_SECS 90
 
 typedef struct {
     bool used;

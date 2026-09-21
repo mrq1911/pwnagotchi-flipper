@@ -213,7 +213,7 @@ def main():
         "          wifi_scan_obj.processPwnagotchiBeacon(snifferPacket->payload, len);",
         "          if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) {\n"
         "            #ifdef HAS_GPS\n"
-        "              bool pf_fix = gps_obj.getFixStatus();\n"
+        "              bool pf_fix = gps_obj.getFixStatus() && gps_obj.getNumSats() >= 4;\n"
         "              double pf_lat = pf_fix ? atof(gps_obj.getLat().c_str()) : 0.0;\n"
         "              double pf_lon = pf_fix ? atof(gps_obj.getLon().c_str()) : 0.0;\n"
         "            #else\n"
@@ -237,7 +237,7 @@ def main():
         "  if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) &&\n"
         "      (type == WIFI_PKT_DATA)) {\n"
         "    #ifdef HAS_GPS\n"
-        "      bool pf_fix = gps_obj.getFixStatus();\n"
+        "      bool pf_fix = gps_obj.getFixStatus() && gps_obj.getNumSats() >= 4;\n"
         "      double pf_lat = pf_fix ? atof(gps_obj.getLat().c_str()) : 0.0;\n"
         "      double pf_lon = pf_fix ? atof(gps_obj.getLon().c_str()) : 0.0;\n"
         "    #else\n"
@@ -265,7 +265,7 @@ def main():
         "        if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWN) {",
         "        if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWNFRIEND) {\n"
         "          #ifdef HAS_GPS\n"
-        "            bool pf_fix = gps_obj.getFixStatus();\n"
+        "            bool pf_fix = gps_obj.getFixStatus() && gps_obj.getNumSats() >= 4;\n"
         "            double pf_lat = pf_fix ? atof(gps_obj.getLat().c_str()) : 0.0;\n"
         "            double pf_lon = pf_fix ? atof(gps_obj.getLon().c_str()) : 0.0;\n"
         "          #else\n"
