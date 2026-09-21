@@ -20,79 +20,69 @@
 #include "../include/consent.h"
 #include "../include/pcap.h"
 #include "../include/wardrive.h"
-#include "pwnfriend_geo.h" // pure geo/identity helpers (host-tested in tests/test_geo.cpp)
+#include "pwnfriend_geo.h" // pure geo/identity helpers
 #include "qrcodegen.h"
 #include <storage/storage.h>
 
 typedef enum {
     WorkerEventStop = (1 << 0),
     WorkerEventRx = (1 << 1),
-    WorkerEventResend = (1 << 2), // fire pwnfriend_send_advertise off the worker's 2K stack
+    WorkerEventResend = (1 << 2), // send_advertise off the worker's 2K stack
 } WorkerEventFlags;
 
 #define WORKER_EVENTS_MASK (WorkerEventStop | WorkerEventRx | WorkerEventResend)
 
-// Distinct BSSIDs whose capture we've already counted this app session. Caps the
-// per-session pwnd dedup table; a re-emitted PWNFRIEND_PWND (the Flipper re-sends
-// the whole command every 15s) is then idempotent and can't inflate pwnd_run/tot.
+// per-session pwnd dedup cap: a re-emitted PWND (every 15s) can't inflate counts
 #define PWND_SEEN_MAX 64
 
-// Per-AP records: the browser + crackability progress + target/whitelist all read
-// this. Also fixes the old pause/resume AP-count inflation (the firmware re-emits
-// its whole recon list on resume; we key by BSSID so each network counts once).
-#define AP_MAX 256 // browsable AP history (persisted across sessions to aps.bin)
-#define WL_MAX 16 // whitelisted BSSIDs we send to the firmware (matches its MAX_WL)
-#define FRIEND_MAX 64 // browsable friend history (persisted across sessions to friends.bin)
+// per-AP records, keyed by BSSID so a resume replay can't double-count
+#define AP_MAX 256 // browsable AP history (persisted to aps.bin)
+#define WL_MAX 16 // whitelisted BSSIDs sent to firmware (matches its MAX_WL)
+#define FRIEND_MAX 64 // browsable friend history (persisted to friends.bin)
 
-// "Home" point — the GPS stat shows distance + compass direction to here. This is
-// the default; "Set home" in the menu overrides it with the current fix (persisted).
+// default "home" point; "Set home" overrides it with the current fix (persisted)
 #define HOME_LAT 50.081148f
 #define HOME_LON 14.451144f
 #define HOME_NAME "Home"
 #define HOME_DB_PATH "/ext/apps_data/pwnfriend/home.bin"
 #define HOME_DB_MAGIC 0x484D4E46u // 'FNMH'
 
-// Persisted AP table (so you can browse APs/pwns from previous sessions).
+// persisted AP table
 #define AP_DB_PATH "/ext/apps_data/pwnfriend/aps.bin"
 #define AP_DB_MAGIC 0x50414E46u // 'FNAP'
-#define AP_DB_VERSION 4 // bumped: ApRec gained triangulation centroid sums (loc_n/w_sum/...)
+#define AP_DB_VERSION 4 // v4: ApRec gained triangulation centroid sums
 
-// Persisted friends table (pwngrid peers we've met), so the browser shows them too.
+// persisted friends table
 #define FRIEND_DB_PATH "/ext/apps_data/pwnfriend/friends.bin"
 #define FRIEND_DB_MAGIC 0x52464E46u // 'FNFR'
-#define FRIEND_DB_VERSION 3 // bumped: triangulation centroid sums; pwnd_tot widened to int32
+#define FRIEND_DB_VERSION 3 // v3: triangulation centroid sums; pwnd_tot widened to int32
 
-// Dev telemetry: one CSV row per PWNFRIEND_EPOCH, for offline algo tuning.
+// dev telemetry: one CSV row per epoch, offline algo tuning
 #define TELEMETRY_PATH "/ext/apps_data/pwnfriend/telemetry.csv"
-// Dev telemetry: one CSV row per capture (bssid/type/provenance/rssi/gps).
+// dev telemetry: one CSV row per capture
 #define CAPTURES_PATH "/ext/apps_data/pwnfriend/captures.csv"
-// One row per friend sighting (identity/rssi/where we stood). Many rows for the
-// same identity from different spots = a triangulation set for its position.
+// one row per friend sighting; many spots = a triangulation set
 #define PEERS_PATH "/ext/apps_data/pwnfriend/peers.csv"
-// Same idea for APs, but throttled per-BSSID (beacons are far more numerous): one
-// (position,rssi) sample per AP every AP_TRACK_MIN_SECS, for offline triangulation.
+// per-AP (position,rssi) samples, throttled per AP_TRACK_MIN_SECS
 #define AP_TRACK_PATH "/ext/apps_data/pwnfriend/ap_track.csv"
 #define AP_TRACK_MIN_SECS 10
-// Per-AP, per-session pcap bookkeeping (ap_pcap_flags): have we filed an EAPOL frame
-// for this AP, and have we spliced its ESSID beacon into the pcap yet.
+// per-AP pcap bookkeeping: EAPOL filed? ESSID beacon spliced?
 #define APF_HS_SEEN 0x01
 #define APF_BEACON_DONE 0x02
 
-// The heartbeat timer fires ANIM_HZ times/sec so the About banner can scroll
-// smoothly; the once-per-second brain work is gated to every ANIM_HZ-th fire.
+// timer fires ANIM_HZ/sec for smooth About scroll; brain work gated to every ANIM_HZ-th fire
 #define ANIM_HZ 8
 #define ABOUT_SPEED_DEFAULT 3 // px per animation fire
 #define ABOUT_SPEED_MAX 12
 
-// Home stat panel: seconds of no Left/Right before it reverts to the persona voice.
+// home stat panel: idle secs before reverting to the persona voice
 #define HOME_STATS_TIMEOUT_SECS 8
 
-// Exit confirmation: the persona asks before quitting. The prompt self-cancels after
-// CONFIRM_EXIT_TIMEOUT_SECS; a "phew, staying" happy beat lasts CONFIRM_STAY_SECS.
+// exit prompt self-cancels after CONFIRM_EXIT_TIMEOUT_SECS; "staying" beat lasts CONFIRM_STAY_SECS
 #define CONFIRM_EXIT_TIMEOUT_SECS 5
 #define CONFIRM_STAY_SECS 2
 
-// An AP not heard for this long has a stale RSSI: hide its signal meter (it may be gone).
+// AP unheard this long -> stale RSSI, hide the signal meter
 #define AP_SIGNAL_TTL_SECS 60
 
 typedef struct {
@@ -100,40 +90,37 @@ typedef struct {
     char ssid[33]; // ESSID, empty if hidden/unknown
     int16_t channel;
     int16_t rssi; // most recent
-    bool has_essid; // a named SSID was seen (a 22000 hashline needs it -> crackable)
+    bool has_essid; // named SSID seen (a 22000 hashline needs it)
     bool pmkid; // captured a PMKID (M1)
     bool handshake; // captured a 4-way handshake (M2)
     bool missed; // firmware reported a MISS (attacked, nothing caught)
     bool whitelisted; // user: never attack this one
     bool targeted; // user: focus the hunt on this one
-    uint32_t first_seq; // discovery order (set once); stable tiebreak in the list sort
-    float lat, lon; // where the AP was heard strongest (1e9 = unknown); persisted for the map QR
+    uint32_t first_seq; // discovery order (set once); stable sort tiebreak
+    float lat, lon; // where heard strongest (1e9 = unknown); for the map QR
     int8_t loc_rssi; // RSSI at which lat/lon was recorded (keep the closest fix)
-    // On-device triangulation (RSSI-weighted centroid, WCL): running sums over all
-    // geotagged sightings. Estimated loc = (wlat_sum/w_sum, wlon_sum/w_sum). O(1) storage.
-    uint16_t loc_n; // number of geotagged samples folded in
+    // triangulation (RSSI-weighted centroid): est = (wlat_sum/w_sum, wlon_sum/w_sum)
+    uint16_t loc_n; // geotagged samples folded in
     float w_sum, wlat_sum, wlon_sum;
 } ApRec;
 
-// A pwngrid peer we've met, persisted to friends.bin (keyed by 64-hex identity) so the
-// friends browser shows buddies from previous sessions, each with a location QR.
+// a pwngrid peer we've met (keyed by 64-hex identity), persisted to friends.bin
 typedef struct {
     char identity[PEER_ID_MAX]; // 64-hex pwngrid id (the key)
     char name[PEER_NAME_MAX]; // last display name seen
     int16_t rssi; // most recent signal
     int16_t best_rssi; // strongest ever heard
-    int32_t pwnd_tot; // their reported lifetime capture count (can exceed an int16)
+    int32_t pwnd_tot; // their lifetime capture count (can exceed int16)
     uint16_t times_seen; // sightings (triangulation confidence)
-    uint32_t first_seq; // discovery order (set once); stable tiebreak in the list sort
-    float lat, lon; // where heard strongest (1e9 = unknown); persisted for the map QR
+    uint32_t first_seq; // discovery order (set once); stable sort tiebreak
+    float lat, lon; // where heard strongest (1e9 = unknown); for the map QR
     int8_t loc_rssi; // RSSI at which lat/lon was recorded (keep the closest fix)
-    uint16_t loc_n; // triangulation samples (RSSI-weighted centroid, WCL)
+    uint16_t loc_n; // triangulation samples (RSSI-weighted centroid)
     float w_sum, wlat_sum, wlon_sum;
 } FriendRec;
 
-// Capture escalation. Default is Deauth (a full pwnagotchi), gated behind the
-// one-time consent acknowledgement (cycled from the menu). Passive = record
-// handshakes the firmware sniffs; Deauth = also associate + deauth (-deauth 1).
+// capture escalation, cycled from the menu; default Deauth, gated behind consent.
+// Passive = record sniffed handshakes; Deauth = also associate + deauth (-deauth 1)
 typedef enum {
     CaptureOff = 0,
     CapturePassive, // listen only, no TX
@@ -147,7 +134,7 @@ typedef enum {
     StatPageMood = 0, // the pwnagotchi voice line (default)
     StatPageCounts, // "ate N shakes!"
     StatPageSocial, // "met N friends!"
-    StatPageGps, // distance+direction to home ("Prague 12km SW"); full coords on the Stats screen
+    StatPageGps, // distance+direction to home; full coords on the Stats screen
     StatPageCount,
 } StatPage;
 
@@ -164,23 +151,21 @@ typedef enum {
     ScreenMenu,
     ScreenApList,
     ScreenApDetail,
-    ScreenApQr, // QR of the AP's location (Up on the detail screen) to scan with a phone
+    ScreenApQr, // QR of the AP's location
     ScreenFriendList,
     ScreenFriendDetail,
-    ScreenFriendQr, // QR of a friend's last location (Up on the friend detail screen)
+    ScreenFriendQr, // QR of a friend's last location
     ScreenStats,
     ScreenAbout,
 } Screen;
 
-// Menu rows. OK-activated rows (open a screen / editor / one-shot action) come
-// first; then the arrow-adjustable rows (Left/Right changes the value, shown on the
-// right flanked by ◄ ► glyphs). About is pinned last.
+// menu rows: OK-activated first, then Left/Right-adjustable; About pinned last
 typedef enum {
     MenuPwnedAps = 0, // OK: AP list (pwned)
     MenuAllAps, // OK: AP list (all)
     MenuWhitelist, // OK: AP list (whitelisted)
     MenuFriends, // OK: friends list (pwngrid peers met)
-    MenuTarget, // OK: clear the current focus target (shows its name; no hunting the list)
+    MenuTarget, // OK: clear the focus target
     MenuStats, // OK: stats
     MenuName, // OK: name editor
     MenuSetHome, // OK: capture GPS home
@@ -209,26 +194,26 @@ typedef struct {
     bool consent_given; // cached consent_is_given() — capture UI is locked until true
     bool showing_consent; // modal: the one-time authorization acknowledgement
 
-    // Per-session capture dedup: 12-hex (no-colon) BSSIDs we've already counted.
+    // per-session capture dedup: 12-hex BSSIDs already counted
     char pwnd_seen[PWND_SEEN_MAX][13];
     uint8_t pwnd_seen_count;
 
-    // Every AP we've seen this session (the browser reads this).
+    // every AP seen this session (the browser reads this)
     ApRec aps[AP_MAX];
     uint16_t ap_count;
-    bool ap_overflow; // table hit AP_MAX and started recycling -> show the count as "N+"
-    uint32_t ap_seq; // monotonic counter stamped into ApRec.first_seq on each sighting
+    bool ap_overflow; // hit AP_MAX and recycling -> show "N+"
+    uint32_t ap_seq; // monotonic, stamped into ApRec.first_seq
     uint32_t ap_seen_tick[AP_MAX]; // tick_secs each AP was last heard (0 = not this session)
-    uint32_t ap_track_tick[AP_MAX]; // tick_secs each AP was last written to ap_track.csv (throttle)
+    uint32_t ap_track_tick[AP_MAX]; // tick each AP last wrote ap_track.csv (throttle)
     uint8_t ap_pcap_flags[AP_MAX]; // per-session APF_* bits: HS filed / ESSID beacon spliced
 
-    // Every pwngrid friend we've met (the friends browser reads this; persisted).
+    // every friend met (the browser reads this; persisted)
     FriendRec friends[FRIEND_MAX];
     uint16_t friend_count;
-    bool friend_overflow; // table hit FRIEND_MAX and started recycling -> show "N+"
-    uint32_t friend_seq; // monotonic counter stamped into FriendRec.first_seq
+    bool friend_overflow; // hit FRIEND_MAX and recycling -> show "N+"
+    uint32_t friend_seq; // monotonic, stamped into FriendRec.first_seq
     uint32_t friend_seen_tick[FRIEND_MAX]; // tick_secs each friend was last heard (0 = not this session)
-    uint32_t friend_track_tick[FRIEND_MAX]; // tick_secs each friend last fed the centroid (throttle)
+    uint32_t friend_track_tick[FRIEND_MAX]; // tick each friend last fed the centroid (throttle)
 
     // Channel tuning: 0 = auto (the pwnagotchi '*' sweep, default); 1..14 = pinned.
     int8_t tuned_channel;
@@ -249,17 +234,16 @@ typedef struct {
     uint16_t fl_top; // scroll window top in ScreenFriendList
     uint16_t detail_friend; // friends[] index shown in ScreenFriendDetail
 
-    // GPS: set once the firmware reports any lat/lon (geotag seen). last_lat/lon
-    // are verbatim decimal-degree strings from the most recent fix.
+    // GPS: last_lat/lon are verbatim decimal-degree strings from the latest fix
     bool gps_seen;
     char last_lat[16];
     char last_lon[16];
     char gps_place[32]; // distance+direction to home, e.g. "Home 12km SW"
     char gps_course[16]; // bearing to home, e.g. "225°" (its own row so it fits)
     float home_lat, home_lon; // the point the GPS compass points at (default Prague; settable)
-    bool home_set; // user set a home (else the default is the persona's Prague "mother")
+    bool home_set; // user set a home (else default Prague "Mother")
     bool quiet; // suppress the LED blink + vibro on pwn / new-friend (persisted)
-    bool triangulate; // on-device RSSI-weighted location estimate + sample logging (persisted)
+    bool triangulate; // on-device location estimate + sample logging (persisted)
     bool confirm_exit; // Home: first Back raises a persona prompt; second Back quits
     uint32_t confirm_secs; // tick the exit prompt went up (auto-cancels after a timeout)
     uint32_t stayed_until; // tick_secs until which the happy "stayed" reaction shows (0 = off)
@@ -268,13 +252,12 @@ typedef struct {
     uint32_t pwn_active; // captures our own attack earned (via=active), this session
     uint32_t pwn_passive; // captures sniffed passively (via=passive), this session
 
-    // About-screen banner scroll (the mrq art is wider than the screen).
+    // About banner scroll (art wider than the screen)
     uint32_t about_scroll; // monotonic px accumulator, advanced by the timer
     uint8_t about_speed; // px advanced per animation fire (1..ABOUT_SPEED_MAX)
     bool about_infinite; // scroll mode: false = bounce, true = infinite wrap
 
-    // ESP32-link watchdog: warn when the board stops answering (unplugged, rear
-    // switch off ESP32, wrong firmware). All in tick_secs, written under the lock.
+    // ESP32-link watchdog: warn when the board goes silent (all in tick_secs)
     uint32_t last_rx_secs; // tick of the last PWNFRIEND_* line seen
     uint32_t advertising_since; // tick advertising last (re)started — boot grace
     bool link_down; // computed each tick; true => the "no ESP32" screen shows
@@ -283,8 +266,7 @@ typedef struct {
     uint8_t qr[qrcodegen_BUFFER_LEN_FOR_VERSION(4)];
     bool qr_ok;
 
-    // AP-location QR (encoded on demand when Up is pressed on an AP with a known
-    // location); holds a geo: URI to scan with a phone.
+    // AP-location QR (encoded on demand); holds a geo: URI
     uint8_t ap_qr[qrcodegen_BUFFER_LEN_FOR_VERSION(4)];
     bool ap_qr_ok;
 } PwnfriendModel;
@@ -303,15 +285,14 @@ typedef struct {
     TextInput* text_input; // "Set name" editor (view id 1)
     char name_buf[PERSONA_NAME_MAX]; // edit buffer for the name text input
 
-    // Line assembly — touched only by the worker thread. Sized to hold a whole
-    // hex-encoded EAPOL frame line (PWNFRIEND_HS <bssid> <~600 hex>), not just JSON.
+    // line assembly, worker-thread only; sized for a full hex EAPOL line, not just JSON
     char line[1024];
     size_t line_len;
     bool got_new_friend; // set by worker, consumed for a notification blink
     bool got_pwnd; // set by worker, consumed for the capture blink
 } PwnfriendApp;
 
-// A rising two-note chirp so a spotted friend is audible, not just a silent blink.
+// rising two-note chirp for a spotted friend
 static const NotificationMessage message_friend_note_a = {
     .type = NotificationMessageTypeSoundOn,
     .data.sound = {.frequency = 587.33f, .volume = 1.0f}, // D5
@@ -334,7 +315,7 @@ static const NotificationSequence sequence_new_friend = {
     NULL,
 };
 
-// A louder blink for an actual handshake capture — this is the "got pwnd" moment.
+// louder blink for an actual handshake capture
 static const NotificationSequence sequence_pwnd = {
     &message_display_backlight_on,
     &message_red_255,
@@ -354,7 +335,7 @@ static const NotificationSequence sequence_pwnd = {
 // ---------------------------------------------------------------------------
 
 static void pwnfriend_send_advertise(PwnfriendApp* app) {
-    char cmd[512]; // room for the base command + a whitelist of up to WL_MAX BSSIDs
+    char cmd[512]; // base command + up to WL_MAX whitelisted BSSIDs
     with_view_model(
         app->view,
         PwnfriendModel * model,
@@ -366,24 +347,16 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
             for(char* c = safe_name; *c; c++) {
                 if(*c == ' ') *c = '_';
             }
-            // -pr/-pt now carry REAL captured-handshake counts; -e the epoch.
-            // -cap/-deauth are the honest firmware-side gates: both are sent as an
-            // explicit 0/1 every advertise so a previously-armed radio is actively
-            // disarmed (a "real gate" must be able to turn OFF, not just ON). -cap
-            // is 1 in Passive/Deauth, -deauth is 1 only in Deauth. The firmware
-            // mirrors -deauth into the beacon's policy.deauth, so the mesh always
-            // sees the truth. Current firmware that doesn't know -cap ignores it.
+            // -cap/-deauth sent as explicit 0/1 every advertise so a previously-armed radio disarms.
+            // -cap=1 in Passive/Deauth, -deauth=1 only in Deauth; firmware mirrors -deauth into the beacon.
             int cap = (model->capture_mode != CaptureOff) ? 1 : 0;
             int deauth = (model->capture_mode == CaptureDeauth) ? 1 : 0;
             // -assoc: solicit PMKID (associate) in both PMKID and Deauth modes.
             int assoc = (model->capture_mode == CapturePmkid || model->capture_mode == CaptureDeauth) ? 1 : 0;
-            // -ch: 0 tells the firmware to auto-hop (the '*' sweep); 1..14 pins it
-            // to the channel the user tuned to with Up/Down.
+            // -ch: 0 = auto-hop ('*' sweep); 1..14 pins the tuned channel
             int ch = (model->tuned_channel >= 1 && model->tuned_channel <= 14) ?
                          model->tuned_channel : 0;
-            // -target: the BSSID the user is focusing on (or "0" = none). -wl: the
-            // whitelisted BSSIDs (capped at WL_MAX). -minrssi / -recon: pwnagotchi
-            // params from the menu. Building the wl list first keeps the snprintf flat.
+            // -target: focus BSSID ("0" = none). -wl: whitelist (<=WL_MAX). build wl first to keep the snprintf flat
             char target[13] = "0";
             char wl[WL_MAX * 13 + 4];
             size_t wp = 0;
@@ -457,9 +430,7 @@ static bool line_extract_int(const char* s, const char* key, int* out) {
     return true;
 }
 
-// Copy the numeric token after `key` verbatim (sign/digits/dot/exponent) into out.
-// We never parse lat/lon to a float — the Flipper printf has %f disabled — so the
-// firmware's decimal-degree text is passed straight through to the wardrive CSV.
+// copy the numeric token after key verbatim; we never float-parse lat/lon (%f disabled in newlib-nano), pass the text straight through
 static bool line_extract_number(const char* s, const char* key, char* out, size_t out_sz) {
     const char* pos = strstr(s, key);
     if(!pos) return false;
@@ -477,9 +448,7 @@ static bool line_extract_number(const char* s, const char* key, char* out, size_
     return i > 0;
 }
 
-// Quote a free-text field for a CSV cell (RFC4180): wrap in double quotes and double any
-// embedded quote, so a comma/quote in an SSID or friend name can't shift the columns after
-// it (lat/lon come later in the row). Truncates safely if `out` is too small.
+// RFC4180-quote a free-text CSV cell so a comma/quote in an SSID/name can't shift later columns
 static void csv_quote(const char* in, char* out, size_t n) {
     if(n < 3) {
         if(n) out[0] = '\0';
@@ -513,13 +482,10 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
     line_extract_int(line, "\"rssi\":", &rssi);
     line_extract_int(line, "\"channel\":", &channel);
 
-    // Drop garbled/truncated captures up front: only a clean 64-hex identity is a real peer.
+    // identity-64hex guard: only a clean 64-hex identity is a real peer
     if(!identity_is_64hex(identity)) return;
 
-    // Where we stood when we heard it. Prefer a fix carried on the PEER line
-    // itself (newer firmware); otherwise fall back to the most recent fix from
-    // the recon AP stream (a few seconds stale at most). Logged per sighting so
-    // the RSSI samples from different spots can triangulate the friend offline.
+    // where we stood: prefer a fix on the PEER line, else the last recon fix; logged per sighting for triangulation
     char lat[16] = {0};
     char lon[16] = {0};
     bool have_gps = line_extract_number(line, "\"lat\":", lat, sizeof(lat)) &&
@@ -536,7 +502,7 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
             uint32_t now = model->tick_secs;
             up = now;
             tri = model->triangulate;
-            // Drop a far-off junk fix on the peer line (fallback to the last good fix below).
+            // gps-outlier guard: drop a far-off junk fix (fall back to last good below)
             if(have_gps && gps_outlier(model, parse_deg(lat), parse_deg(lon))) have_gps = false;
             is_new = peers_update(
                 &model->peers, name, identity, pwnd_tot, rssi, channel, now);
@@ -546,11 +512,7 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
                 strncpy(lon, model->last_lon, sizeof(lon) - 1);
                 have_gps = true;
             }
-            // Only persist + count a peer we've heard BEFORE (established in the nearby list):
-            // a real pwnagotchi re-advertises constantly, while a garbled frame that slipped
-            // past the hex check is a one-off, so this keeps a bad parse out of friends.bin.
-            // "Met a friend" then counts distinct established identities, not every 30s-TTL
-            // re-appearance, so one lingering peer no longer inflates friends_met.
+            // established gate: only persist/count a peer heard before, so a one-off bad parse stays out of friends.bin and can't inflate friends_met
             int fi = is_new ? -1 : friend_get(model, identity, &fnew);
             persona_note_peer(model->persona, fnew, bonded);
             if(fi >= 0) {
@@ -564,15 +526,13 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
                 if(have_gps) {
                     float la = parse_deg(lat);
                     float lo = parse_deg(lon);
-                    // Keep the single strongest fix as a fallback (used when triangulation is
-                    // off or we have <2 samples), updated on every sighting.
+                    // keep the strongest fix as a fallback (triangulation off or <2 samples)
                     if(fr->lat >= 1e8f || (rssi != 0 && (int8_t)rssi > fr->loc_rssi)) {
                         fr->lat = la;
                         fr->lon = lo;
                         fr->loc_rssi = (int8_t)rssi;
                     }
-                    // Fold ONE throttled sample per window into the weighted centroid, so a
-                    // long dwell doesn't out-vote distinct positions (matches the CSV cadence).
+                    // fold one throttled sample per window so a long dwell can't out-vote distinct positions
                     if(tri && (model->friend_track_tick[fi] == 0 ||
                                model->tick_secs - model->friend_track_tick[fi] >= AP_TRACK_MIN_SECS)) {
                         model->friend_track_tick[fi] = model->tick_secs;
@@ -586,9 +546,7 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
 
     if(fnew) app->got_new_friend = true; // chirp only for a genuinely new, established friend
 
-    // One triangulation row per sighting of an ESTABLISHED peer (uptime, identity, name,
-    // rssi, channel, lat, lon). Gated like the friend record so a one-off bad frame can't
-    // pollute peers.csv. lat/lon empty when we had no fix.
+    // one peers.csv row per established-peer sighting; gated like the friend record; lat/lon empty if no fix
     if(tri && !is_new) {
         storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
         File* f = storage_file_alloc(app->storage);
@@ -615,8 +573,7 @@ static void pwnfriend_handle_adv_line(PwnfriendApp* app, const char* line) {
     line_extract_int(line, "ch=", &ch);
     line_extract_int(line, "sent=", &sent);
     line_extract_int(line, "ver=", &ver); // firmware protocol version (0 on old builds)
-    // fw=<hash> is an unquoted word (not "..."-wrapped), so copy it by hand up to the space.
-    // Empty on old firmware that predates the build stamp.
+    // fw=<hash> is an unquoted word; copy by hand up to the space (empty on old firmware)
     char fw[16] = {0};
     const char* fp = strstr(line, "fw=");
     if(fp) {
@@ -648,8 +605,7 @@ static int hexval(char c) {
     return -1;
 }
 
-// Normalise a bssid to a 12-char lowercase-hex key (colons dropped). Non-hex is
-// skipped, so both "aa:bb:cc:dd:ee:ff" and "aabbccddeeff" collapse to one key.
+// normalise a bssid to a 12-char lowercase-hex key (colons/non-hex dropped)
 static void bssid_key(char out[13], const char* in) {
     size_t n = 0;
     for(const char* c = in; *c && n < 12; c++) {
@@ -659,9 +615,7 @@ static void bssid_key(char out[13], const char* in) {
     out[n] = '\0';
 }
 
-// Insert a bssid key into the per-session pwnd dedup set. Returns true only on the
-// first sight of that bssid (so persona_note_pwnd fires once). When the table is
-// full, returns false — mirrors the firmware's markPwnd cap so counts can't run away.
+// insert into the per-session pwnd dedup set; true only on first sight. full -> false (mirrors firmware's markPwnd cap)
 static bool pwnd_seen_insert(PwnfriendModel* model, const char* key) {
     if(!key[0]) return false;
     for(uint8_t i = 0; i < model->pwnd_seen_count; i++) {
@@ -681,9 +635,7 @@ static int ap_find(PwnfriendModel* model, const char* key) {
     return -1;
 }
 
-// Get (creating if needed) the AP record for `key`. Returns its index, or -1 when
-// the key is empty or the table is full and the AP is new. *is_new is set when a
-// record was just created (so the AP count / persona_note_ap fire once per BSSID).
+// get-or-create the AP record for key; -1 if empty/full+new. *is_new set on creation (count fires once per BSSID)
 static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
     *is_new = false;
     if(!key[0]) return -1;
@@ -693,14 +645,11 @@ static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
         return i;
     }
     if(model->ap_count >= AP_MAX) {
-        // Table full: recycle the least-recently-heard slot, but PROTECT captured APs —
-        // evict a non-pwned entry first so loot stays in the browser. Full history still
-        // lives in wardrive.csv / pcaps; this only recycles the on-device view.
+        // full: recycle the least-recently-heard slot but PROTECT captured APs (loot stays; full history is in wardrive.csv/pcaps)
         int victim = -1;
         for(uint16_t k = 0; k < model->ap_count; k++) {
             const ApRec* e = &model->aps[k];
-            // Keep captures and user-flagged (ignore/target) APs — evicting an ignored
-            // one would also drop it from the -wl list sent to the firmware.
+            // keep captures + flagged APs (evicting an ignored one would drop it from -wl)
             if(e->pmkid || e->handshake || e->whitelisted || e->targeted) continue;
             if(victim < 0 || model->ap_seen_tick[k] < model->ap_seen_tick[victim]) victim = (int)k;
         }
@@ -728,9 +677,7 @@ static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
     return i;
 }
 
-// Persisted AP table, so the browser shows APs/pwns from previous sessions too.
-// `targeted` is session-only (cleared on load); whitelist persists and is re-sent to
-// the firmware by the first advertise.
+// load persisted AP table. targeted is session-only (cleared); whitelist persists and is re-sent on first advertise
 static void ap_db_load(Storage* storage, PwnfriendModel* model) {
     File* f = storage_file_alloc(storage);
     if(storage_file_open(f, AP_DB_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
@@ -742,8 +689,7 @@ static void ap_db_load(Storage* storage, PwnfriendModel* model) {
             model->ap_count = (uint16_t)(got / sizeof(ApRec));
             for(uint16_t i = 0; i < model->ap_count; i++) {
                 model->aps[i].targeted = false;
-                // Continue the sighting sequence above anything loaded, so this session's
-                // sightings still sort as most-recent over restored history.
+                // continue ap_seq above loaded first_seq so new sightings sort as most-recent
                 if(model->aps[i].first_seq >= model->ap_seq)
                     model->ap_seq = model->aps[i].first_seq + 1;
             }
@@ -765,8 +711,7 @@ static void ap_db_save(Storage* storage, PwnfriendModel* model) {
     storage_file_free(f);
 }
 
-// Upsert a friend by identity. Returns its friends[] index, sets *is_new on discovery.
-// Table full -> recycle the least-recently-heard slot (64 distinct peers is a lot).
+// upsert a friend by identity; *is_new on discovery. full -> recycle least-recently-heard
 static int friend_get(PwnfriendModel* model, const char* identity, bool* is_new) {
     *is_new = false;
     if(!identity || !identity[0]) return -1;
@@ -808,8 +753,7 @@ static void friend_db_load(Storage* storage, PwnfriendModel* model) {
             uint32_t n = hdr[2] > FRIEND_MAX ? FRIEND_MAX : hdr[2];
             size_t got = storage_file_read(f, model->friends, n * sizeof(FriendRec));
             uint16_t loaded = (uint16_t)(got / sizeof(FriendRec));
-            // Self-heal: drop any record whose identity isn't a clean 64-hex fingerprint
-            // (legacy garbage from before the parse guard). Compact in place.
+            // self-heal: drop records whose identity isn't clean 64-hex (legacy garbage), compact in place
             uint16_t w = 0;
             for(uint16_t i = 0; i < loaded; i++) {
                 if(!identity_is_64hex(model->friends[i].identity)) continue;
@@ -837,14 +781,14 @@ static void friend_db_save(Storage* storage, PwnfriendModel* model) {
     storage_file_free(f);
 }
 
-// Small prefs file: home point + quiet flag (stored together in home.bin).
+// prefs file: home point + quiet + triangulate (home.bin)
 typedef struct {
     uint32_t magic;
     uint32_t version;
     float lat;
     float lon;
     uint8_t quiet;
-    uint8_t home_set; // v3: user actually set a home (vs the default Prague birthplace)
+    uint8_t home_set; // v3: user set a home (vs default Prague)
     uint8_t triangulate; // v4: on-device triangulation enabled
 } HomeDb;
 
@@ -853,8 +797,7 @@ static void home_load(Storage* storage, PwnfriendModel* model) {
     if(storage_file_open(f, HOME_DB_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
         HomeDb h = {0}; // zero-init: fields absent from an older, shorter record read as 0
         size_t got = storage_file_read(f, &h, sizeof(h));
-        // Accept any record that carries our magic and at least the v3 layout, so growing
-        // the struct (v4 triangulate) doesn't wipe a user's saved home/quiet on upgrade.
+        // accept magic + at least v3 layout so growing the struct (v4) doesn't wipe saved home/quiet
         if(got >= offsetof(HomeDb, triangulate) && h.magic == HOME_DB_MAGIC) {
             model->home_lat = h.lat;
             model->home_lon = h.lon;
@@ -881,10 +824,7 @@ static void home_save(Storage* storage, PwnfriendModel* model) {
     storage_file_free(f);
 }
 
-// A fix is an outlier if it's implausibly far (>GPS_OUTLIER_KM) from our reference — the set
-// home, else the last good fix. Indoors the GPS module sometimes emits a far-off coordinate
-// (a partial/stale NMEA fix); this keeps that junk out of the map + triangulation. No trusted
-// reference yet -> keep it (can't judge). parse_deg/coord_ok/geo_km live in pwnfriend_geo.h.
+// gps-outlier guard: a fix >GPS_OUTLIER_KM from our reference (set home, else last good fix) is junk; no reference yet -> keep
 #define GPS_OUTLIER_KM 150.0f
 static bool gps_outlier(const PwnfriendModel* m, float la, float lo) {
     float rlat = 1e9f, rlon = 1e9f;
@@ -899,7 +839,7 @@ static bool gps_outlier(const PwnfriendModel* m, float la, float lo) {
     return geo_km(rlat, rlon, la, lo) > GPS_OUTLIER_KM;
 }
 
-// Compact "age" string (Ns / Nm / Nh) for a duration in seconds — the AP's last-seen.
+// compact age string (Ns/Nm/Nh)
 static void fmt_age(uint32_t secs, char* out, size_t n) {
     if(secs < 60)
         snprintf(out, n, "%lus", (unsigned long)secs);
@@ -909,8 +849,7 @@ static void fmt_age(uint32_t secs, char* out, size_t n) {
         snprintf(out, n, "%luh", (unsigned long)(secs / 3600));
 }
 
-// Format a coordinate to "sdd.dddddd" (6 decimals) WITHOUT printf %f (newlib-nano has
-// none). Used to build the maps URL for the AP-location QR.
+// format a coordinate to 6 decimals without %f (newlib-nano has none); for the map QR URL
 static void fmt_coord(float v, char* out, size_t n) {
     if(n == 0) return;
     char* p = out;
@@ -939,9 +878,7 @@ static void fmt_coord(float v, char* out, size_t n) {
     if(rem > 0) *p = '\0';
 }
 
-// Format model->gps_place as distance + 8-point compass direction from the last fix
-// to HOME (e.g. "Prague 12km SW", "Prague 320m NE", "At Prague!"). Single-precision
-// math only (Cortex-M4F builds with -Werror=double-promotion).
+// gps_place = distance + 8-point compass to HOME; single-precision math only (-Werror=double-promotion)
 static void pwnfriend_update_place(PwnfriendModel* model) {
     float lat = parse_deg(model->last_lat), lon = parse_deg(model->last_lon);
     if(lat >= 1e8f || lon >= 1e8f) {
@@ -959,11 +896,9 @@ static void pwnfriend_update_place(PwnfriendModel* model) {
     const char* dir = DIRS[((int)roundf(ang / 0.78539816f)) & 7];
     int brg = (int)roundf(ang * 57.29578f); // radians -> degrees, 0 = N, 90 = E
     if(brg < 0) brg += 360;
-    // Until the user sets a home, the persona points back at its default Prague birthplace
-    // and calls it "Mother"; after "Set home" it's "Home".
+    // no home set yet -> point at default Prague, call it "Mother"; after "Set home" it's "Home"
     const char* hn = model->home_set ? HOME_NAME : "Mother";
-    // Distance + direction on gps_place; the course (degrees) goes to gps_course so the
-    // home panel can put it on its own row (the combined line was too wide).
+    // distance+direction on gps_place, bearing on gps_course (own row; combined was too wide)
     model->gps_course[0] = '\0';
     if(km < 0.03f) { // only the "we're here" line within ~30m; otherwise keep showing distance
         if(model->home_set)
@@ -971,8 +906,7 @@ static void pwnfriend_update_place(PwnfriendModel* model) {
         else
             snprintf(model->gps_place, sizeof(model->gps_place), "look up to Mother");
     } else {
-        // Row 1: name + distance. Row 2: direction + bearing (e.g. "SW 225") — a real °
-        // ring is drawn after it at render time (the ° glyph isn't in the Flipper font).
+        // row1 name+distance; row2 dir+bearing (° ring drawn at render time; no ° glyph in the font)
         if(km < 1.0f)
             snprintf(model->gps_place, sizeof(model->gps_place), "%s %dm", hn, (int)(km * 1000.0f));
         else
@@ -1011,11 +945,9 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
         PwnfriendModel * model,
         {
             up = model->tick_secs;
-            // Discard an implausible (far-from-home / stale) GPS fix before it geotags loot.
+            // gps-outlier guard before it geotags loot
             if(have_gps && gps_outlier(model, parse_deg(lat), parse_deg(lon))) have_gps = false;
-            // Gate the earned count behind the consent + capture opt-in: without
-            // it we ignore whatever the firmware happens to report. Dedup by BSSID
-            // across the session so a re-emitted PWND (every 15s) counts only once.
+            // gate the count behind consent+capture opt-in; dedup by BSSID so a 15s re-emit counts once
             if(model->capture_mode != CaptureOff && pwnd_seen_insert(model, key)) {
                 persona_note_pwnd(model->persona);
                 strncpy(model->last_pwnd_ssid, label, sizeof(model->last_pwnd_ssid) - 1);
@@ -1025,8 +957,7 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
                 else model->pwn_passive++;
                 counted = true;
             }
-            // Record the capture on the AP (browser + progress), regardless of the
-            // count gate — it reflects what actually landed.
+            // record the capture on the AP regardless of the count gate (reflects what landed)
             bool ap_new = false;
             int ai = ap_get(model, key, &ap_new);
             if(ai >= 0) {
@@ -1066,7 +997,7 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
                 model->last_lat[sizeof(model->last_lat) - 1] = '\0';
                 strncpy(model->last_lon, lon, sizeof(model->last_lon) - 1);
                 model->last_lon[sizeof(model->last_lon) - 1] = '\0';
-                pwnfriend_update_place(model); // nearest major city, offline
+                pwnfriend_update_place(model); // distance+bearing to home
             }
         },
         true);
@@ -1077,8 +1008,7 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
             app->storage, bssid, ssid, "[WPA2-PSK-CCMP][ESS]", channel, rssi, lat, lon);
     }
 
-    // Dev telemetry: one row per capture with provenance + RSSI, for offline analysis
-    // of where captures actually come from (active vs passive, at what signal).
+    // dev telemetry: one row per capture (provenance + RSSI)
     if(counted) {
         storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
         File* f = storage_file_alloc(app->storage);
@@ -1100,11 +1030,9 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
     if(counted) app->got_pwnd = true; // capture blink
 }
 
-// Build a minimal WPA2 beacon carrying `ssid` for `bssidhex` (12 lowercase hex) into `b`
-// (needs ~100 bytes). Splicing this into a handshake pcap gives it the ESSID that hashcat
-// needs (the PBKDF2 salt) — the app knows the name even after the firmware evicts the AP
-// from its recon table, so this rescues captures the firmware's own beacon splice misses.
-// Byte layout mirrors the firmware's streamSyntheticBeacon so the pcap stays uniform.
+// build a minimal WPA2 beacon carrying ssid for bssidhex (~100B), to splice the ESSID
+// (hashcat's PBKDF2 salt) into a pcap; rescues captures the firmware's own splice missed.
+// byte layout mirrors the firmware's streamSyntheticBeacon.
 static int build_synth_beacon(uint8_t* b, const char* bssidhex, const char* ssid) {
     if(!ssid || !ssid[0]) return 0;
     uint8_t mac[6];
@@ -1135,8 +1063,7 @@ static int build_synth_beacon(uint8_t* b, const char* bssidhex, const char* ssid
     return p;
 }
 
-// "PWNFRIEND_RSSI <mac> <dbm>" — a throttled live-signal refresh for an already-known
-// AP (firmware protocol v3). Updates the stored RSSI so the list/detail bar tracks it.
+// "PWNFRIEND_RSSI <mac> <dbm>" — throttled live-signal refresh for a known AP (fw v3)
 static void pwnfriend_handle_rssi_line(PwnfriendApp* app, const char* line) {
     char key[13];
     bssid_key(key, line + 15); // hex of the mac, colons skipped, stops at 12
@@ -1182,10 +1109,9 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
         PwnfriendModel * model,
         {
             up = model->tick_secs;
-            // Discard an implausible (far-from-home / stale) GPS fix before it geotags this AP.
+            // gps-outlier guard before it geotags this AP
             if(have_gps && gps_outlier(model, parse_deg(lat), parse_deg(lon))) have_gps = false;
-            // Upsert the AP record (browser + progress). New BSSID -> count it once,
-            // so a pause/resume replay of the firmware's recon list can't inflate it.
+            // upsert the AP; new BSSID counts once so a resume replay can't inflate it
             int ai = ap_get(model, key, &is_new_ap);
             if(ai >= 0) {
                 ApRec* a = &model->aps[ai];
@@ -1195,8 +1121,7 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
                     strncpy(a->ssid, ssid, sizeof(a->ssid) - 1);
                     a->ssid[sizeof(a->ssid) - 1] = '\0';
                     a->has_essid = true;
-                    // Learned the name for an AP we've already captured EAPOL for this
-                    // session -> splice its ESSID beacon into the pcap now (once).
+                    // late name for an already-captured AP -> splice its ESSID beacon now (once)
                     if((model->ap_pcap_flags[ai] & APF_HS_SEEN) &&
                        !(model->ap_pcap_flags[ai] & APF_BEACON_DONE)) {
                         model->ap_pcap_flags[ai] |= APF_BEACON_DONE;
@@ -1207,16 +1132,13 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
                 if(have_gps) {
                     float la = parse_deg(lat);
                     float lo = parse_deg(lon);
-                    // Keep the single strongest fix (fallback when triangulation is off / <2
-                    // samples), updated on every sighting; gains a loc on the first fix.
+                    // keep the strongest fix as a fallback (triangulation off / <2 samples)
                     if(a->lat >= 1e8f || (rssi != 0 && (int8_t)rssi > a->loc_rssi)) {
                         a->lat = la;
                         a->lon = lo;
                         a->loc_rssi = (int8_t)rssi;
                     }
-                    // Throttle: ONE triangulation sample (centroid fold + track-CSV row) per AP
-                    // per window, so a long dwell can't out-vote distinct positions and the
-                    // running sums stay bounded (beacons arrive many times/sec otherwise).
+                    // throttle: one triangulation sample per AP per window so a long dwell can't out-vote distinct positions
                     if(model->triangulate &&
                        (model->ap_track_tick[ai] == 0 ||
                         model->tick_secs - model->ap_track_tick[ai] >= AP_TRACK_MIN_SECS)) {
@@ -1234,27 +1156,24 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
                 model->last_lat[sizeof(model->last_lat) - 1] = '\0';
                 strncpy(model->last_lon, lon, sizeof(model->last_lon) - 1);
                 model->last_lon[sizeof(model->last_lon) - 1] = '\0';
-                pwnfriend_update_place(model); // nearest major city, offline
+                pwnfriend_update_place(model); // distance+bearing to home
             }
         },
         true);
 
-    // Late-learned name for an already-captured AP: splice the ESSID beacon into its pcap.
+    // late name for a captured AP: splice the ESSID beacon into its pcap
     if(inject) {
         uint8_t beac[100];
         int bl = build_synth_beacon(beac, key, beac_ssid);
         if(bl > 0) pcap_append_frame(app->storage, key, beac, (uint16_t)bl);
     }
 
-    // One geotagged wardrive row per network — only for a first-seen BSSID, so a
-    // pause/resume replay doesn't write the same AP again. Encryption is unknown
-    // from a beacon here.
+    // one wardrive row per first-seen BSSID (resume replay won't rewrite); encryption unknown from a beacon
     if(have_gps && is_new_ap) {
         wardrive_log(app->storage, bssid, ssid, "[ESS]", channel, rssi, lat, lon);
     }
 
-    // Throttled per-sighting track row (bssid + rssi + where we stood) — many rows for one
-    // BSSID from different spots = a triangulation set for offline / cross-check analysis.
+    // throttled per-sighting track row; many spots per BSSID = a triangulation set
     if(do_track) {
         storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
         File* f = storage_file_alloc(app->storage);
@@ -1277,11 +1196,8 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
 }
 
 static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
-    // Contract v2, self-describing:
-    //   line = "PWNFRIEND_HS <bssid12hex> <lowercase-hex-of-the-full-802.11-frame>"
-    // The bssid on THIS line names the per-target pcap, so a beacon (streamed by
-    // reportAP) and its EAPOL frames land in the same <bssid>.pcap without relying
-    // on a preceding PWND — that's what makes the file ESSID-bearing and crackable.
+    // "PWNFRIEND_HS <bssid12hex> <hex-of-full-802.11-frame>"; the bssid names the per-target
+    // pcap so beacon + EAPOL share one crackable <bssid>.pcap without needing a preceding PWND.
     const char* p = line + 13; // past "PWNFRIEND_HS "
 
     // Parse exactly 12 hex chars for the bssid, then require the space separator.
@@ -1296,9 +1212,7 @@ static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
     if(bi != 12 || *p != ' ') return; // need 12 hex chars then a single space
     p++; // step past the separator to the frame hex
 
-    // Only record if capture is opted in; otherwise silently drop the frame. While we're
-    // under the lock, note we've filed an EAPOL frame for this AP and, if we already know
-    // its name, arrange to splice the ESSID beacon in once (so the pcap is crackable).
+    // record only if capture is opted in; under the lock note the EAPOL file and, if we know the name, queue the ESSID splice (once)
     bool record = false;
     bool inject = false;
     char beac_ssid[33] = {0};
@@ -1333,9 +1247,7 @@ static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
     }
     if(flen == 0) return;
 
-    // bssid is already fs-safe (12 lowercase hex), so it's the pcap filename. Splice the
-    // ESSID beacon first (once per AP/session) so a name we know reaches the pcap even
-    // when the firmware never had it at capture time.
+    // bssid is the (fs-safe) pcap filename; splice the ESSID beacon first (once/session) so a known name reaches the pcap
     if(inject) {
         uint8_t beac[100];
         int bl = build_synth_beacon(beac, bssid, beac_ssid);
@@ -1345,10 +1257,8 @@ static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
 }
 
 static void pwnfriend_handle_miss_line(PwnfriendApp* app, const char* line) {
-    // pwnagotchi's on_miss: firmware attacked an AP MISS_ATTEMPTS times with no
-    // capture. Flash the demotivated face + feed the epoch's miss tally, and mark the
-    // AP so the browser shows it's been struggled with. Gated on capture being armed
-    // (like the pwnd/hs handlers) so a stray MISS while Off/paused can't skew the mood.
+    // on_miss: firmware attacked with no capture -> demotivated face + miss tally, mark the AP.
+    // gated on capture armed so a stray MISS can't skew the mood.
     char key[13];
     bssid_key(key, line + 15); // past "PWNFRIEND_MISS "
     with_view_model(
@@ -1368,8 +1278,7 @@ static void pwnfriend_handle_miss_line(PwnfriendApp* app, const char* line) {
         true);
 }
 
-// "PWNFRIEND_EPOCH {...}" — dev telemetry (fw v4). Append one CSV row per epoch to SD
-// (with uptime + last GPS) so a data dump can be analysed offline to tune the algo.
+// "PWNFRIEND_EPOCH {...}" — dev telemetry (fw v4): one CSV row per epoch for offline tuning
 static void pwnfriend_handle_epoch_line(PwnfriendApp* app, const char* line) {
     int n = 0, recon = 0, att = 0, chans = 0, assoc = 0, deauth = 0, uni = 0, sta = 0, hs = 0,
         pmkid = 0, miss = 0, dpmf = 0, dnocli = 0;
@@ -1421,8 +1330,7 @@ static void pwnfriend_handle_epoch_line(PwnfriendApp* app, const char* line) {
 }
 
 static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
-    // PWNFRIEND_PWND and PWNFRIEND_PEER share the PWNFRIEND_P prefix, so both
-    // full comparisons are needed.
+    // PWND and PEER share the PWNFRIEND_P prefix, so compare both fully
     if(strncmp(line, "PWNFRIEND_PEER ", 15) == 0) {
         pwnfriend_handle_peer_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_PWND ", 15) == 0) {
@@ -1440,8 +1348,7 @@ static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
     } else if(strncmp(line, "PWNFRIEND_MISS ", 15) == 0) {
         pwnfriend_handle_miss_line(app, line);
     }
-    // Any recognized PWNFRIEND_* line proves the board + firmware are alive; stamp
-    // the link watchdog (in one place so it also scopes detection to OUR firmware).
+    // any PWNFRIEND_* line proves the board is alive; stamp the link watchdog here
     if(strncmp(line, "PWNFRIEND_", 10) == 0) {
         with_view_model(
             app->view,
@@ -1452,25 +1359,21 @@ static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
             },
             false);
     }
-    // Any other line is ordinary Marauder chatter; ignore it.
+    // other lines are ordinary Marauder chatter; ignore
 }
 
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
 
-// Map the persona + detected peers onto the flipagotchi Pwnagotchi struct so we
-// render exactly like a real pwnagotchi screen (CH / APS / UP / PWND / message /
-// friend slot). Repopulated each draw so it's always current.
+// map persona + peers onto the flipagotchi Pwnagotchi struct; repopulated each draw
 static void pwnfriend_populate(PwnfriendModel* model) {
     Persona* p = model->persona;
     Pwnagotchi* pwn = model->pwn;
 
     furi_string_set(pwn->hostname, p->s.name);
     pwn->face = (enum PwnagotchiFace)persona_face(p);
-    // Exit prompt: the persona pulls an angry face while it asks; a relieved happy one
-    // for a beat if you decide to stay. Deadline compare (not a since-stamp) so it works
-    // even at tick 0.
+    // exit prompt: angry face while asking, happy for a beat if you stay. deadline compare works at tick 0
     bool staying = model->tick_secs < model->stayed_until;
     if(model->confirm_exit)
         pwn->face = (enum PwnagotchiFace)FaceAngry;
@@ -1478,9 +1381,7 @@ static void pwnfriend_populate(PwnfriendModel* model) {
         pwn->face = (enum PwnagotchiFace)FaceHappy;
     pwn->mode = PwnMode_Ai;
 
-    // CH: the channel the ESP32 is actually on right now (reported on each PWNFRIEND_ADV).
-    // While recon-sweeping this cycles like a real pwnagotchi; targeting an AP pins it. '*'
-    // until the board reports one (or when paused).
+    // CH: the channel the ESP32 is on now (per PWNFRIEND_ADV); '*' until it reports one
     uint8_t cur_ch = model->adv_channel;
     if(cur_ch >= 1 && cur_ch <= 14) {
         furi_string_printf(pwn->channel, "%u", (unsigned)cur_ch);
@@ -1488,9 +1389,7 @@ static void pwnfriend_populate(PwnfriendModel* model) {
         furi_string_set(pwn->channel, "*");
     }
 
-    // AP: like a real pwnagotchi, the number of nearby (recent, not-ignored) APs ON THE
-    // CURRENT CHANNEL — not a session total. Falls back to all recent non-ignored APs when
-    // the current channel isn't known yet.
+    // AP: count of recent, not-ignored APs on the current channel (all recent if channel unknown)
     uint16_t apc = 0;
     for(uint16_t i = 0; i < model->ap_count; i++) {
         if(model->aps[i].whitelisted) continue; // ignored APs don't count
@@ -1500,8 +1399,7 @@ static void pwnfriend_populate(PwnfriendModel* model) {
     }
     furi_string_printf(pwn->apStat, "%u", (unsigned)apc);
 
-    // BAT: battery %, cached from the 1 Hz tick (more useful at a glance than uptime;
-    // full uptime still lives on the Stats screen).
+    // BAT: cached battery % (uptime lives on the Stats screen)
     furi_string_printf(pwn->uptime, "%u%%", (unsigned)model->battery_pct);
 
     // PWND: real handshakes captured, this session (lifetime).
@@ -1511,10 +1409,7 @@ static void pwnfriend_populate(PwnfriendModel* model) {
         (unsigned long)p->pwnd_run,
         (unsigned long)p->s.pwnd_tot);
 
-    // Message bubble — shown only on the Mood page (Left/Right pages draw their own
-    // multi-line panel via pwnfriend_draw_home_stats). Paused hint and a fresh-catch
-    // shout take priority; otherwise the persona speaks its mood and, now and then,
-    // brags a stat so the idle screen still surfaces numbers.
+    // message bubble (Mood page only). paused hint + fresh-catch shout take priority; else mood, and now and then a stat brag
     if(model->confirm_exit) {
         furi_string_set(pwn->message, "leaving me? Back=bye");
     } else if(staying) {
@@ -1553,7 +1448,7 @@ static void pwnfriend_populate(PwnfriendModel* model) {
     }
 }
 
-// The one-time authorization acknowledgement, shown before capture can be armed.
+// one-time authorization acknowledgement, before capture can be armed
 static void pwnfriend_draw_consent(Canvas* canvas) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
@@ -1566,10 +1461,8 @@ static void pwnfriend_draw_consent(Canvas* canvas) {
     canvas_draw_str(canvas, 2, 62, "Hold OK=accept  Back=no");
 }
 
-// Encode the setup URL into the model's QR buffer, once. Runs on the app thread
-// (never the draw callback, which is on the GUI service thread). maxVersion is
-// capped at 4 so the two scratch/output buffers stay 138 B (a version-40 buffer
-// would be ~3.9 KB and blow the stack).
+// encode the setup URL once, on the app thread (not the draw callback); maxVersion capped
+// at 4 so the buffers stay ~138B and don't blow the stack.
 static void pwnfriend_qr_encode(PwnfriendModel* model) {
     uint8_t tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(4)];
     model->qr_ok = qrcodegen_encodeText(
@@ -1577,9 +1470,7 @@ static void pwnfriend_qr_encode(PwnfriendModel* model) {
         qrcodegen_Mask_AUTO, true);
 }
 
-// "No ESP32" full-screen warning shown when the board stops answering. The setup
-// QR (left) points at the compatible-hardware + firmware doc; the text (right)
-// says what to check. Modules are drawn as boxes so it scales crisply.
+// "No ESP32" warning: setup QR (left) + what-to-check text (right)
 static void draw_str_trunc(Canvas* c, int x, int y, const char* s, int maxw); // defined below
 
 static void pwnfriend_draw_link_down(Canvas* canvas, const PwnfriendModel* model) {
@@ -1605,8 +1496,7 @@ static void pwnfriend_draw_link_down(Canvas* canvas, const PwnfriendModel* model
     canvas_draw_str(canvas, 66, 54, "& firmware.");
 }
 
-// QR of the selected AP's location (a maps URL) — Up on the AP detail screen. Scan it
-// with a phone to open the spot where the AP was seen.
+// QR of the selected AP's location (a geo: URI); scan with a phone
 static void pwnfriend_draw_ap_qr(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     const ApRec* a = &model->aps[model->detail_ap];
@@ -1642,21 +1532,14 @@ static void pwnfriend_draw_ap_qr(Canvas* canvas, const PwnfriendModel* model) {
     }
 }
 
-// Bottom-right status cluster, in the corner freed by dropping the AI/AUTO/MANU
-// mode tag. Laid out right-to-left so nothing overruns the screen edge or the
-// PWND/friend rows on the left. The old status cluster (CAP/DEAUTH/GPS/dot) lived
-// here but was noise — this space now shows the last pwned AP, right-aligned on the
-// PWND baseline row, clamped so it never collides with the "PWND N (N)" count on the
-// left. Capture mode moved to the Left/Right "counts" stat page; GPS to its own page.
+// bottom-right: the last pwned AP, right-aligned on the PWND baseline, clamped so it never collides with the "PWND N (N)" count
 #define PWNFRIEND_STATUS_LEFT_LIMIT 64
 #define PWNFRIEND_STATUS_Y PWNAGOTCHI_HANDSHAKES_I // 63, the PWND baseline row
 
 static void pwnfriend_draw_last_pwnd(Canvas* canvas, const PwnfriendModel* model) {
     if(!model->last_pwnd_ssid[0]) return; // nothing captured yet -> leave it blank
     canvas_set_font(canvas, FontSecondary);
-    // Left limit = the actual width the "PWND N (N)" count occupies (measured, so a
-    // big lifetime count can't be overlapped) + a gap. pwn->handshakes is already
-    // populated for this frame by pwnfriend_populate().
+    // left limit = measured width of the "PWND N (N)" count + a gap, so a big count can't be overlapped
     int left_limit = canvas_string_width(canvas, "PWND ") +
                      canvas_string_width(canvas, furi_string_get_cstr(model->pwn->handshakes)) + 4;
     // Truncate from the left so the freshest chars show, right-aligned to the edge.
@@ -1687,8 +1570,7 @@ static int rssi_level(int rssi) {
     return v;
 }
 
-// True if this AP's RSSI is fresh enough to show a signal meter (heard within the TTL
-// this session). Stale/loaded APs have an out-of-date RSSI, so we hide the bar.
+// AP RSSI fresh enough (heard within the TTL) to show a meter; stale/loaded APs hide it
 static bool ap_signal_recent(const PwnfriendModel* m, uint16_t i) {
     return m->ap_seen_tick[i] != 0 && (m->tick_secs - m->ap_seen_tick[i]) <= AP_SIGNAL_TTL_SECS;
 }
@@ -1701,11 +1583,8 @@ static void ap_flags_str(const ApRec* a, char out[4]) {
     out[3] = '\0';
 }
 
-// Draw text truncated with the current font to fit `maxw` px at (x,y).
-// Draw `s` at baseline (x, y), clipped to maxw px. Printable ASCII renders normally; every
-// other UTF-8 character (emoji / unicode SSID chars the Flipper bitmap font can't draw) is
-// drawn as one small dot centred in the row height — one dot per source character (not
-// collapsed). Display-only; the raw SSID stays in wardrive.csv / the crackable pcap beacon.
+// draw s at baseline (x,y), clipped to maxw. ASCII renders; every other UTF-8 char draws as
+// one centred dot (Flipper font can't). display-only; raw SSID stays in the CSV/pcap.
 static void draw_str_trunc(Canvas* c, int x, int y, const char* s, int maxw) {
     const int xend = x + maxw;
     const int dot_cell = 5; // px a substituted glyph occupies
@@ -1743,8 +1622,7 @@ static void draw_str_trunc(Canvas* c, int x, int y, const char* s, int maxw) {
         }
         if(ch == '\0') break;
         if(!ascii) {
-            // One dot per non-ASCII character: skip its UTF-8 continuation bytes (the loop's
-            // p++ then steps past the last one).
+            // one dot per non-ASCII char: skip its UTF-8 continuation bytes
             while(((unsigned char)*(p + 1) & 0xC0) == 0x80) p++;
             if(x + dot_cell > xend) return;
             canvas_draw_box(c, x + 1, y - 4, 2, 2); // centred in the ~8px row
@@ -1780,16 +1658,14 @@ static const char* capture_name(CaptureMode m) {
                                  "off";
 }
 
-// Tiny d-pad/button glyphs drawn inline (this SDK exports no firmware button icons).
-// Coordinates are the left edge x and the vertical CENTRE yc; drawn in the current color.
+// tiny inline d-pad glyphs (no firmware icons); x = left edge, yc = vertical centre
 static void icon_left(Canvas* c, int x, int yc) { // solid ◄, 4x7
     for(int i = 0; i < 4; i++) canvas_draw_line(c, x + i, yc - i, x + i, yc + i);
 }
 static void icon_right(Canvas* c, int x, int yc) { // solid ►, 4x7
     for(int i = 0; i < 4; i++) canvas_draw_line(c, x + 3 - i, yc - i, x + 3 - i, yc + i);
 }
-// Right-aligned "◄ value ►" for an arrow-adjustable menu row: the glyphs signal it's
-// changed with Left/Right (no literal < > text). `y` is the text baseline.
+// right-aligned "◄ value ►" for an arrow-adjustable row; y = text baseline
 static void draw_adjust_value(Canvas* c, int y, const char* value) {
     int yc = y - 3; // glyph centre vs the text baseline
     int vw = (int)canvas_string_width(c, value);
@@ -1798,24 +1674,19 @@ static void draw_adjust_value(Canvas* c, int y, const char* value) {
     canvas_draw_str(c, vx, y, value);
     icon_left(c, vx - 6, yc); // ◄ left of the value
 }
-// Title bar (inverted): title left, optional right-aligned text. Back is a universal
-// Flipper button, so we don't waste pixels hinting it.
+// inverted title bar: title left, optional right text
 static void draw_titlebar(Canvas* c, const char* title, const char* right) {
     canvas_draw_box(c, 0, 0, FLIPPER_SCREEN_WIDTH, 11);
     canvas_set_color(c, ColorWhite);
     canvas_set_font(c, FontSecondary);
     int rw = right ? (int)canvas_string_width(c, right) : 0;
-    // Title through the dot renderer (SSID/name may carry unrenderable unicode), clipped so
-    // it can't run into the right-hand text.
+    // title via the dot renderer (may carry unrenderable unicode), clipped off the right text
     draw_str_trunc(c, 2, 9, title, FLIPPER_SCREEN_WIDTH - 2 - (right ? rw + 4 : 2));
     if(right) canvas_draw_str(c, FLIPPER_SCREEN_WIDTH - 2 - rw, 9, right);
     canvas_set_color(c, ColorBlack);
 }
 
-// Fill out[] with aps[] indices matching the ScreenApList filter. Order: APs with a
-// live signal first, then stale ones; within each group, STRONGEST signal first (RSSI
-// desc), with discovery order as a stable tiebreaker for equal signal. Insertion sort,
-// n<=256.
+// fill out[] with filtered aps[] indices: live signal first, then strongest RSSI, discovery order as a stable tiebreak. insertion sort, n<=256
 static uint16_t ap_filtered(const PwnfriendModel* m, uint16_t* out) {
     uint16_t n = 0;
     for(uint16_t i = 0; i < m->ap_count; i++) {
@@ -1833,8 +1704,7 @@ static uint16_t ap_filtered(const PwnfriendModel* m, uint16_t* out) {
             uint16_t u = out[j];
             bool ru = ap_signal_recent(m, u);
             int16_t rssiu = m->aps[u].rssi;
-            // v outranks u if it's live and u isn't; else (same liveness) stronger signal,
-            // and for equal signal the earlier-discovered wins (stable).
+            // v outranks u: live over stale; else stronger RSSI; else earlier-discovered (stable)
             bool v_first = (rv && !ru) ||
                            (rv == ru && (rssiv > rssiu || (rssiv == rssiu && sv > m->aps[u].first_seq)));
             if(!v_first) break;
@@ -1854,8 +1724,7 @@ static bool friend_signal_recent(const PwnfriendModel* m, uint16_t i) {
            (m->tick_secs - m->friend_seen_tick[i]) <= AP_SIGNAL_TTL_SECS;
 }
 
-// Order friends[] into out[]: live signal first, then by strongest RSSI, discovery order
-// as a stable tiebreak. Same shape as ap_filtered (no filters). Insertion sort, n<=64.
+// order friends[]: live first, then strongest RSSI, discovery order as a stable tiebreak. insertion sort, n<=64
 static uint16_t friend_order(const PwnfriendModel* m, uint16_t* out) {
     uint16_t n = m->friend_count;
     for(uint16_t i = 0; i < n; i++) out[i] = i;
@@ -2023,8 +1892,7 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
             canvas_draw_box(canvas, 0, y - 9, FLIPPER_SCREEN_WIDTH, 10);
             canvas_set_color(canvas, ColorWhite);
         }
-        // Pwned view: name + [T/I] + capture status only (signal/flags aren't useful
-        // once it's caught). Other views: name + [T/I] + signal bar + E/P/H flags.
+        // pwned view: name + [T/I] + capture status; other views also add signal bar + E/P/H flags
         const char* name = a->ssid[0] ? a->ssid : a->bssid;
         bool pwned_view = model->list_filter == FilterPwned;
         char right[8];
@@ -2064,8 +1932,7 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
     fmt_bssid_colons(a->bssid, mac);
     snprintf(l, sizeof(l), "%s  ch%d", mac, a->channel);
     canvas_draw_str(canvas, 2, 22, l);
-    // Distance from us to the AP's estimated location (triangulated centroid, else the
-    // strongest fix) — shown on row 2 (right). Needs a current fix + a stored AP location.
+    // distance to the AP's estimated location (triangulated, else strongest fix); needs a current fix
     float clat = parse_deg(model->last_lat), clon = parse_deg(model->last_lon);
     float alat = 1e9f, alon = 1e9f;
     loc_estimate(
@@ -2109,9 +1976,7 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
     else
         snprintf(l, sizeof(l), "nothing caught yet");
     canvas_draw_str(canvas, 2, 53, l);
-    // Bottom row: target[x] (left, Left toggles), ignore[x] (right, Right toggles), and the
-    // OK-map hint (a small disc + "map") centred between them when a location is known — OK
-    // opens the map QR.
+    // bottom row: target[x] (Left), ignore[x] (Right), and a centred OK-map hint when a location is known
     snprintf(l, sizeof(l), "target[%c]", a->targeted ? 'x' : ' ');
     canvas_draw_str(canvas, 2, 63, l);
     snprintf(l, sizeof(l), "ignore[%c]", a->whitelisted ? 'x' : ' ');
@@ -2166,8 +2031,7 @@ static void pwnfriend_draw_friendlist(Canvas* canvas, const PwnfriendModel* mode
 static void pwnfriend_draw_frienddetail(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     const FriendRec* fr = &model->friends[model->detail_friend];
-    // Friend's face in the title bar's right slot (ASCII stand-in — real pwngrid faces are
-    // unicode the Flipper can't draw), name on the left.
+    // friend's face (ASCII stand-in; real pwngrid faces are unicode) in the title's right slot, name left
     draw_titlebar(canvas, fr->name[0] ? fr->name : "???", "^_^");
     canvas_set_font(canvas, FontSecondary);
     char l[40];
@@ -2223,8 +2087,7 @@ static void pwnfriend_draw_frienddetail(Canvas* canvas, const PwnfriendModel* mo
     }
 }
 
-// QR of the selected friend's last location — Up on the friend detail screen. Reuses the
-// AP-location QR buffer (only one QR is on screen at a time).
+// QR of the friend's last location; reuses the AP-location QR buffer (one QR on screen at a time)
 static void pwnfriend_draw_friend_qr(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     const FriendRec* fr = &model->friends[model->detail_friend];
@@ -2284,16 +2147,14 @@ static void pwnfriend_draw_stats(Canvas* canvas, const PwnfriendModel* model) {
     } else {
         canvas_draw_str(canvas, 2, 51, "GPS: no fix");
     }
-    // tx beacons + the capture provenance split (dev telemetry): active = our attack
-    // earned it, passive = we just sniffed it.
+    // tx beacons + capture provenance split (active = our attack, passive = sniffed)
     snprintf(
         l, sizeof(l), "tx %lu  pwn a%lu/p%lu", (unsigned long)model->adv_sent_count,
         (unsigned long)model->pwn_active, (unsigned long)model->pwn_passive);
     canvas_draw_str(canvas, 2, 61, l);
 }
 
-// The <mrq> mark as text (from ~/mrq.min.ascii). The stock fonts are proportional,
-// which skews the columns, so draw_mono() renders it at a fixed cell pitch instead.
+// the <mrq> mark as text; draw_mono() renders it at a fixed pitch (stock fonts are proportional)
 static const char* MRQ_ART[] = {
     "     _    __/\\_______  _______",
     "    / \\  /  \\_____   \\/  ___  \\",
@@ -2303,8 +2164,7 @@ static const char* MRQ_ART[] = {
     "(___/  \\/  <mrq>  \\___)   \\___)",
 };
 
-// Draw an ASCII-art line at a fixed cell pitch `cw` so its columns line up (a
-// proportional font would give spaces/slashes/letters different widths and skew it).
+// draw an ASCII-art line at a fixed cell pitch cw so columns line up
 static void draw_mono(Canvas* c, int x, int y, const char* s, int cw) {
     for(const char* p = s; *p; p++, x += cw) {
         if(*p == ' ') continue; // blank cell — just advance
@@ -2316,9 +2176,7 @@ static void draw_mono(Canvas* c, int x, int y, const char* s, int cw) {
 static void pwnfriend_draw_about(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
-    // The mrq banner is wider than 128px, so it scrolls (the timer advances
-    // about_scroll; OK toggles bounce/infinite; Left/Right change the speed). Art on
-    // 8px rows (baselines 7..47) to free the bottom for two version lines.
+    // the mrq banner scrolls (timer advances about_scroll; OK toggles bounce/infinite; Left/Right speed). art on 8px rows, bottom free for two version lines
     const size_t art_n = sizeof(MRQ_ART) / sizeof(MRQ_ART[0]);
     int cw = (int)canvas_string_width(canvas, "_"); // pitch: seamless underscore runs
     if(cw < 1) cw = 5;
@@ -2352,9 +2210,7 @@ static void pwnfriend_draw_about(Canvas* canvas, const PwnfriendModel* model) {
     // App: version + short git hash (baked in at build; "nogit" outside a checkout).
     snprintf(line, sizeof(line), "app %s %s", PWNFRIEND_APP_VERSION, PWNFRIEND_GIT_HASH);
     canvas_draw_str(canvas, 2, 56, line);
-    // Firmware: prefer the actual build hash (fw=<hash>) so a reflash is verifiable — the
-    // protocol number alone (v4) can't tell two v4 builds apart. Fall back to the protocol
-    // for firmware too old to stamp a hash, or a nudge when the board is silent.
+    // firmware: prefer the build hash (verifiable reflash; the protocol number can't tell two v4 builds apart), fall back to the protocol
     if(model->fw_proto == 0)
         snprintf(line, sizeof(line), "fw  none (want v%d)", PWNFRIEND_FW_PROTO);
     else if(model->fw_commit[0])
@@ -2368,9 +2224,7 @@ static void pwnfriend_draw_about(Canvas* canvas, const PwnfriendModel* model) {
     canvas_draw_str(canvas, 2, 64, line);
 }
 
-// A multi-line stat panel drawn in the message region (right of the face) when the
-// user has scrolled off the Mood page with Left/Right. Fills the space the single-line
-// bubble left empty; auto-reverts to the persona voice after HOME_STATS_TIMEOUT_SECS.
+// multi-line stat panel right of the face, shown off the Mood page; auto-reverts after HOME_STATS_TIMEOUT_SECS
 static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* model) {
     canvas_set_font(canvas, FontSecondary);
     const Persona* p = model->persona;
@@ -2405,8 +2259,7 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
     }
     case StatPageGps:
     default:
-        // Distance/direction on one row, the course on its own so neither overflows.
-        // (No raw coords here — those live on the Stats screen.)
+        // distance/direction on one row, course on its own; raw coords live on Stats
         if(model->gps_seen) {
             HS_ROW("%s", model->gps_place[0] ? model->gps_place : "locating...");
             if(model->gps_course[0]) {
@@ -2425,9 +2278,7 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
 
 static void pwnfriend_draw_home(Canvas* canvas, PwnfriendModel* model) {
     pwnfriend_populate(model);
-    // Draw the pwnagotchi screen piece by piece, skipping pwnagotchi_draw_mode: the
-    // AI/AUTO/MANU tag is meaningless here, and the bottom-right corner shows the
-    // last pwned AP instead.
+    // draw the pwnagotchi screen piecewise, skipping the AI/AUTO/MANU tag (corner shows the last pwned AP)
     Pwnagotchi* pwn = model->pwn;
     pwnagotchi_draw_face(pwn, canvas);
     pwnagotchi_draw_name(pwn, canvas);
@@ -2437,8 +2288,7 @@ static void pwnfriend_draw_home(Canvas* canvas, PwnfriendModel* model) {
     pwnagotchi_draw_lines(pwn, canvas);
     pwnagotchi_draw_friend(pwn, canvas);
     pwnagotchi_draw_handshakes(pwn, canvas);
-    // Mood page (or paused) speaks; other pages show the multi-line stat panel. The exit
-    // prompt / "staying" reaction always speaks so the persona voice carries it.
+    // Mood page (or paused) speaks; other pages show the stat panel; exit/staying always speaks
     bool reacting = model->confirm_exit || model->tick_secs < model->stayed_until;
     if(!reacting && model->advertising && model->stat_page != StatPageMood)
         pwnfriend_draw_home_stats(canvas, model);
@@ -2454,8 +2304,7 @@ static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
         pwnfriend_draw_consent(canvas);
         return;
     }
-    // The "no ESP32" warning only takes over the home screen; the menu/browser stay
-    // usable (they show data we already gathered) even if the board goes quiet.
+    // "no ESP32" only takes over the home screen; menu/browser stay usable
     if(model->link_down && model->screen == ScreenHome) {
         pwnfriend_draw_link_down(canvas, model);
         return;
@@ -2479,8 +2328,7 @@ static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
 // Input
 // ---------------------------------------------------------------------------
 
-// "Set name" text-input result (OK): apply + persist the new name, return to the
-// menu, and refresh the beacon so the mesh sees the new name.
+// name editor OK: apply + persist the name, back to menu, refresh the beacon
 static void pwnfriend_name_result(void* ctx) {
     PwnfriendApp* app = ctx;
     bool advertising = false;
@@ -2506,8 +2354,7 @@ static uint32_t pwnfriend_name_prev(void* ctx) {
 static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
     PwnfriendApp* app = ctx;
 
-    // While the consent modal is up: long-press OK accepts, Back cancels; every
-    // other input is swallowed so nothing leaks through to the pwnagotchi view.
+    // consent modal: long-OK accepts, Back cancels, everything else swallowed
     bool consent_modal = false;
     with_view_model(
         app->view, PwnfriendModel * model, { consent_modal = model->showing_consent; }, false);
@@ -2544,9 +2391,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
 
     switch(screen) {
     case ScreenHome:
-        // Exit confirmation: first Back raises a persona prompt; a second Back quits. Any
-        // other key while the prompt is up cancels it (the persona is relieved) instead of
-        // doing its usual thing. A dead board (link_down) just exits — the prompt'd be hidden.
+        // exit: first Back prompts, second Back quits; any other key cancels; a dead board just exits
         if(event->key == InputKeyBack) {
             bool quit = false;
             with_view_model(
@@ -2596,7 +2441,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                 true);
             return true;
         }
-        // Up/Down: unused on home now — the channel is set by targeting an AP, not by hand.
+        // Up/Down unused on home (channel is set by targeting an AP)
         if(event->key == InputKeyUp || event->key == InputKeyDown) return true;
         return true; // Back (exit) is handled above; swallow any other stray key
 
@@ -2726,8 +2571,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         model->fl_top = 0;
                         break;
                     case MenuTarget: {
-                        // Clear the focus target from here (no hunting the 256-AP list) and
-                        // drop back to the auto (*) channel sweep.
+                        // clear the focus target and drop back to the auto (*) sweep
                         bool had = false;
                         for(uint16_t i = 0; i < model->ap_count; i++)
                             if(model->aps[i].targeted) {
@@ -2810,8 +2654,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                             a->targeted = on;
                             if(on) {
                                 a->whitelisted = false;
-                                // Pin the hunt to the target's channel so the attack
-                                // actually lands there (else auto-sweep hunts it slowly).
+                                // pin the hunt to the target's channel so the attack lands there
                                 if(a->channel >= 1 && a->channel <= 14)
                                     model->tuned_channel = (int8_t)a->channel;
                             } else {
@@ -2864,8 +2707,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
             return true;
         }
         if(event->key == InputKeyUp || event->key == InputKeyDown) {
-            // Up/Down flip to the prev/next AP in the (filtered) list, staying in detail and
-            // keeping list_idx in sync so Back returns to the one we ended on.
+            // Up/Down flip to prev/next AP in detail, keeping list_idx in sync
             with_view_model(
                 app->view, PwnfriendModel * model,
                 {
@@ -2906,8 +2748,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         uint8_t tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(4)];
                         fmt_coord(alat, lats, sizeof(lats));
                         fmt_coord(alon, lons, sizeof(lons));
-                        // Vendor-neutral geo: URI — the phone opens it in whatever map app
-                        // the user has (Organic Maps / OsmAnd / Apple / …), not forced Google.
+                        // vendor-neutral geo: URI (opens in whatever map app, not forced Google)
                         snprintf(url, sizeof(url), "geo:%s,%s", lats, lons);
                         model->ap_qr_ok = qrcodegen_encodeText(
                             url, tmp, model->ap_qr, qrcodegen_Ecc_LOW, 1, 4, qrcodegen_Mask_AUTO,
@@ -3128,8 +2969,7 @@ static void pwnfriend_timer_callback(void* ctx) {
     app->anim_tick++;
     bool second = (app->anim_tick % ANIM_HZ) == 0; // one real second has elapsed
 
-    // Idle sub-second fires only exist to animate the About banner; skip them (and
-    // the redraw) on every other screen so the home face still refreshes at ~1 Hz.
+    // sub-second fires only animate About; skip them (and redraw) on other screens
     Screen screen = ScreenHome;
     with_view_model(app->view, PwnfriendModel * model, { screen = model->screen; }, false);
     if(!second && screen != ScreenAbout) return;
@@ -3153,17 +2993,13 @@ static void pwnfriend_timer_callback(void* ctx) {
                 peers_prune(&model->peers, model->tick_secs);
                 bool bonded = peers_any_bonded(&model->peers, model->tick_secs);
                 model->persona->friend_near = bonded;
-                // "Engaged" = advertising + capture armed + APs around. Keeps the friend
-                // content while it works a populated area (the firmware reports each AP
-                // only once, so per-epoch discovery dries up even mid-hunt).
+                // "engaged" = advertising + capture armed + APs around; keeps it content mid-hunt (each AP reported once)
                 model->persona->hunting = model->advertising &&
                                           model->capture_mode != CaptureOff &&
                                           model->ap_count > 0;
                 persona_tick(model->persona, 1);
 
-                // ESP32-link watchdog: warn only while advertising, only after the boot
-                // grace, and only once the board has been silent past the timeout.
-                // Unsigned subtraction is safe: both stamps are always <= tick_secs.
+                // link watchdog: warn only while advertising, past boot grace + silence timeout. unsigned sub is safe (stamps <= tick_secs)
                 if(model->advertising) {
                     uint32_t since_rx = model->tick_secs - model->last_rx_secs;
                     uint32_t since_adv = model->tick_secs - model->advertising_since;
@@ -3184,12 +3020,10 @@ static void pwnfriend_timer_callback(void* ctx) {
         },
         true);
 
-    // send_advertise builds ~760B of buffers (cmd[512] + wl) and a 14-arg snprintf —
-    // too much for the 1KB timer-daemon stack. Kick the worker thread (2KB) to do it.
+    // send_advertise needs ~760B of buffers, too much for the 1KB timer stack; kick the 2KB worker
     if(resend) furi_thread_flags_set(furi_thread_get_id(app->worker_thread), WorkerEventResend);
     if(save) {
-        // persona pointer lives for the app's lifetime; a save racing a note_peer
-        // update at worst records a slightly stale count, which is harmless.
+        // a save racing a note_peer update at worst records a slightly stale count (harmless)
         with_view_model(
             app->view,
             PwnfriendModel * model,
@@ -3297,10 +3131,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             peers_init(&model->peers);
             model->tick_secs = 0;
             model->advertising = true; // say hi on launch; OK toggles pause/resume
-            // A full pwnagotchi by default: capture + deauth ON. It's gated behind
-            // the one-time authorization acknowledgement — if that's already been
-            // given (a returning user), arm Deauth straight away; otherwise start
-            // Off and raise the consent screen on launch, arming Deauth on accept.
+            // default full pwnagotchi (capture+deauth), gated by consent: returning user arms Deauth now, else start Off and raise the consent screen
             model->consent_given = consent_is_given();
             model->capture_mode = model->consent_given ? CaptureDeauth : CaptureOff;
             model->showing_consent = !model->consent_given;
@@ -3309,8 +3140,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->ap_count = 0;
             model->ap_overflow = false;
             model->ap_seq = 1;
-            // Parallel per-AP session arrays: no signal yet, no known location. Must be
-            // set for every slot (loaded APs never pass through ap_get).
+            // init per-AP session arrays for every slot (loaded APs skip ap_get)
             for(uint16_t i = 0; i < AP_MAX; i++) {
                 model->ap_seen_tick[i] = 0;
                 model->ap_track_tick[i] = 0;
@@ -3320,7 +3150,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
                 model->aps[i].loc_rssi = -128; // weakest, so the first real fix always wins
             }
             ap_db_load(app->storage, model); // browse APs/pwns from previous sessions
-            // Friends browser: no signal yet for any slot; then restore met friends.
+            // friends browser: init per-slot signal, then restore met friends
             model->friend_count = 0;
             model->friend_overflow = false;
             model->friend_seq = 1;
@@ -3394,14 +3224,11 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
     furi_thread_set_callback(app->worker_thread, pwnfriend_worker);
     furi_thread_start(app->worker_thread);
 
-    // ANIM_HZ heartbeat: the per-second brain work is gated inside the callback; the
-    // extra fires only animate the About banner.
+    // ANIM_HZ heartbeat; per-second work gated inside, extra fires animate About
     app->timer = furi_timer_alloc(pwnfriend_timer_callback, FuriTimerTypePeriodic, app);
     furi_timer_start(app->timer, furi_kernel_get_tick_frequency() / ANIM_HZ);
 
-    // Auto-start: start saying hi immediately (model->advertising is true). The timer
-    // re-pushes every PWNFRIEND_ADV_RESEND_SECS; this is the initial greeting so the
-    // user never has to press OK to begin. OK still toggles pause/resume afterwards.
+    // auto-start greeting (advertising is true); the timer re-pushes every PWNFRIEND_ADV_RESEND_SECS
     pwnfriend_send_advertise(app);
 
     return app;
@@ -3425,8 +3252,7 @@ static void pwnfriend_app_free(PwnfriendApp* app) {
         },
         false);
 
-    // Tear down serial (which silences the RX IRQ) BEFORE freeing the worker
-    // thread, so a byte arriving mid-teardown can't poke a freed thread.
+    // tear down serial (silences RX IRQ) BEFORE freeing the worker, so a late byte can't poke a freed thread
     furi_hal_serial_deinit(app->serial_handle);
     furi_hal_serial_control_release(app->serial_handle);
 

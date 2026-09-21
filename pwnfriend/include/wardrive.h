@@ -4,15 +4,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// WiGLE-importable wardrive log. One CSV, appended a row per geotagged AP/PWND.
-// Lives beside the persona so everything the app writes is under one data dir.
+// WiGLE-importable wardrive log; one CSV, a row per geotagged AP/PWND, beside the persona
 #define PWNFRIEND_WARDRIVE_DIR "/ext/apps_data/pwnfriend"
 #define PWNFRIEND_WARDRIVE_PATH PWNFRIEND_WARDRIVE_DIR "/wardrive.csv"
 
-// Append one WiGLE-1.4 row. `lat`/`lon` are the verbatim decimal-degree strings
-// straight out of the firmware JSON (we never parse them to float — the Flipper
-// printf has float disabled), so they must be non-empty. On a brand-new/empty
-// file the pre-header + column header are written first. Returns false on error.
+// append one WiGLE-1.4 row. lat/lon are verbatim decimal-degree strings from the firmware
+// JSON, never parsed to float (Flipper printf has %f disabled), so must be non-empty.
+// pre-header + column header written first on an empty file. false on error.
 bool wardrive_log(
     Storage* storage,
     const char* mac, // "aa:bb:cc:dd:ee:ff"

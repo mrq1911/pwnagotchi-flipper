@@ -1,15 +1,12 @@
-// Pure 802.11 frame parsers for pwnfriend — NO Arduino / ESP-IDF dependencies, so
-// they can be unit-tested on the host (see tests/). Keep everything here hardware-free
-// (only <stdint.h>/<stddef.h>); anything touching esp_wifi/Serial belongs in Pwnfriend.cpp.
+// pure 802.11 parsers for pwnfriend — hardware-free (only stdint/stddef) so host-testable
+// (see tests/). anything touching esp_wifi/Serial belongs in Pwnfriend.cpp.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
 
-// Does this beacon/probe-response advertise 802.11w PMF as REQUIRED (RSN MFPR bit)?
-// If so, deauth is futile (the client ignores unprotected deauths) and we should only
-// solicit its PMKID. Walks the tagged params to the RSN IE (id 48) capabilities field.
-// `f` is the raw 802.11 frame, `len` its length. Bounds-checked; returns false on any
-// malformed/truncated input.
+// does this beacon/probe-response require 802.11w PMF (RSN MFPR bit)? if so deauth is
+// futile, PMKID only. walks tagged params to the RSN IE (id 48) caps. bounds-checked,
+// false on malformed input.
 static inline bool pwnfriend_rsn_requires_pmf(const uint8_t* f, int len) {
     int p = 36; // tagged params start after the 24-byte mgmt hdr + 12-byte fixed params
     while(p + 2 <= len) {

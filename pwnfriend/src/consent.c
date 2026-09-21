@@ -4,7 +4,7 @@
 #include <datetime/datetime.h>
 #include <furi_hal_rtc.h>
 
-// Same data dir the persona lives in; created lazily on record.
+// same data dir as the persona; created lazily on record
 #define CONSENT_DIR "/ext/apps_data/pwnfriend"
 
 static uint64_t consent_now_unix(void) {

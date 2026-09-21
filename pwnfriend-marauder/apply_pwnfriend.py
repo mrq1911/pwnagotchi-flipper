@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Add the `pwnfriend` command to an ESP32 Marauder checkout.
 
-Anchored, idempotent source surgery — the automated form of PATCH.md. It finds
-quoted anchor strings (which survive line-number drift between Marauder releases
-and forks) and inserts our hooks. If an anchor is missing it aborts loudly, so a
-CI build fails clearly instead of producing a broken firmware.
+Anchored, idempotent source surgery (automated PATCH.md): finds quoted anchor
+strings and inserts our hooks, aborting loudly if an anchor is missing.
 
 Usage:
     python3 apply_pwnfriend.py /path/to/marauder            # dir with esp32_marauder/
@@ -84,9 +82,7 @@ def main():
     src = find_src(Path(sys.argv[1]).resolve())
     print(f"patching Marauder at {src}")
 
-    # 0. Copy the module in.
-    # Bake our repo's short commit into pwnfriend_commit.h so the firmware can report
-    # exactly which build is flashed (stamped on PWNFRIEND_ADV as fw=<hash>).
+    # 0. copy the module in; bake our short commit into pwnfriend_commit.h (fw=<hash> on PWNFRIEND_ADV).
     import subprocess
     try:
         commit = subprocess.check_output(
@@ -126,8 +122,7 @@ def main():
         tag="RunPwnfriendScan")
     _write(p, t); steps += d1 + d2
 
-    # 3. WiFiScan.cpp — include, runner, dispatch, sniff-report, main() tick,
-    #    and the outer sniffer guard.
+    # 3. WiFiScan.cpp — include, runner, dispatch, sniff-report, main() tick, sniffer guard.
     p = src / "WiFiScan.cpp"
     t = _read(p)
 
@@ -184,8 +179,7 @@ def main():
         tag="RunPwnfriendScan(scan_mode, color);")
     steps += d
 
-    # Broadcast on every main() tick while in pwnfriend mode (and skip the rest,
-    # since broadcast() hops channels itself and the rx callback reports peers).
+    # broadcast on every main() tick in pwnfriend mode, skip the rest.
     t, d = insert_after(
         t,
         "void WiFiScan::main(uint32_t currentTime)\n{",
@@ -199,7 +193,7 @@ def main():
         tag="pwnfriend_obj.broadcast();")
     steps += d
 
-    # Let the sniffer callback process our mode, and branch to reportPeer.
+    # let the sniffer callback process our mode and branch to reportPeer.
     t, d = replace_once(
         t,
         "      (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWN)) {",
@@ -226,11 +220,9 @@ def main():
         tag="pwnfriend_obj.reportPeer(")
     steps += d
 
-    # 3b. Capture path: EAPOL/PMKID arrive as DATA frames. `filt` already passes
-    # DATA (WiFiScan.h: filt = MGMT|DATA), but beaconSnifferCallback only acts on
-    # MGMT frames. Handle pwnfriend DATA frames before the mgmt-only dispatch and
-    # append any EAPOL frame to the pcap so the capture is crackable offline.
-    # `len` here is still rx_ctrl.sig_len (un-decremented) — correct for DATA.
+    # 3b. capture path: EAPOL/PMKID come as DATA frames; beaconSnifferCallback only handles
+    # MGMT, so handle pwnfriend DATA first and append EAPOL to the pcap. len here is still
+    # rx_ctrl.sig_len (correct for DATA).
     t, d = insert_before(
         t,
         "  if ((wifi_scan_obj.currentScanMode == WIFI_SCAN_PROBE) ||",
@@ -256,10 +248,9 @@ def main():
         tag="pwnfriend_obj.reportHandshake(")
     steps += d
 
-    # 3c. Recon: dedup non-pwngrid beacons into PWNFRIEND_AP lines, and save the
-    # first beacon per AP to the pcap so its ESSID is in the 22000 hashline. Sits
-    # inside if(type==MGMT)->if(payload[0]==0x80), after the pwngrid mac_match
-    # return, so peers never reach it. `len` here is already FCS-stripped (-4).
+    # 3c. recon: dedup non-pwngrid beacons into PWNFRIEND_AP lines. sits inside
+    # if(type==MGMT)->if(payload[0]==0x80) after the pwngrid mac_match return, so peers
+    # never reach it. len here is FCS-stripped (-4).
     t, d = insert_before(
         t,
         "        if (wifi_scan_obj.currentScanMode == WIFI_SCAN_PWN) {",

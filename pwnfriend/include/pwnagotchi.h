@@ -18,8 +18,7 @@
 #define PWNAGOTCHI_APS_I 7
 #define PWNAGOTCHI_APS_J 30
 #define PWNAGOTCHI_UPTIME_I 7
-// UPTIME is drawn right-aligned to the screen edge (see pwnagotchi_draw_uptime), so
-// no fixed J is needed; a full hh:mm:ss can't overrun the edge or hit the AP count.
+// uptime is right-aligned (see pwnagotchi_draw_uptime), so no fixed J
 #define PWNAGOTCHI_LINE1_START_I 8
 #define PWNAGOTCHI_LINE1_START_J 0
 #define PWNAGOTCHI_LINE1_END_I 8
@@ -45,9 +44,7 @@
 
 #define PWNAGOTCHI_FONT FontSecondary
 
-/**
- * Enum to represent possible faces to save them locally rather than transmit every time
- */
+// faces, kept local rather than transmitted each time
 enum PwnagotchiFace {
     NoFace = 0,
     DefaultFace,
@@ -78,147 +75,32 @@ enum PwnagotchiFace {
     Upload2
 };
 
-
-/**
- * Enum for current mode of the pwnagotchi
- */
 enum PwnagotchiMode { PwnMode_Auto, PwnMode_Ai, PwnMode_Manual };
 
 typedef struct {
-    /// Current face
     enum PwnagotchiFace face;
-    /// CH channel display at top left
     FuriString* channel;
-    /// AP text shown at the top
     FuriString* apStat;
-    /// Uptime as text
     FuriString* uptime;
-    /// Hostname of the unit
     FuriString* hostname;
-    /// Message that is displayed
     FuriString* message;
-    /// LAST SSID and other handshake information for the bottom
-    FuriString* handshakes;
-    /// Current mode the pwnagotchi is in
+    FuriString* handshakes; // last ssid + handshake info (bottom)
     enum PwnagotchiMode mode;
-    /// Name and aps of friend
-    FuriString* friendStat;
-
+    FuriString* friendStat; // friend name + aps
 } Pwnagotchi;
 
-/**
- * @brief Allocates and constructs a pwnagotchi struct
- * 
- * @return Pwnagotchi* Constructed pwnagotchi pointer
- */
 Pwnagotchi* pwnagotchi_alloc();
-
-/**
- * @brief Destruct and free pwnagotchi
- * 
- * @param pwn Pwnagotchi to destruct
- */
 void pwnagotchi_free(Pwnagotchi* pwn);
-
-/**
- * Draw the default display with no additional information provided
- * 
- * @param pwn Pwnagotchi device to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_blank(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw the stored pwnagotchi's face on the device
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_face(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw the name of the pwnagotchi
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_name(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw channel on pwnagotchi
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_channel(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw aps on pwnagotchi
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_aps(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw uptime on pwnagotchi
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_uptime(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw lines on pwnagotchi
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_lines(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw friend of pwnagotchi on screen
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_friend(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw current mode of pwnagotchi
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_mode(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw the number of handshakes in the PWND portion as well as the last handshake
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_handshakes(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Draw the message that the pwnagotchi is showing on the screen
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_message(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Runs all drawing functions to update the screen completely
- * 
- * @param pwn Pwnagotchi to draw
- * @param canvas Canvas to draw on
- */
 void pwnagotchi_draw_all(Pwnagotchi* pwn, Canvas* canvas);
-
-/**
- * Clears the screen buffer of the pwnagotchi
- * 
- * @param pwn Pwn to clear
- */
 void pwnagotchi_screen_clear(Pwnagotchi* pwn);

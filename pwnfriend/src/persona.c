@@ -11,27 +11,20 @@
 #define PERSONA_DIR "/ext/apps_data/pwnfriend"
 #define PERSONA_PATH PERSONA_DIR "/persona.bin"
 
-// pwnagotchi's "lonely" is NOT peer-absence (a lone friend is the normal, intended
-// case) — it's staleness: is_stale() == epoch.num_missed > max_misses_for_recon,
-// i.e. it attacked APs this epoch and caught nothing ("agent missed N interactions
-// -> lonely"). We mirror that: misses past this threshold in an epoch -> lonely.
+// lonely is staleness, not peer-absence: attacked APs this epoch, caught nothing
+// (is_stale() == num_missed > max_misses_for_recon). misses past this -> lonely.
 #define PERSONA_MAX_MISSES 5 // personality.max_misses_for_recon
 
-// One "epoch" == one recon window. Upstream personality.recon_time = 30 s, so we
-// use the same wall-time per epoch: "num_epochs" here means the same as upstream.
+// one epoch == one recon window; same wall-time as upstream recon_time
 #define PERSONA_EPOCH_SECS 30 // personality.recon_time
 
-// max_inactive_scale / recon_inactive_multiplier: agent.recon() doubles recon_time
-// once inactive_for >= max_inactive_scale, so the friend slows its scanning when
-// nothing is happening. We mirror that by stretching the epoch window the same way,
-// which scales the wall-time onset of boredom/sadness exactly like upstream.
+// agent.recon() doubles recon_time once inactive_for >= max_inactive_scale; we stretch
+// the epoch window the same way, scaling boredom/sadness onset like upstream
 #define PERSONA_MAX_INACTIVE_SCALE 2 // personality.max_inactive_scale
 #define PERSONA_RECON_INACTIVE_MULT 2 // personality.recon_inactive_multiplier
 
-// Per-epoch activity thresholds (APs seen inside one epoch). Upstream's activity is
-// "did we deauth/assoc/handshake this epoch"; we proxy it with per-epoch AP volume
-// (min_rssi filtering stays in firmware, out of the brain).
-#define PERSONA_EPOCH_ACTIVE_APS 4 // >= this -> the epoch counts as "active"
+// per-epoch AP volume as a proxy for upstream's deauth/assoc/handshake activity
+#define PERSONA_EPOCH_ACTIVE_APS 4 // >= this -> epoch is "active"
 #define PERSONA_SMART_APS 8 // a flood this epoch -> SMART face
 
 // Consecutive-epoch thresholds (real pwnagotchi defaults.toml values).
@@ -43,9 +36,7 @@
 // Handshake streak inside one epoch that earns the COOL face.
 #define PERSONA_COOL_STREAK 4
 
-// How many fully-silent epochs (no APs/handshakes/misses) an engaged unit tolerates
-// before it's allowed to get bored/sad — so a busy hunt stays content but a truly
-// dead area still eventually bores it.
+// silent epochs an engaged unit tolerates before bored/sad is allowed to set in
 #define PERSONA_HUNT_PATIENCE 5
 
 // Time-based feels (seconds).
@@ -71,8 +62,7 @@ static void persona_gen_identity(char* out /* PERSONA_ID_HEX_LEN+1 */) {
     out[PERSONA_ID_HEX_LEN] = '\0';
 }
 
-// The display name shown on the mesh. Defaults to "flippy" for a fresh persona and
-// is user-editable (persona_set_name, persisted); the 64-hex identity is separate.
+// mesh display name; user-editable (persona_set_name), separate from the 64-hex identity
 #define PERSONA_DEFAULT_NAME "flippy"
 
 void persona_set_name(Persona* p, const char* name) {
@@ -91,9 +81,9 @@ static void persona_mint(Persona* p) {
     p->s.total_uptime = 0;
     p->s.friends_met = 0;
     p->s.generation = 0;
-    // memset above already zeroed the v2 counters and every volatile epoch field.
+    // memset above already zeroed v2 counters + every volatile epoch field
     p->mood = MoodContent; // AWAKE on start, like a real pwnagotchi
-    p->secs_since_peer = 0; // a grace window before it gets lonely
+    p->secs_since_peer = 0; // grace window before it gets lonely
 }
 
 Persona* persona_alloc(void) {
@@ -110,12 +100,11 @@ Persona* persona_alloc(void) {
            saved.version == PERSONA_SAVE_VERSION) {
             memset(p, 0, sizeof(Persona));
             p->s = saved;
-            // Guard against a corrupt name/identity from a truncated write.
+            // guard corrupt name/identity from a truncated write
             p->s.name[PERSONA_NAME_MAX - 1] = '\0';
             p->s.identity[PERSONA_ID_HEX_LEN] = '\0';
             if(!p->s.name[0]) persona_set_name(p, PERSONA_DEFAULT_NAME); // guard empty
-            // Keep the saved (user-chosen) name; identity stays as saved.
-            // The memset above zeroed every volatile epoch counter before p->s = saved.
+            // memset above zeroed every volatile epoch counter before p->s = saved
             p->mood = MoodContent;
             p->secs_since_peer = 0;
             loaded = true;
@@ -150,27 +139,22 @@ bool persona_save(Persona* p) {
     return ok;
 }
 
-// Current epoch length in seconds. Upstream agent.recon() doubles recon_time once
-// inactive_for >= max_inactive_scale; we stretch the epoch window identically so
-// the wall-time onset of boredom/sadness scales the same way it does upstream.
+// epoch length in seconds; doubles while inactive (mirrors recon_time doubling)
 static uint32_t persona_epoch_len(const Persona* p) {
     if(p->inactive_epochs >= PERSONA_MAX_INACTIVE_SCALE)
         return PERSONA_EPOCH_SECS * PERSONA_RECON_INACTIVE_MULT;
     return PERSONA_EPOCH_SECS;
 }
 
-// Close out the current epoch: classify it, roll the active/inactive streaks,
-// and reset the per-epoch tallies. Mirrors pwnagotchi Epoch.next(): an epoch is
-// "active" iff there was any activity OR a handshake, and inactive/active_for are
-// the consecutive streaks the mood machine reads.
+// close the epoch: classify, roll active/inactive streaks, reset tallies (Epoch.next).
+// active iff any activity or a handshake; the streaks drive the mood machine
 static void persona_end_epoch(Persona* p) {
     p->epoch++;
     p->s.epochs_tot++;
 
     bool got_hs = (p->hs_this_epoch > 0);
     bool active = got_hs || (p->aps_this_epoch >= PERSONA_EPOCH_ACTIVE_APS);
-    // Any traffic at all this epoch (fresh AP, capture, or miss) resets the quiet
-    // streak; a genuinely silent unit accrues quiet epochs.
+    // any traffic (AP/capture/miss) resets the quiet streak; silence accrues quiet epochs
     bool traffic = got_hs || (p->aps_this_epoch > 0) || (p->misses_this_epoch > 0);
     if(traffic)
         p->quiet_epochs = 0;
@@ -181,11 +165,8 @@ static void persona_end_epoch(Persona* p) {
         p->active_epochs++;
         p->inactive_epochs = 0;
     } else if(p->hunting && p->quiet_epochs < PERSONA_HUNT_PATIENCE) {
-        // Engaged (advertising + capture armed + APs around) and still seeing traffic
-        // recently: stay content, don't slide into bored/sad. The firmware reports each
-        // AP only once, so "new APs per epoch" dries up mid-hunt — this keeps the friend
-        // from going perma-sad. But once the area goes truly silent for PATIENCE epochs,
-        // boredom is allowed to set in (so bored/sad stay reachable).
+        // engaged + recent traffic: stay content (firmware reports each AP once, so
+        // per-epoch APs dry up mid-hunt); after PATIENCE silent epochs boredom is allowed
         p->active_epochs = 0;
         p->inactive_epochs = 0;
     } else {
@@ -193,9 +174,7 @@ static void persona_end_epoch(Persona* p) {
         p->inactive_epochs++;
     }
 
-    // Snapshot this epoch's misses so baseline_mood can render lonely for the next
-    // window (agent.next_epoch reads epoch.num_missed BEFORE resetting it), then
-    // clear the running tally for the new epoch.
+    // snapshot misses for next window's lonely (next_epoch reads num_missed before reset)
     p->last_epoch_missed = p->misses_this_epoch;
     p->misses_this_epoch = 0;
 
@@ -203,41 +182,33 @@ static void persona_end_epoch(Persona* p) {
     p->hs_this_epoch = 0;
 }
 
-// The steady-state mood when no transient reaction is being held. Mirrors the
-// dispatch in Automata.next_epoch(): the activity streak (active/inactive_for)
-// drives excited/bored/sad, and a good friend around turns any down epoch grateful
-// (upstream set_bored/set_sad/set_lonely all defer to set_grateful when the support
-// network is strong enough).
+// steady-state mood with no reaction held (Automata.next_epoch): activity streak drives
+// excited/bored/sad; a good friend nearby turns any down epoch grateful
 static PersonaMood persona_baseline_mood(const Persona* p) {
-    // The automata activity/social droughts. sad supersedes bored, both pure
-    // inactivity (Epoch.next); sleep is our friendlier stand-in for automata's
-    // set_angry escalation at inactive_for >= 2*sad_num_epochs. 'stale' is
-    // pwnagotchi's is_stale() — we attacked APs last epoch and caught nothing.
+    // sad supersedes bored (both pure inactivity); sleep stands in for automata's
+    // set_angry at 2x sad; stale = is_stale() (attacked last epoch, caught nothing)
     bool sleepy = (p->inactive_epochs >= PERSONA_SLEEP_EPOCHS);
     bool sad = (p->inactive_epochs >= PERSONA_SAD_EPOCHS);
     bool bored = (p->inactive_epochs >= PERSONA_BORED_EPOCHS);
     bool stale = (p->last_epoch_missed > PERSONA_MAX_MISSES);
     bool down = sleepy || sad || bored || stale;
 
-    // A good friend in range always wins: grateful on a bad day (the support-network
-    // override), bonded otherwise (on_new_peer picks the FRIEND face for a bond).
+    // a good friend in range wins: grateful on a down epoch, bonded otherwise
     if(p->friend_near) return down ? MoodGrateful : MoodBonded;
 
-    // Live activity this very epoch reacts fastest (per-epoch AP volume + the
-    // sustained excited from active_for >= excited_num_epochs).
+    // live activity this epoch reacts fastest (AP volume + sustained excited)
     if(p->aps_this_epoch >= PERSONA_SMART_APS) return MoodSmart;
     if(p->active_epochs >= PERSONA_EXCITED_EPOCHS) return MoodExcited;
     if(p->aps_this_epoch >= PERSONA_EPOCH_ACTIVE_APS) return MoodMotivated;
 
-    // Stale: kicked things all epoch, nothing bit -> lonely (agent.next_epoch's
-    // was_stale -> set_lonely). This is the real pwnagotchi 'lonely', and only ever
-    // fires in active/Deauth mode (passive never misses, so it's never lonely).
+    // stale -> lonely (was_stale -> set_lonely); only fires in active/Deauth mode
+    // (passive never misses)
     if(stale) return MoodLonely;
 
-    // A unit just dropped by -> curious (on_new_peer for a returning unit).
+    // a unit just dropped by -> curious (returning unit)
     if(p->secs_since_peer < PERSONA_CURIOUS_SECS) return MoodCurious;
 
-    // The slow decay: sleep (deep) > sad > bored, all pure inactivity.
+    // slow decay: sleep > sad > bored, all pure inactivity
     if(sleepy) return MoodSleep;
     if(sad) return MoodSad;
     if(bored) return MoodBored;
@@ -252,21 +223,19 @@ void persona_tick(Persona* p, uint32_t dt) {
     p->secs_since_pwnd += dt;
     p->secs_in_epoch += dt;
 
-    // Epoch boundary: score the window and roll the streak counters. The window
-    // stretches while inactive (persona_epoch_len), mirroring agent.recon()'s
-    // recon_time doubling.
+    // epoch boundary: score the window, roll the streaks (window stretches while inactive)
     if(p->secs_in_epoch >= persona_epoch_len(p)) {
         p->secs_in_epoch = 0;
         persona_end_epoch(p);
     }
 
-    // Decay a held transient reaction (capture / new-friend flash).
+    // decay a held transient reaction (capture / new-friend flash)
     if(p->mood_lock_secs > dt)
         p->mood_lock_secs -= dt;
     else
         p->mood_lock_secs = 0;
 
-    // While a reaction is held, keep it — otherwise settle to the baseline.
+    // hold a reaction while locked, else settle to the baseline
     if(p->mood_lock_secs == 0) p->mood = persona_baseline_mood(p);
 }
 
@@ -308,15 +277,12 @@ void persona_note_ap(Persona* p) {
     p->aps_session++;
     p->s.aps_tot++;
     p->aps_this_epoch++;
-    // No direct mood poke: persona_baseline_mood() reads aps_this_epoch each tick,
-    // so MOTIVATED/SMART surface within a second without flicker.
+    // no direct mood poke: baseline_mood reads aps_this_epoch each tick
 }
 
 void persona_note_miss(Persona* p) {
-    // Automata._on_miss -> view.on_miss: an interaction that hit nothing. Upstream
-    // flashes a face + "Missed!"; we hold a short DEMOTIVATED nudge, then settle back.
-    // The miss also feeds this epoch's tally: once it passes max_misses_for_recon
-    // the epoch is "stale" and baseline_mood settles to lonely (agent.next_epoch).
+    // _on_miss: an interaction hit nothing -> brief DEMOTIVATED. also feeds the epoch
+    // tally; past max_misses_for_recon the epoch is stale and baseline settles to lonely
     p->misses_this_epoch++;
     p->mood = MoodDemotivated;
     p->mood_lock_secs = PERSONA_MISS_REACT_SECS;
@@ -357,9 +323,7 @@ Face persona_face(const Persona* p) {
     }
 }
 
-// One representative line per mood, taken from pwnagotchi's voice.py (upstream
-// random-picks from a list; we keep the shortest faithful pick for the Flipper's
-// message area). The mapping follows view.py's face<->voice pairing.
+// one line per mood from pwnagotchi voice.py (shortest faithful pick); view.py face<->voice
 const char* persona_mood_label(const Persona* p) {
     switch(p->mood) {
     case MoodLonely:

@@ -1,18 +1,15 @@
-// Pure geo / identity helpers for pwnfriend — NO Flipper/Furi dependencies (only stdint,
-// stdbool, math), so they can be unit-tested on the host (see tests/test_geo.cpp). Anything
-// touching the model / SDK stays in pwnfriend_app.c.
+// pure geo/identity helpers — no Flipper/Furi deps, so host-testable (tests/test_geo.cpp).
+// anything touching the model/SDK stays in pwnfriend_app.c.
 #pragma once
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-// Cap the triangulation sample count so the running centroid sums can't grow without bound
-// (float rounding would otherwise slowly drift a long-lived estimate).
+// cap triangulation samples so centroid sums stay bounded (else float drift)
 #define LOC_SAMPLE_CAP 4000
 
-// Parse a decimal-degree string ("50.0784950" / "-14.42") without atof (no %f/newlib-nano
-// float-format dependency). Returns 1e9 on empty/NULL so callers can treat it as "unknown".
+// parse a decimal-degree string without atof (no %f/newlib-nano float dep). 1e9 = unknown.
 static inline float parse_deg(const char* s) {
     if(!s || !s[0]) return 1e9f;
     float sign = 1.0f, v = 0.0f;
@@ -39,8 +36,7 @@ static inline float parse_deg(const char* s) {
     return sign * v;
 }
 
-// Sanity-check a lat/lon string pair before we trust it: in-range, and not "null island"
-// (~0,0 — the classic no-fix GPS default, never a real location).
+// sanity-check a lat/lon pair: in-range and not null island (~0,0, the no-fix GPS default)
 static inline bool coord_ok(const char* lat, const char* lon) {
     float la = parse_deg(lat), lo = parse_deg(lon);
     if(la < -90.0f || la > 90.0f || lo < -180.0f || lo > 180.0f) return false;
@@ -48,17 +44,15 @@ static inline bool coord_ok(const char* lat, const char* lon) {
     return true;
 }
 
-// Approx great-circle distance in km (equirectangular projection, single precision — plenty
-// for the ~city-scale distances we show and the outlier guard).
+// approx great-circle km (equirectangular, single precision — fine for city-scale + outlier guard)
 static inline float geo_km(float lat1, float lon1, float lat2, float lon2) {
     float coslat = cosf(lat1 * 3.14159265f / 180.0f);
     float dn = lat2 - lat1, de = (lon2 - lon1) * coslat;
     return sqrtf(dn * dn + de * de) * 111.0f;
 }
 
-// A real pwngrid identity is exactly 64 hex chars (a SHA256 key fingerprint). A garbled or
-// truncated sniffed beacon parses into something else, so reject it (mirrors pwngrid's own
-// ^[a-fA-F0-9]{64}$ gate) — a mis-parse can't then spawn a bogus peer.
+// a real pwngrid identity is exactly 64 hex (SHA256 fingerprint); reject anything else
+// (pwngrid's ^[a-fA-F0-9]{64}$ gate) so a mis-parsed beacon can't spawn a bogus peer
 static inline bool identity_is_64hex(const char* s) {
     int n = 0;
     for(; s[n]; n++) {
@@ -70,10 +64,8 @@ static inline bool identity_is_64hex(const char* s) {
     return n == 64;
 }
 
-// Fold one geotagged sighting into a running RSSI-weighted centroid (weighted-centroid
-// localization). Stronger signal -> more weight -> the estimate leans toward closest
-// approach; averaging cancels per-sample GPS jitter. O(1) storage. rssi==0 (absent) is
-// skipped, and accumulation stops at LOC_SAMPLE_CAP to bound float drift.
+// fold a geotagged sighting into a running RSSI-weighted centroid: stronger signal -> more
+// weight; averaging cancels GPS jitter. O(1). rssi==0 skipped, capped at LOC_SAMPLE_CAP.
 static inline void loc_accumulate(
     uint16_t* n, float* w_sum, float* wlat_sum, float* wlon_sum, float lat, float lon, int rssi) {
     if(rssi == 0) return;
@@ -86,8 +78,8 @@ static inline void loc_accumulate(
     if(*n < 0xFFFF) (*n)++;
 }
 
-// Best position estimate: the weighted centroid once we have >=2 samples and triangulation
-// is enabled, else the single strongest fix (fix_lat 1e9 = none). Returns false if no loc.
+// best position: weighted centroid with >=2 samples + triangulation on, else the strongest
+// fix (fix_lat 1e9 = none). false if no loc.
 static inline bool loc_estimate(
     bool tri, uint16_t n, float w_sum, float wlat_sum, float wlon_sum, float fix_lat,
     float fix_lon, float* out_lat, float* out_lon) {

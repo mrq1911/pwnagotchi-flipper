@@ -3,10 +3,8 @@
 #include <furi.h>
 #include "face.h"
 
-// The Flipper friend's identity and how it grows. Persisted to SD so the friend
-// remembers who it is (stable pwngrid identity => the pwnagotchi keeps counting
-// encounters and eventually treats it as a "good friend").
-
+// the friend's identity and how it grows; persisted to SD so a stable pwngrid identity
+// lets the pwnagotchi keep counting encounters and eventually treat it as a good friend
 #define PERSONA_NAME_MAX 17
 #define PERSONA_ID_HEX_LEN 64
 
@@ -30,9 +28,8 @@ typedef enum {
     MoodDemotivated, // a deauth/assoc that missed (DEMOTIVATED face)
 } PersonaMood;
 
-// Persisted-to-SD portion. Fixed layout; bump PERSONA_SAVE_VERSION on change.
-// Appending fields changes sizeof(), and the loader rejects any blob whose size
-// or version doesn't match — so a v1 file is cleanly discarded (a one-time reset).
+// persisted-to-SD portion; fixed layout, bump PERSONA_SAVE_VERSION on change. loader
+// rejects any blob whose size/version differs, so an old file is cleanly discarded
 #define PERSONA_SAVE_MAGIC 0x50574E46u // "PWNF"
 #define PERSONA_SAVE_VERSION 2
 
@@ -94,21 +91,16 @@ void persona_set_name(Persona* p, const char* name);
 // Advance one tick. dt = seconds elapsed. Recomputes mood/face.
 void persona_tick(Persona* p, uint32_t dt);
 
-// Note that a unit was heard this tick. `is_new` if not seen before this session,
-// `is_bonded` if it's a good friend (met many times / high encounter count).
+// unit heard this tick. is_new if unseen this session, is_bonded if a good friend.
 void persona_note_peer(Persona* p, bool is_new, bool is_bonded);
 
-// Note that a real WPA handshake / PMKID was captured this tick. Bumps
-// pwnd_run/pwnd_tot, flashes the capture face, feeds the epoch machine.
+// real WPA handshake/PMKID captured; bumps pwnd counters, flashes face, feeds epochs.
 void persona_note_pwnd(Persona* p);
 
-// Note that an access point was seen this tick. Feeds aps_session and the
-// epoch's activity signal (drives MOTIVATED/SMART).
+// access point seen; feeds aps_session + epoch activity (MOTIVATED/SMART).
 void persona_note_ap(Persona* p);
 
-// Note that a deauth/assoc attempt yielded nothing (the target went out of range).
-// Mirrors pwnagotchi Automata._on_miss / view.on_miss: a brief demotivated nudge.
-// Optional to call — the firmware wires it when an interaction misses.
+// deauth/assoc caught nothing (_on_miss): a brief demotivated nudge. optional.
 void persona_note_miss(Persona* p);
 
 // Derived getters.

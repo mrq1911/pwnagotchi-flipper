@@ -4,8 +4,7 @@
 #include <furi_hal_rtc.h>
 #include <string.h>
 
-// 24-byte classic pcap global header, little-endian, linktype 105. Byte layout
-// mirrors Marauder's Buffer.cpp so the two produce interchangeable files.
+// 24-byte classic pcap global header, LE, linktype 105 — byte-for-byte Marauder's Buffer.cpp
 static void pcap_global_header(uint8_t hdr[24]) {
     uint32_t magic = 0xa1b2c3d4;
     uint16_t vmaj = 2, vmin = 4;
@@ -22,7 +21,7 @@ static void pcap_global_header(uint8_t hdr[24]) {
     memcpy(hdr + 20, &linktype, 4);
 }
 
-// 16-byte per-packet record header: ts_sec, ts_usec, incl_len, orig_len (LE).
+// 16-byte record header: ts_sec, ts_usec, incl_len, orig_len (LE)
 static void pcap_record_header(uint8_t rh[16], uint32_t sec, uint32_t usec, uint32_t len) {
     memcpy(rh + 0, &sec, 4);
     memcpy(rh + 4, &usec, 4);
@@ -47,7 +46,7 @@ bool pcap_append_frame(Storage* storage, const char* name, const uint8_t* frame,
     }
     if(ok) {
         uint32_t sec = furi_hal_rtc_get_timestamp();
-        uint32_t usec = 0; // RTC is 1 Hz; sub-second isn't needed for cracking
+        uint32_t usec = 0; // RTC is 1 Hz; sub-second not needed for cracking
         uint8_t rh[16];
         pcap_record_header(rh, sec, usec, len);
         ok = storage_file_write(f, rh, sizeof(rh)) == sizeof(rh);

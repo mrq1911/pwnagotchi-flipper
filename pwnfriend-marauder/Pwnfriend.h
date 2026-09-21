@@ -1,37 +1,26 @@
 // Pwnfriend — pwngrid advertisement broadcaster for ESP32 Marauder.
 //
-// Turns the Flipper's Wi-Fi board into a social pwngrid peer: it broadcasts a
-// Pwnagotchi-compatible beacon (source MAC de:ad:be:ef:de:ad, JSON persona in
-// vendor IE 222) so a nearby Pwnagotchi detects it, greets it, and — thanks to a
-// stable identity — counts encounters and befriends it over time.
-//
-// This is a self-contained module. It only reaches into Marauder for the raw
-// 802.11 TX primitive; everything else (frame building, persona, channel hop,
-// peer reporting) lives here to keep the fork's merge surface tiny. See
-// PATCH.md for the handful of insertion points into WiFiScan.
-//
-// Wire format reference: ../doc/PwnfriendProtocol.md
+// Broadcasts a Pwnagotchi-compatible beacon (MAC de:ad:be:ef:de:ad, JSON persona
+// in vendor IE 222) so a nearby Pwnagotchi detects, greets, and befriends it.
+// Self-contained: only reaches into Marauder for the raw 802.11 TX primitive.
+// See PATCH.md for insertion points; wire format: ../doc/PwnfriendProtocol.md
 
 #pragma once
 
-// pwnfriend serial-protocol version, stamped on every PWNFRIEND_ADV line (ver=N) so
-// the Flipper app can warn when the flashed firmware is older than it needs. Bump on
-// any protocol change. v2 = dwell recon + unicast/repeat deauth + PMKID auth + ESSID
-// embed + target/whitelist/recon/assoc flags. v3 = live RSSI refresh (PWNFRIEND_RSSI).
-// v4 = per-epoch telemetry (PWNFRIEND_EPOCH) + capture provenance (via=) + floor-free
-// PMKID solicitation.
+// serial-protocol version, stamped on PWNFRIEND_ADV (ver=N) so the Flipper warns on
+// stale firmware. bump on any protocol change. v2=dwell recon+unicast/repeat deauth+
+// PMKID auth+ESSID embed+flags; v3=live RSSI (PWNFRIEND_RSSI); v4=epoch telemetry+
+// provenance (via=)+floor-free PMKID.
 #define PWNFRIEND_PROTO 4
 
-// Min interval between PWNFRIEND_RSSI updates for one AP, so re-heard beacons refresh
-// the signal without flooding the serial link.
+// min interval between PWNFRIEND_RSSI updates per AP, so re-heard beacons don't flood serial.
 #define PWNFRIEND_RSSI_EMIT_MS 3000
 
 #include <Arduino.h>
 #include <esp_wifi.h>
 #include <LinkedList.h>
 
-// Provided by Marauder (declared in WiFiScan.h). Redeclared here so the module
-// compiles even if included before that header.
+// provided by Marauder (WiFiScan.h); redeclared so we compile if included first.
 extern "C" esp_err_t esp_wifi_80211_tx(wifi_interface_t ifx, const void* buffer,
                                        int len, bool en_sys_seq);
 
@@ -39,57 +28,42 @@ class Pwnfriend {
   public:
     Pwnfriend();
 
-    // Parse a `pwnfriend ...` CLI line (already tokenised by Marauder's
-    // CommandLine into argv/argc) and load it into the live persona. Missing
-    // args keep their previous / default value. Returns false only on a
-    // malformed identity.
+    // parse a tokenised `pwnfriend ...` CLI line into the live persona; missing
+    // args keep their value. false only on a malformed identity.
     bool configureFromArgs(LinkedList<String>* args);
 
-    // Rebuild the beacon frame from the current persona. Call after any persona
-    // change. Cheap; also called lazily by broadcast().
+    // rebuild the beacon frame from the persona; call after any change (also called by broadcast()).
     void rebuild();
 
-    // Hop to the next broadcast channel (or the pinned one) and transmit the
-    // persona beacon a few times. Call this on a timer from WiFiScan::main().
+    // hop/pin channel and transmit the persona beacon a few times; call on a timer from WiFiScan::main().
     void broadcast();
 
-    // Emit one PWNFRIEND_PEER line for a sniffed Pwnagotchi beacon. `payload`
-    // is the raw 802.11 frame, `rssi`/`channel` come from the rx metadata.
-    // `has_fix`/`lat`/`lon` geotag the line so the Flipper can log where each
-    // sighting was heard (RSSI + position → triangulate the friend offline).
+    // emit one PWNFRIEND_PEER line for a sniffed Pwnagotchi beacon. has_fix/lat/lon
+    // geotag the sighting (RSSI + position -> triangulate offline).
     void reportPeer(const uint8_t* payload, int length, int rssi, int channel,
                     bool has_fix, double lat, double lon);
 
-    // Capture path (called from the pwnfriend rx callback on DATA frames).
-    // Detects a crackable EAPOL M2 handshake or an RSN PMKID (M1) and, once per
-    // BSSID this session, emits a PWNFRIEND_PWND line. Streams every EAPOL frame
-    // to the Flipper as a self-describing PWNFRIEND_HS <bssid> <hex> line so it
-    // is filed under the right per-BSSID pcap. `payload` is the raw 802.11 frame,
-    // `length` is rx_ctrl.sig_len. `has_fix`/`lat`/`lon` geotag the PWND line when
-    // the GPS has a fix. Returns true if the frame was EAPOL (so the caller should
-    // append it to the on-board pcap too).
+    // capture path (rx callback, DATA frames). detects EAPOL M2 / RSN PMKID (M1) and
+    // emits PWNFRIEND_PWND once per BSSID; streams every EAPOL frame as a self-describing
+    // PWNFRIEND_HS line. returns true if EAPOL (caller appends to pcap).
     bool reportHandshake(const uint8_t* payload, int length, int rssi, int channel,
                          bool has_fix, double lat, double lon);
 
-    // Recon: dedup a non-pwngrid beacon into one PWNFRIEND_AP line per BSSID, and
-    // stream that first beacon to the Flipper as a PWNFRIEND_HS line so the pcap
-    // carries the ESSID (a mandatory 22000 field). `has_fix`/`lat`/`lon` geotag
-    // the AP line when the GPS has a fix. Returns true the first time a BSSID is
-    // stored (append the beacon to the on-board pcap then).
+    // recon: dedup a non-pwngrid beacon into one PWNFRIEND_AP line per BSSID.
+    // has_fix/lat/lon geotag the AP line. returns true the first time a BSSID is
+    // stored (append beacon to pcap then).
     bool reportAP(const uint8_t* payload, int length, int rssi, int channel,
                   bool has_fix, double lat, double lon);
 
-    // Recon: harvest a client station from a DATA frame (the non-BSSID address of
-    // an AP we already know) into the client table, so active mode can deauth it by
-    // UNICAST. Called from the rx callback on every DATA frame; allocation-free.
+    // recon: harvest a client STA (non-BSSID address of a known AP) for unicast deauth.
+    // rx callback, every DATA frame, allocation-free.
     void reportClient(const uint8_t* payload, int length);
 
-    // True once a persona has been loaded (so broadcast() has something to send).
+    // true once a persona is loaded.
     bool ready() const { return _ready; }
 
-    // Clear the per-session capture dedup tables. Called at real scan start
-    // (RunPwnfriendScan), NOT on a persona refresh — so re-sending the pwnfriend
-    // command every 15s doesn't re-count already-pwnd APs and inflate pwnd_tot.
+    // clear per-session dedup tables. at scan start only, NOT on the 15s persona
+    // refresh (else re-counts pwnd APs, inflates pwnd_tot).
     void beginSession() {
         _n_recon = 0;
         _n_pwnd_seen = 0;
@@ -131,12 +105,9 @@ class Pwnfriend {
     uint32_t _sent;
     uint32_t _last_active_ms;  // throttle for the pinned-channel active burst
 
-    // --- pwnagotchi-faithful recon/attack dwell (agent.py's epoch loop) ---
-    // RECON sweeps every channel for recon_time gathering APs (and being heard on
-    // the mesh); ATTACK then visits each AP-bearing channel, fires associate()+
-    // deauth() once, and DWELLS hop_recon_time on it so the solicited 4-way
-    // handshake actually completes before we hop away. The old blind 500ms hop is
-    // exactly why nothing was ever captured.
+    // pwnagotchi-faithful recon/attack epoch loop. RECON sweeps all channels gathering
+    // APs; ATTACK visits each AP-bearing channel, fires assoc+deauth once, and dwells so
+    // the 4-way completes before hopping.
     enum Phase { PHASE_RECON, PHASE_ATTACK };
     Phase    _phase;
     uint32_t _phase_ms;        // millis() when the phase / channel dwell began
@@ -160,9 +131,8 @@ class Pwnfriend {
     uint16_t _ep_hs, _ep_pmkid, _ep_miss;        // outcomes this epoch
     uint16_t _ep_dpmf, _ep_dnocli;               // deauths skipped: PMF-protected / no client
 
-    // Targeting + whitelist (set from the Flipper's options menu). When a target is
-    // set, only that BSSID is attacked (the attack list collapses to its channel);
-    // whitelisted BSSIDs are never attacked (but still recon'd/reported).
+    // targeting + whitelist. target set -> only that BSSID attacked; whitelisted BSSIDs
+    // never attacked (still recon'd).
     bool     _target_set;
     uint8_t  _target[6];
     static const int MAX_WL = 16;
@@ -180,22 +150,19 @@ class Pwnfriend {
         bool pmf;        // 802.11w PMF required (RSN MFPR) -> deauth is futile, PMKID only
         uint32_t last_rssi_ms; // millis() of the last PWNFRIEND_RSSI we streamed for it
     };
-    // A dense area easily tops 80 APs; 64 silently dropped ~16 of them (never
-    // recon'd, never attacked). 128 covers a busy neighbourhood.
+    // dense areas top 80 APs; 64 dropped ~16. 128 covers a busy neighbourhood.
     static const int MAX_RECON = 128;
     static const int MAX_PWND  = 128;
     static const int MAX_STA   = 128;   // client stations tracked for unicast deauth
-    // Active-mode bursts against an AP with no capture before it counts as a
-    // "miss" (pwnagotchi's on_miss).
+    // active-mode bursts with no capture before it's a "miss" (pwnagotchi on_miss).
     static const int MISS_ATTEMPTS = 4;
     ReconAP  _recon[MAX_RECON];
     int      _n_recon;
     uint8_t  _pwnd_seen[MAX_PWND][6];
     int      _n_pwnd_seen;
 
-    // Client stations sniffed from DATA frames, so we can deauth them by UNICAST
-    // (spoofing both directions) the way pwnagotchi/bettercap does — broadcast
-    // deauth is ignored by modern clients, which is why yield was so low.
+    // client stations sniffed from DATA frames for unicast deauth (both directions);
+    // broadcast deauth is ignored by modern clients.
     struct ClientSta {
         uint8_t mac[6];
         uint8_t ap_idx;      // index into _recon of the AP this client belongs to
@@ -215,11 +182,9 @@ class Pwnfriend {
     bool deauthable(const ReconAP& ap) const;  // + strong enough to bother deauthing (RSSI floor)
     bool hasClient(int ap_idx) const;           // a fresh associated client -> deauth can work
     bool isWhitelisted(const uint8_t* bssid) const;
-    // Directed probe request (wildcard SSID) to make a nameless AP reveal its ESSID,
-    // so a keymat-only capture can still be cracked (hcxdumptool-style).
+    // directed wildcard-SSID probe to make a nameless AP reveal its ESSID.
     void probeAP(const uint8_t* bssid);
-    // Clients older than this (no data frame seen) are treated as gone: don't deauth
-    // an AP on their behalf.
+    // clients older than this are treated as gone.
     static const uint32_t STA_TTL_MS = 180000;
 
     int  reconIndex(const uint8_t* bssid) const;   // -1 if unseen
@@ -229,27 +194,18 @@ class Pwnfriend {
                   const char* type, int channel, int rssi,
                   bool has_fix, double lat, double lon, bool active);
     void deauthAP(const uint8_t* bssid);
-    // Unicast deauth of one client, spoofed in BOTH directions (AP->client and
-    // client->AP) — the effective form modern clients honour, mirroring bettercap's
-    // wifi.deauth (and Marauder's sendDeauthFrame).
+    // unicast deauth of one client, spoofed BOTH directions — the form modern clients honour.
     void deauthClient(const uint8_t* bssid, const uint8_t* client);
-    // Send a WPA2 association request to a target AP to solicit its RSN PMKID
-    // (EAPOL M1) — pwnagotchi's associate() half, no client needed. Prefixed by an
-    // open-system Authentication so the AP actually processes it. Only fired in
-    // active mode (the -deauth opt-in), same as deauthAP.
+    // WPA2 assoc-request to solicit the RSN PMKID (EAPOL M1); no client needed. prefixed
+    // by open-system auth so the AP processes it.
     void assocAP(const uint8_t* bssid, const char* ssid);
-    // Emit one self-describing "PWNFRIEND_HS <bssid12hex> <framehex>" line for a
-    // raw 802.11 frame. The Flipper files the frame under <bssid>.pcap by parsing
-    // this line alone (no dependence on a preceding PWND). Raw binary would trip
-    // the CLI's CR/XON handling, so we stream lowercase hex.
+    // emit one self-describing "PWNFRIEND_HS <bssid> <hex>" line; Flipper files it under
+    // <bssid>.pcap from this line alone. hex because raw binary trips the CLI's CR/XON handling.
     void streamFrameHex(const uint8_t* bssid, const uint8_t* frame, int length);
-    // On capture, synthesize a minimal beacon carrying the AP's ESSID and stream it
-    // into the same per-BSSID pcap. hcxpcapngtool/hashcat need the ESSID in the file;
-    // when we caught the EAPOL as DATA frames but never sniffed/kept the real beacon
-    // (e.g. table was full, or a cross-session file), the capture was uncrackable
-    // without this. No-op if the SSID is unknown/hidden.
+    // on capture, synthesize a minimal ESSID-bearing beacon into the same pcap: hashcat
+    // needs the ESSID, and EAPOL-as-DATA caps otherwise lack it. no-op if SSID unknown.
     void streamSyntheticBeacon(const uint8_t* bssid, const char* ssid);
 };
 
-// Map a face index (matching flipagotchi's enum PwnagotchiFace) to a glyph.
+// map a face index (flipagotchi's PwnagotchiFace) to a glyph.
 const char* pwnfriend_face_glyph(int idx);

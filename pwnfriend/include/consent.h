@@ -3,10 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// One-time, persisted acknowledgement that handshake capture / deauth is only
-// for networks the operator owns or is authorized to test. Stored SEPARATELY
-// from the persona so a persona reset never silently re-arms capture, and so
-// bumping the warning text force-re-prompts.
+// one-time persisted "authorized to test only" acknowledgement. stored separately from
+// the persona so a persona reset never re-arms capture; bumping the text re-prompts.
 #define PWNFRIEND_CONSENT_PATH "/ext/apps_data/pwnfriend/capture_consent.bin"
 #define PWNFRIEND_CONSENT_MAGIC 0x50574343u // "PWCC"
 #define PWNFRIEND_CONSENT_VERSION 1 // bump when the warning text changes

@@ -15,11 +15,9 @@ https://github.com/RogueMaster/flipperzero-firmware-wPlugins/commit/8c45f8e9a921
 Pwnagotchi* pwnagotchi_alloc() {
     Pwnagotchi* pwn = malloc(sizeof(Pwnagotchi));
 
-    // Set numbered values
     pwn->face = Cool;
     pwn->mode = PwnMode_Manual;
 
-    // Set string values to initial
     pwn->channel = furi_string_alloc_set_str(CHANNEL_DEFAULT_TEXT);
     pwn->apStat = furi_string_alloc_set_str(AP_STAT_DEFAULT_TEXT);
     pwn->uptime = furi_string_alloc_set_str(UPTIME_DEFAULT_TEXT);
@@ -37,7 +35,6 @@ void pwnagotchi_draw_face(Pwnagotchi* pwn, Canvas* canvas) {
 
     switch(pwn->face) {
     case NoFace:
-        // Draw nothing
         draw = false;
         break;
     case DefaultFace:
@@ -127,15 +124,7 @@ void pwnagotchi_draw_face(Pwnagotchi* pwn, Canvas* canvas) {
     }
 }
 
-/**
- * Function to draw a generic string with a preceder and data
- * 
- * @param preceder Preceding characters in the string
- * @param info Actual string from pwnagotchi to print
- * @param i_pos Position in the i direction to start printing
- * @param j_pos Position in the j direction to start printing
- * @param canvas Pointer to the canvas to draw on
-*/
+// draw "<preceder><info>" at (j_pos, i_pos)
 static void pwnagotchi_draw_str(char* preceder, FuriString* info, const unsigned int i_pos,
                                 const unsigned int j_pos, Canvas* canvas) {
     FuriString* formatTemp = furi_string_alloc_printf("%s%s", preceder, furi_string_get_cstr(info));
@@ -163,8 +152,7 @@ void pwnagotchi_draw_aps(Pwnagotchi* pwn, Canvas* canvas) {
 }
 
 void pwnagotchi_draw_uptime(Pwnagotchi* pwn, Canvas* canvas) {
-    // Right-aligned to the screen edge so a full hh:mm:ss (even 3-digit hours) can
-    // neither run off the right nor collide with the AP count to its left.
+    // right-aligned so a full hh:mm:ss can't overrun the edge or hit the AP count
     FuriString* tmp = furi_string_alloc_printf("BAT %s", furi_string_get_cstr(pwn->uptime));
     canvas_set_font(canvas, PWNAGOTCHI_FONT);
     uint16_t w = canvas_string_width(canvas, furi_string_get_cstr(tmp));
@@ -197,14 +185,12 @@ void pwnagotchi_draw_handshakes(Pwnagotchi* pwn, Canvas* canvas) {
 }
 
 void pwnagotchi_draw_friend(Pwnagotchi* pwn, Canvas* canvas) {
-    // The closest detected unit, shown in the bottom-left friend slot as
-    // "<face> <bars> name pwnd" — the pwnagotchi's own friend readout.
+    // closest unit, bottom-left slot: "<face> <bars> name pwnd"
     if(furi_string_empty(pwn->friendStat)) {
         return;
     }
     canvas_set_font(canvas, PWNAGOTCHI_FONT);
-    // A compact ASCII face for the friend. Real pwngrid faces are unicode the Flipper font
-    // can't render, and the full face icons don't fit this corner, so we use a small stand-in.
+    // ascii stand-in: real pwngrid faces are unrenderable unicode, icons don't fit the corner
     canvas_draw_str(canvas, PWNAGOTCHI_FRIEND_FACE_J, PWNAGOTCHI_FRIEND_FACE_I, "^_^");
     canvas_draw_str(
         canvas,
@@ -228,33 +214,30 @@ void pwnagotchi_draw_mode(Pwnagotchi* pwn, Canvas* canvas) {
     }
 }
 
-// Greedy word-wrap the message into the region right of the face (x = MESSAGE_J), up to a
-// few lines. The old stock version memcpy'd a fixed charSpaces+2 slab regardless of the
-// message length and then cut at the first space in the (over-read) buffer — so a short
-// message like "6 shakes!" collapsed to "6" and "Hack the planet!" lost "planet!". This
-// measures by pixel width and never reads past the string.
+// greedy pixel-width word-wrap right of the face; never over-reads (old version truncated
+// short messages by cutting a fixed over-read slab at the first space)
 void pwnagotchi_draw_message(Pwnagotchi* pwn, Canvas* canvas) {
     canvas_set_font(canvas, FontSecondary);
     const char* msg = furi_string_get_cstr(pwn->message);
     const int x = PWNAGOTCHI_MESSAGE_J;
-    const int maxw = FLIPPER_SCREEN_WIDTH - x - 1; // px available per line
-    const int step = 9; // row pitch (matches the home stat panel)
+    const int maxw = FLIPPER_SCREEN_WIDTH - x - 1; // px per line
+    const int step = 9; // row pitch
     const int maxlines = 4;
     int y = PWNAGOTCHI_MESSAGE_I;
     int drawn = 0;
     char line[48];
-    size_t ll = 0; // chars in the current line
+    size_t ll = 0;
     line[0] = '\0';
 
     const char* p = msg;
     while(*p && drawn < maxlines) {
-        while(*p == ' ') p++; // skip the run of spaces between words
+        while(*p == ' ') p++; // skip spaces between words
         if(!*p) break;
         const char* ws = p;
         while(*p && *p != ' ') p++; // [ws, p) is one word
         size_t wlen = (size_t)(p - ws);
 
-        // Build "line + space + word" and see if it still fits.
+        // does "line + space + word" still fit?
         char cand[48];
         size_t cl = 0;
         if(ll > 0) {
@@ -269,7 +252,7 @@ void pwnagotchi_draw_message(Pwnagotchi* pwn, Canvas* canvas) {
         cand[cl] = '\0';
 
         if(ll > 0 && (int)canvas_string_width(canvas, cand) > maxw) {
-            // Doesn't fit: flush the current line, start a fresh one with this word.
+            // doesn't fit: flush line, start fresh with this word
             canvas_draw_str(canvas, x, y, line);
             y += step;
             if(++drawn >= maxlines) return;

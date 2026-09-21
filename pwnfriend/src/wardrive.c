@@ -6,14 +6,14 @@
 #include <stdio.h>
 #include <string.h>
 
-// WiGLE 1.4 pre-header + column header, written once when the file is created.
+// WiGLE 1.4 pre-header + column header, written once on file creation
 static const char* WARDRIVE_PREHEADER =
     "WigleWifi-1.4,appRelease=pwnfriend,model=Flipper Zero,release=1.0,"
     "device=esp32-marauder,display=,board=Feberis,brand=pwnagotchi-flipper\n"
     "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,"
     "AltitudeMeters,AccuracyMeters,Type\n";
 
-// FirstSeen as WiGLE's "yyyy-MM-dd HH:mm:ss" from the RTC.
+// FirstSeen as WiGLE "yyyy-MM-dd HH:mm:ss" from the RTC
 static void wardrive_now_str(char* out, size_t out_sz) {
     DateTime dt;
     furi_hal_rtc_get_datetime(&dt);
@@ -29,8 +29,7 @@ static void wardrive_now_str(char* out, size_t out_sz) {
         (unsigned)dt.second);
 }
 
-// Copy `in` into a CSV-quoted field ("..."), doubling any embedded quotes, so a
-// comma/quote in an ESSID can't shift the columns. Always emits the quotes.
+// CSV-quote `in`, doubling embedded quotes, so a comma/quote in an ESSID can't shift columns
 static void wardrive_quote(char* out, size_t out_sz, const char* in) {
     size_t n = 0;
     if(out_sz < 3) {

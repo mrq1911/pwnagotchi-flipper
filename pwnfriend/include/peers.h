@@ -2,19 +2,15 @@
 
 #include <furi.h>
 
-// The other pwnagotchis this friend can currently hear, as reported by the ESP32
-// over serial (PWNFRIEND_PEER lines).
-
+// pwnagotchis this friend can currently hear (ESP32 PWNFRIEND_PEER lines).
 #define PEER_NAME_MAX 17
 #define PEER_ID_MAX 65
 #define MAX_PEERS 8
 
-// A peer counts as a "good friend" once we've kept hearing it for this long — a
-// lingering buddy, not a passer-by. Drives the bonded (<3) mood.
+// heard this long -> a lingering buddy, not a passer-by; drives the bonded mood
 #define PEER_BONDED_AFTER_SECS 60
-// Drop a peer we haven't heard from in this long. Very generous: during an attack dwell we
-// sit off the peer's channel for a long stretch (only the periodic all-channel advertise
-// sweep briefly revisits it), so a shorter TTL made a still-present friend blink out.
+// generous TTL: a peer's only heard when our hop lands on its channel, so during an
+// attack dwell we're off-channel for long stretches — a shorter TTL blinked friends out
 #define PEER_TTL_SECS 180
 
 typedef struct {
@@ -24,8 +20,8 @@ typedef struct {
     int pwnd_tot;
     int rssi;
     int channel;
-    uint32_t first_seen; // app tick (seconds) first heard this session
-    uint32_t last_seen; // app tick (seconds) last heard
+    uint32_t first_seen; // app secs tick, first heard this session
+    uint32_t last_seen; // app secs tick, last heard
 } Peer;
 
 typedef struct {
