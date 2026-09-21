@@ -201,7 +201,6 @@ typedef struct {
     // every AP seen this session (the browser reads this)
     ApRec aps[AP_MAX];
     uint16_t ap_count;
-    bool ap_overflow; // hit AP_MAX and recycling -> show "N+"
     uint32_t ap_seq; // monotonic, stamped into ApRec.first_seq
     uint32_t ap_seen_tick[AP_MAX]; // tick_secs each AP was last heard (0 = not this session)
     uint32_t ap_track_tick[AP_MAX]; // tick each AP last wrote ap_track.csv (throttle)
@@ -659,7 +658,6 @@ static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
                 if(model->ap_seen_tick[k] < model->ap_seen_tick[victim]) victim = (int)k;
         }
         i = victim;
-        model->ap_overflow = true;
     } else {
         i = (int)model->ap_count++;
     }
@@ -1774,9 +1772,8 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
         // OK-activated rows: a plain right-aligned value (count / name / hint).
         case MenuPwnedAps: label = "Pwned APs"; snprintf(value, sizeof(value), "%u", pwned); break;
         case MenuAllAps:
-            label = "All APs";
-            snprintf(
-                value, sizeof(value), "%u%s", model->ap_count, model->ap_overflow ? "+" : "");
+            label = "Recent APs";
+            snprintf(value, sizeof(value), "%u", model->ap_count);
             break;
         case MenuWhitelist: label = "Ignore"; snprintf(value, sizeof(value), "%u", wl); break;
         case MenuFriends:
@@ -1793,7 +1790,7 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
                     tn = model->aps[i].ssid[0] ? model->aps[i].ssid : model->aps[i].bssid;
                     break;
                 }
-            snprintf(value, sizeof(value), "%.14s", tn ? tn : "none"); // clear it with OK
+            snprintf(value, sizeof(value), "%.14s", tn ? tn : "*"); // clear it with OK
             break;
         }
         case MenuStats: label = "Stats"; break;
@@ -1865,14 +1862,11 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
         title, sizeof(title), "%s",
         model->list_filter == FilterPwned    ? "PWNED APS" :
         model->list_filter == FilterWhitelist ? "IGNORED" :
-                                                "ALL APS");
+                                                "RECENT APS");
     uint16_t idx[AP_MAX];
     uint16_t n = ap_filtered(model, idx);
     char hint[10];
-    // "N+" on the All view once we've started recycling (more seen than the table holds).
-    snprintf(
-        hint, sizeof(hint), "%u%s", n,
-        (model->list_filter == FilterAll && model->ap_overflow) ? "+" : "");
+    snprintf(hint, sizeof(hint), "%u", n);
     draw_titlebar(canvas, title, hint);
     canvas_set_font(canvas, FontSecondary);
     if(n == 0) {
@@ -3138,7 +3132,6 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->last_pwnd_ssid[0] = '\0';
             model->pwnd_seen_count = 0;
             model->ap_count = 0;
-            model->ap_overflow = false;
             model->ap_seq = 1;
             // init per-AP session arrays for every slot (loaded APs skip ap_get)
             for(uint16_t i = 0; i < AP_MAX; i++) {
