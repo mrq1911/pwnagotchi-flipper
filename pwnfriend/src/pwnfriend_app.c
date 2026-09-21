@@ -268,6 +268,7 @@ typedef struct {
     uint32_t confirm_secs; // tick the exit prompt went up (auto-cancels after a timeout)
     uint32_t stayed_until; // tick_secs until which the happy "stayed" reaction shows (0 = off)
     int fw_proto; // ESP32 firmware protocol version from PWNFRIEND_ADV (0 = unknown)
+    char fw_commit[16]; // ESP32 firmware build hash from PWNFRIEND_ADV fw= (empty = old/none)
     uint32_t pwn_active; // captures our own attack earned (via=active), this session
     uint32_t pwn_passive; // captures sniffed passively (via=passive), this session
 
@@ -664,6 +665,19 @@ static void pwnfriend_handle_adv_line(PwnfriendApp* app, const char* line) {
     line_extract_int(line, "ch=", &ch);
     line_extract_int(line, "sent=", &sent);
     line_extract_int(line, "ver=", &ver); // firmware protocol version (0 on old builds)
+    // fw=<hash> is an unquoted word (not "..."-wrapped), so copy it by hand up to the space.
+    // Empty on old firmware that predates the build stamp.
+    char fw[16] = {0};
+    const char* fp = strstr(line, "fw=");
+    if(fp) {
+        fp += 3;
+        size_t i = 0;
+        while(fp[i] && fp[i] != ' ' && fp[i] != '\r' && fp[i] != '\n' && i < sizeof(fw) - 1) {
+            fw[i] = fp[i];
+            i++;
+        }
+        fw[i] = '\0';
+    }
     with_view_model(
         app->view,
         PwnfriendModel * model,
@@ -671,6 +685,8 @@ static void pwnfriend_handle_adv_line(PwnfriendApp* app, const char* line) {
             model->adv_channel = (uint8_t)ch;
             model->adv_sent_count = (uint32_t)sent;
             model->fw_proto = ver;
+            strncpy(model->fw_commit, fw, sizeof(model->fw_commit) - 1);
+            model->fw_commit[sizeof(model->fw_commit) - 1] = '\0';
         },
         true);
 }
@@ -2095,14 +2111,14 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
     if(dist[0])
         canvas_draw_str(
             canvas, FLIPPER_SCREEN_WIDTH - 2 - (int)canvas_string_width(canvas, dist), 37, dist);
-    // Up-hint: a centered ▲ map when this AP has a known location, so it's clear Up
-    // pops the map QR. Only drawn when there IS one (Up is a no-op otherwise).
+    // OK-hint: a centered OK glyph (small disc) + "map" when this AP has a known location,
+    // so it's clear OK opens the map QR. Only drawn when there IS one (OK is a no-op else).
     if(alat < 1e8f) {
         const char* h = "map";
         int hw = (int)canvas_string_width(canvas, h);
-        int gx = (FLIPPER_SCREEN_WIDTH - (5 + 3 + hw)) / 2;
-        canvas_draw_triangle(canvas, gx + 2, 45, 5, 4, CanvasDirectionBottomToTop);
-        canvas_draw_str(canvas, gx + 8, 45, h);
+        int gx = (FLIPPER_SCREEN_WIDTH - (7 + 3 + hw)) / 2;
+        canvas_draw_disc(canvas, gx + 3, 42, 3);
+        canvas_draw_str(canvas, gx + 10, 45, h);
     }
     // Crackability as a plain-language formula (what we have -> whether it cracks).
     const char* key = a->pmkid ? "PMKID" : a->handshake ? "HS" : NULL;
@@ -2209,13 +2225,13 @@ static void pwnfriend_draw_frienddetail(Canvas* canvas, const PwnfriendModel* mo
     if(dist[0])
         canvas_draw_str(
             canvas, FLIPPER_SCREEN_WIDTH - 2 - (int)canvas_string_width(canvas, dist), 37, dist);
-    // Up-hint: a centered ▲map when this friend has a known location.
+    // OK-hint: a centered OK glyph (small disc) + "map" when this friend has a known location.
     if(alat < 1e8f) {
         const char* h = "map";
         int hw = (int)canvas_string_width(canvas, h);
-        int gx = (FLIPPER_SCREEN_WIDTH - (5 + 3 + hw)) / 2;
-        canvas_draw_triangle(canvas, gx + 2, 45, 5, 4, CanvasDirectionBottomToTop);
-        canvas_draw_str(canvas, gx + 8, 45, h);
+        int gx = (FLIPPER_SCREEN_WIDTH - (7 + 3 + hw)) / 2;
+        canvas_draw_disc(canvas, gx + 3, 42, 3);
+        canvas_draw_str(canvas, gx + 10, 45, h);
     }
     // Row: their capture count + how many times we've heard them (triangulation samples).
     snprintf(l, sizeof(l), "pwned %ld   seen %ux", (long)fr->pwnd_tot, fr->times_seen);
@@ -2351,9 +2367,15 @@ static void pwnfriend_draw_about(Canvas* canvas, const PwnfriendModel* model) {
     // App: version + short git hash (baked in at build; "nogit" outside a checkout).
     snprintf(line, sizeof(line), "app %s %s", PWNFRIEND_APP_VERSION, PWNFRIEND_GIT_HASH);
     canvas_draw_str(canvas, 2, 56, line);
-    // Firmware: the ESP32's stamped protocol version, or a nudge when it's stale/absent.
+    // Firmware: prefer the actual build hash (fw=<hash>) so a reflash is verifiable — the
+    // protocol number alone (v4) can't tell two v4 builds apart. Fall back to the protocol
+    // for firmware too old to stamp a hash, or a nudge when the board is silent.
     if(model->fw_proto == 0)
         snprintf(line, sizeof(line), "fw  none (want v%d)", PWNFRIEND_FW_PROTO);
+    else if(model->fw_commit[0])
+        snprintf(
+            line, sizeof(line), "fw  %s %s", model->fw_commit,
+            model->fw_proto < PWNFRIEND_FW_PROTO ? "old" : "ok");
     else if(model->fw_proto < PWNFRIEND_FW_PROTO)
         snprintf(line, sizeof(line), "fw  v%d old (want v%d)", model->fw_proto, PWNFRIEND_FW_PROTO);
     else
@@ -2874,13 +2896,39 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
 
     case ScreenApDetail:
         if(event->key == InputKeyBack) {
+            // list_idx already tracks the AP we were viewing, so we land back on it.
             with_view_model(
                 app->view, PwnfriendModel * model, { model->screen = ScreenApList; }, true);
             return true;
         }
-        if(event->key == InputKeyUp) {
-            // Up: QR of this AP's location (a maps URL) to scan with a phone. Only if we
-            // recorded where it was seen.
+        if(event->key == InputKeyUp || event->key == InputKeyDown) {
+            // Up/Down flip to the prev/next AP in the (filtered) list, staying in detail and
+            // keeping list_idx in sync so Back returns to the one we ended on.
+            with_view_model(
+                app->view, PwnfriendModel * model,
+                {
+                    uint16_t idx[AP_MAX];
+                    uint16_t n = ap_filtered(model, idx);
+                    if(n) {
+                        uint16_t pos = 0;
+                        for(uint16_t k = 0; k < n; k++)
+                            if(idx[k] == model->detail_ap) { pos = k; break; }
+                        if(event->key == InputKeyDown)
+                            pos = (uint16_t)((pos + 1) % n);
+                        else
+                            pos = (uint16_t)((pos + n - 1) % n);
+                        model->detail_ap = idx[pos];
+                        model->list_idx = pos;
+                        if(model->list_idx < model->list_top) model->list_top = model->list_idx;
+                        if(model->list_idx >= model->list_top + APLIST_ROWS)
+                            model->list_top = model->list_idx - APLIST_ROWS + 1;
+                    }
+                },
+                true);
+            return true;
+        }
+        if(event->key == InputKeyOk) {
+            // OK: QR of this AP's location (a geo: URI) to scan with a phone, if we have one.
             with_view_model(
                 app->view, PwnfriendModel * model,
                 {
@@ -2930,7 +2978,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         a->whitelisted = !a->whitelisted;
                         if(a->whitelisted) a->targeted = false;
                     }
-                    model->screen = ScreenApList; // picked -> pop back to the list
+                    // Stay in detail (Up/Down keeps browsing); no pop back to the list.
                     need_advertise = model->advertising;
                 },
                 true);
@@ -2989,12 +3037,38 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
 
     case ScreenFriendDetail:
         if(event->key == InputKeyBack) {
+            // fl_idx already tracks the friend we were viewing, so we land back on it.
             with_view_model(
                 app->view, PwnfriendModel * model, { model->screen = ScreenFriendList; }, true);
             return true;
         }
-        if(event->key == InputKeyUp) {
-            // Up: QR of this friend's last location (a geo: URI) to scan with a phone.
+        if(event->key == InputKeyUp || event->key == InputKeyDown) {
+            // Up/Down flip to the prev/next friend, staying in detail; fl_idx stays in sync.
+            with_view_model(
+                app->view, PwnfriendModel * model,
+                {
+                    uint16_t idx[FRIEND_MAX];
+                    uint16_t n = friend_order(model, idx);
+                    if(n) {
+                        uint16_t pos = 0;
+                        for(uint16_t k = 0; k < n; k++)
+                            if(idx[k] == model->detail_friend) { pos = k; break; }
+                        if(event->key == InputKeyDown)
+                            pos = (uint16_t)((pos + 1) % n);
+                        else
+                            pos = (uint16_t)((pos + n - 1) % n);
+                        model->detail_friend = idx[pos];
+                        model->fl_idx = pos;
+                        if(model->fl_idx < model->fl_top) model->fl_top = model->fl_idx;
+                        if(model->fl_idx >= model->fl_top + APLIST_ROWS)
+                            model->fl_top = model->fl_idx - APLIST_ROWS + 1;
+                    }
+                },
+                true);
+            return true;
+        }
+        if(event->key == InputKeyOk) {
+            // OK: QR of this friend's last location (a geo: URI) to scan with a phone.
             with_view_model(
                 app->view, PwnfriendModel * model,
                 {
@@ -3307,6 +3381,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->list_filter = FilterAll;
             model->detail_ap = 0;
             model->fw_proto = 0; // unknown until the first PWNFRIEND_ADV with ver=
+            model->fw_commit[0] = '\0'; // filled from the first ADV that carries fw=
             model->pwn_active = 0;
             model->pwn_passive = 0;
             model->quiet = false;

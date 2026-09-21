@@ -142,6 +142,7 @@ class Pwnfriend {
     uint32_t _phase_ms;        // millis() when the phase / channel dwell began
     uint8_t  _cur_channel;     // channel we're parked on right now
     uint32_t _last_hop_ms;     // recon-sweep hop cadence timer
+    uint32_t _last_sweep_ms;   // all-channel advertise-sweep cadence timer
     uint8_t  _attack_list[14]; // AP-bearing channels to attack this epoch
     int      _n_attack;        // channels in _attack_list
     int      _attack_idx;      // current channel within _attack_list

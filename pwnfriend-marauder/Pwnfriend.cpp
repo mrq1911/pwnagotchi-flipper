@@ -124,6 +124,11 @@ static const uint8_t ASSOC_TEMPLATE[28] = {
 static const uint32_t RECON_TIME_MS       = 30000; // personality.recon_time = 30
 static const uint32_t HOP_RECON_TIME_MS   = 10000; // personality.hop_recon_time = 10
 static const uint32_t RECON_HOP_MS        = 1200;  // sweep cadence during recon
+// How often to spray the advertisement across ALL channels (so a hopping pwngrid receiver
+// hears us). Doing it every broadcast() tick starved recon rx (AP count stuck at 0), so we
+// throttle it: a pwngrid neighbour dwells seconds per channel and still catches us within
+// this window, while recon keeps clean rx on _cur_channel the rest of the time.
+static const uint32_t ADVERTISE_SWEEP_MS  = 1500;
 static const uint8_t  MAX_INACTIVE_SCALE  = 2;     // personality.max_inactive_scale
 static const uint8_t  RECON_INACTIVE_MULT = 2;     // personality.recon_inactive_multiplier
 
@@ -213,6 +218,7 @@ void Pwnfriend::reset() {
     _ready = false;
     _sent = 0;
     _last_active_ms = 0;
+    _last_sweep_ms = 0;
     _n_recon = 0;
     _n_pwnd_seen = 0;
     _n_sta = 0;
@@ -645,24 +651,31 @@ void Pwnfriend::broadcast() {
     // Re-emit the frame so updated stats (uptime, pwnd counts, face) propagate.
     rebuild();
 
-    // Sprinkle the advertisement on EVERY channel this tick, not just the recon channel.
-    // A real pwngrid receiver hops on its own schedule and dwells a long time, so a beacon
-    // confined to our slow 1..13 sweep almost never coincides with the channel it's parked
-    // on — we hear its dense ~300ms stream easily, but it rarely catches our sparse per-
-    // channel burst. (An earlier single-channel build WAS seen; adding the recon hop is
-    // what broke discovery.) A quick all-channel pass — 2 lossy beacons each, ~1ms settle —
-    // guarantees it hears us within a tick. We then drop back to _cur_channel so our own
-    // sniff/attack dwell (and the next tick's attackChannel, which assumes the radio is
-    // already on _cur_channel) is unchanged.
-    for (uint8_t h = 0; h < NUM_HOP_CHANNELS; h++) {
-        esp_wifi_set_channel(HOP_CHANNELS[h], WIFI_SECOND_CHAN_NONE);
+    // Be heard by a pwngrid receiver that hops on its own schedule: every ADVERTISE_SWEEP_MS
+    // spray the advert across ALL channels (2 lossy beacons each, ~1ms settle), then return
+    // to _cur_channel. Doing this EVERY tick starved recon rx (AP stuck at 0); throttling it
+    // keeps recon clean between sweeps while a dwelling neighbour still catches us. On the
+    // in-between ticks we just beacon on _cur_channel (cheap, rx-friendly).
+    if (now - _last_sweep_ms >= ADVERTISE_SWEEP_MS) {
+        _last_sweep_ms = now;
+        for (uint8_t h = 0; h < NUM_HOP_CHANNELS; h++) {
+            esp_wifi_set_channel(HOP_CHANNELS[h], WIFI_SECOND_CHAN_NONE);
+            delay(1);
+            esp_wifi_80211_tx(WIFI_IF_AP, _frame, _frame_len, false);
+            esp_wifi_80211_tx(WIFI_IF_AP, _frame, _frame_len, false);
+            _sent += 2;
+        }
+        esp_wifi_set_channel(_cur_channel, WIFI_SECOND_CHAN_NONE); // back for rx/attack
         delay(1);
-        esp_wifi_80211_tx(WIFI_IF_AP, _frame, _frame_len, false);
-        esp_wifi_80211_tx(WIFI_IF_AP, _frame, _frame_len, false);
-        _sent += 2;
+    } else {
+        // Just beacon on the recon/attack channel (radio may have hopped this tick).
+        esp_wifi_set_channel(_cur_channel, WIFI_SECOND_CHAN_NONE);
+        delay(1);
+        for (int i = 0; i < 3; i++) {
+            esp_wifi_80211_tx(WIFI_IF_AP, _frame, _frame_len, false);
+            _sent++;
+        }
     }
-    esp_wifi_set_channel(_cur_channel, WIFI_SECOND_CHAN_NONE); // back to recon/attack channel
-    delay(1);
 
     // One atomic write so this main-loop line can't interleave with the rx
     // callback's PWNFRIEND_* prints.
