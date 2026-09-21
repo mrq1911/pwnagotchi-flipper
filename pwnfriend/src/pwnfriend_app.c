@@ -1053,14 +1053,13 @@ static void pwnfriend_update_place(PwnfriendModel* model) {
         else
             snprintf(model->gps_place, sizeof(model->gps_place), "look up to Mother");
     } else {
-        // Row 1: name + distance. Row 2: direction + course (e.g. "SW 225deg"). We spell
-        // "deg" — the ° glyph (UTF-8 0xC2 0xB0) isn't in the Flipper font, so it rendered
-        // as garbage.
+        // Row 1: name + distance. Row 2: direction + bearing (e.g. "SW 225") — a real °
+        // ring is drawn after it at render time (the ° glyph isn't in the Flipper font).
         if(km < 1.0f)
             snprintf(model->gps_place, sizeof(model->gps_place), "%s %dm", hn, (int)(km * 1000.0f));
         else
             snprintf(model->gps_place, sizeof(model->gps_place), "%s %dkm", hn, (int)(km + 0.5f));
-        snprintf(model->gps_course, sizeof(model->gps_course), "%s %ddeg", dir, brg);
+        snprintf(model->gps_course, sizeof(model->gps_course), "%s %d", dir, brg);
     }
 }
 
@@ -2473,7 +2472,12 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
         // (No raw coords here — those live on the Stats screen.)
         if(model->gps_seen) {
             HS_ROW("%s", model->gps_place[0] ? model->gps_place : "locating...");
-            if(model->gps_course[0]) HS_ROW("%s", model->gps_course);
+            if(model->gps_course[0]) {
+                canvas_draw_str(canvas, x, y, model->gps_course);
+                int w = (int)canvas_string_width(canvas, model->gps_course);
+                canvas_draw_circle(canvas, x + w + 2, y - 5, 1); // a real superscript ° ring
+                y += 9;
+            }
         } else {
             HS_ROW("no GPS fix");
         }
