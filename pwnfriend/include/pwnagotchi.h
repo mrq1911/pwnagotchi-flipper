@@ -78,32 +78,6 @@ enum PwnagotchiFace {
     Upload2
 };
 
-/** All of the faces as macros so we don't have to worry about size */
-#define LOOK_R "( ⚆_⚆)"
-#define LOOK_L "(☉_☉ )"
-#define LOOK_R_HAPPY "( ◕‿◕)"
-#define LOOK_L_HAPPY "(◕‿◕ )"
-#define SLEEP "(⇀‿‿↼)"
-#define SLEEP2 "(≖‿‿≖)"
-#define AWAKE "(◕‿‿◕)"
-#define BORED "(-__-)"
-#define INTENSE "(°▃▃°)"
-#define COOL "(⌐■_■)"
-#define HAPPY "(•‿‿•)"
-#define GRATEFUL "(^‿‿^)"
-#define EXCITED "(ᵔ◡◡ᵔ)"
-#define MOTIVATED "(☼‿‿☼)"
-#define DEMOTIVATED "(≖__≖)"
-#define SMART "(✜‿‿✜)"
-#define LONELY "(ب__ب)"
-#define SAD "(╥☁╥ )"
-#define ANGRY "(-_-')"
-#define FRIEND "(♥‿‿♥)"
-#define BROKEN "(☓‿‿☓)"
-#define DEBUG "(#__#)"
-#define UPLOAD "(1__0)"
-#define UPLOAD1 "(1__1)"
-#define UPLOAD2 "(0__1)"
 
 /**
  * Enum for current mode of the pwnagotchi
@@ -127,8 +101,6 @@ typedef struct {
     FuriString* handshakes;
     /// Current mode the pwnagotchi is in
     enum PwnagotchiMode mode;
-    /// Friend face
-    enum PwnagotchiFace friendFace;
     /// Name and aps of friend
     FuriString* friendStat;
 

@@ -17,7 +17,6 @@ Pwnagotchi* pwnagotchi_alloc() {
 
     // Set numbered values
     pwn->face = Cool;
-    pwn->friendFace = NoFace;
     pwn->mode = PwnMode_Manual;
 
     // Set string values to initial

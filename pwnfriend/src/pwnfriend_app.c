@@ -20,6 +20,7 @@
 #include "../include/consent.h"
 #include "../include/pcap.h"
 #include "../include/wardrive.h"
+#include "pwnfriend_geo.h" // pure geo/identity helpers (host-tested in tests/test_geo.cpp)
 #include "qrcodegen.h"
 #include <storage/storage.h>
 
@@ -76,10 +77,6 @@ typedef enum {
 // for this AP, and have we spliced its ESSID beacon into the pcap yet.
 #define APF_HS_SEEN 0x01
 #define APF_BEACON_DONE 0x02
-// Cap the centroid sample count so w_sum/wlat_sum/wlon_sum can't grow without bound
-// (float rounding would otherwise slowly drift a long-lived estimate). By this many
-// throttled samples the estimate has long since converged.
-#define LOC_SAMPLE_CAP 4000
 
 // The heartbeat timer fires ANIM_HZ times/sec so the About banner can scroll
 // smoothly; the once-per-second brain work is gated to every ANIM_HZ-th fire.
@@ -480,39 +477,6 @@ static bool line_extract_number(const char* s, const char* key, char* out, size_
     return i > 0;
 }
 
-// Fold one geotagged sighting into a running RSSI-weighted centroid (weighted-centroid
-// localization). Stronger signal -> more weight -> the estimate leans toward the closest
-// approach; averaging several sightings cancels per-sample GPS jitter. O(1) storage.
-static void loc_accumulate(
-    uint16_t* n, float* w_sum, float* wlat_sum, float* wlon_sum, float lat, float lon, int rssi) {
-    if(rssi == 0) return; // no signal reading (absent field) -> can't weight it; skip
-    if(*n >= LOC_SAMPLE_CAP) return; // converged; stop growing the sums (bounds fp drift)
-    float w = (float)(rssi + 100); // ~ -100dBm floor -> tiny weight, -30dBm close -> ~70
-    if(w < 1.0f) w = 1.0f;
-    *w_sum += w;
-    *wlat_sum += w * lat;
-    *wlon_sum += w * lon;
-    if(*n < 0xFFFF) (*n)++;
-}
-
-// Best position estimate for a record: the weighted centroid once we have >=2 samples and
-// triangulation is enabled; else the single strongest fix. Returns false if no location.
-static bool loc_estimate(
-    bool tri, uint16_t n, float w_sum, float wlat_sum, float wlon_sum, float fix_lat,
-    float fix_lon, float* out_lat, float* out_lon) {
-    if(tri && n >= 2 && w_sum > 0.0f) {
-        *out_lat = wlat_sum / w_sum;
-        *out_lon = wlon_sum / w_sum;
-        return true;
-    }
-    if(fix_lat < 1e8f) {
-        *out_lat = fix_lat;
-        *out_lon = fix_lon;
-        return true;
-    }
-    return false;
-}
-
 // Quote a free-text field for a CSV cell (RFC4180): wrap in double quotes and double any
 // embedded quote, so a comma/quote in an SSID or friend name can't shift the columns after
 // it (lat/lon come later in the row). Truncates safely if `out` is too small.
@@ -534,26 +498,9 @@ static void csv_quote(const char* in, char* out, size_t n) {
     out[o] = '\0';
 }
 
-static bool coord_ok(const char* lat, const char* lon); // defined below (map/log guard)
 static bool gps_outlier(const PwnfriendModel* m, float la, float lo); // defined below
-static float parse_deg(const char* s); // defined below (decimal-degree string -> float)
 static int friend_get(PwnfriendModel* model, const char* identity, bool* is_new); // below
 static bool ap_signal_recent(const PwnfriendModel* m, uint16_t i); // defined below
-
-// A real pwngrid identity is exactly 64 hex chars (a SHA256 key fingerprint). A garbled or
-// truncated sniffed beacon parses into something else (raw frame bytes, a run-on into the
-// next JSON key, a short stub) — pwngrid's own receiver rejects those, and so do we, so a
-// mis-parse can't spawn a bogus peer. Mirrors pwngrid NewPeer's ^[a-fA-F0-9]{64}$ gate.
-static bool identity_is_64hex(const char* s) {
-    int n = 0;
-    for(; s[n]; n++) {
-        if(n >= 64) return false;
-        char c = s[n];
-        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-        if(!hex) return false;
-    }
-    return n == 64;
-}
 
 static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
     char name[PEER_NAME_MAX] = {0};
@@ -934,36 +881,10 @@ static void home_save(Storage* storage, PwnfriendModel* model) {
     storage_file_free(f);
 }
 
-// Parse a decimal-degree string ("50.0784950" / "-14.42") to double without atof
-// (avoids any %f/newlib-nano float-formatting dependency). Returns 1e9 on empty.
-static float parse_deg(const char* s) {
-    if(!s || !s[0]) return 1e9f;
-    float sign = 1.0f, v = 0.0f;
-    const char* p = s;
-    if(*p == '-') { sign = -1.0f; p++; } else if(*p == '+') { p++; }
-    while(*p >= '0' && *p <= '9') { v = v * 10.0f + (float)(*p - '0'); p++; }
-    if(*p == '.') {
-        p++;
-        float f = 0.1f;
-        while(*p >= '0' && *p <= '9') { v += (float)(*p - '0') * f; f *= 0.1f; p++; }
-    }
-    return sign * v;
-}
-
-// Sanity-check a lat/lon string pair before we trust it (log / map / QR): rejects a
-// corrupt sample like lon=1.3e14. Belt-and-suspenders with the firmware's fmt_geo check.
-static bool coord_ok(const char* lat, const char* lon) {
-    float la = parse_deg(lat), lo = parse_deg(lon);
-    if(la < -90.0f || la > 90.0f || lo < -180.0f || lo > 180.0f) return false;
-    // Reject "null island" (~0,0): the classic no-fix GPS default, never a real location.
-    if(la > -0.5f && la < 0.5f && lo > -0.5f && lo < 0.5f) return false;
-    return true;
-}
-
 // A fix is an outlier if it's implausibly far (>GPS_OUTLIER_KM) from our reference — the set
 // home, else the last good fix. Indoors the GPS module sometimes emits a far-off coordinate
 // (a partial/stale NMEA fix); this keeps that junk out of the map + triangulation. No trusted
-// reference yet -> keep it (can't judge).
+// reference yet -> keep it (can't judge). parse_deg/coord_ok/geo_km live in pwnfriend_geo.h.
 #define GPS_OUTLIER_KM 150.0f
 static bool gps_outlier(const PwnfriendModel* m, float la, float lo) {
     float rlat = 1e9f, rlon = 1e9f;
@@ -975,10 +896,7 @@ static bool gps_outlier(const PwnfriendModel* m, float la, float lo) {
         rlon = parse_deg(m->last_lon);
     }
     if(rlat >= 1e8f) return false;
-    float coslat = cosf(rlat * 3.14159265f / 180.0f);
-    float dn = la - rlat, de = (lo - rlon) * coslat;
-    float km = sqrtf(dn * dn + de * de) * 111.0f;
-    return km > GPS_OUTLIER_KM;
+    return geo_km(rlat, rlon, la, lo) > GPS_OUTLIER_KM;
 }
 
 // Compact "age" string (Ns / Nm / Nh) for a duration in seconds — the AP's last-seen.
@@ -2156,9 +2074,7 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
     char dist[14];
     dist[0] = '\0';
     if(model->gps_seen && clat < 1e8f && alat < 1e8f) {
-        float coslat = cosf(clat * 3.14159265f / 180.0f);
-        float dn = alat - clat, de = (alon - clon) * coslat;
-        float km = sqrtf(dn * dn + de * de) * 111.0f;
+        float km = geo_km(clat, clon, alat, alon);
         if(km < 1.0f)
             snprintf(dist, sizeof(dist), "~%dm", (int)(km * 1000.0f));
         else
@@ -2270,9 +2186,7 @@ static void pwnfriend_draw_frienddetail(Canvas* canvas, const PwnfriendModel* mo
     char dist[14];
     dist[0] = '\0';
     if(model->gps_seen && clat < 1e8f && alat < 1e8f) {
-        float coslat = cosf(clat * 3.14159265f / 180.0f);
-        float dn = alat - clat, de = (alon - clon) * coslat;
-        float km = sqrtf(dn * dn + de * de) * 111.0f;
+        float km = geo_km(clat, clon, alat, alon);
         if(km < 1.0f)
             snprintf(dist, sizeof(dist), "~%dm", (int)(km * 1000.0f));
         else
