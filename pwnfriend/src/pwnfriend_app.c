@@ -190,7 +190,6 @@ typedef enum {
     // --- below: Left/Right adjusts the value ---
     MenuAdvertise, // toggle
     MenuCapture, // cycle
-    MenuChannel, // adjust
     MenuMinRssi, // adjust
     MenuRecon, // adjust
     MenuQuiet, // toggle
@@ -538,6 +537,7 @@ static void csv_quote(const char* in, char* out, size_t n) {
 static bool coord_ok(const char* lat, const char* lon); // defined below (map/log guard)
 static float parse_deg(const char* s); // defined below (decimal-degree string -> float)
 static int friend_get(PwnfriendModel* model, const char* identity, bool* is_new); // below
+static bool ap_signal_recent(const PwnfriendModel* m, uint16_t i); // defined below
 
 // A real pwngrid identity is exactly 64 hex chars (a SHA256 key fingerprint). A garbled or
 // truncated sniffed beacon parses into something else (raw frame bytes, a run-on into the
@@ -1528,17 +1528,27 @@ static void pwnfriend_populate(PwnfriendModel* model) {
         pwn->face = (enum PwnagotchiFace)FaceHappy;
     pwn->mode = PwnMode_Ai;
 
-    // CH: the tuned channel, or '*' for auto (the pwnagotchi recon sweep) — matches
-    // upstream, which shows '*' while hopping and a number when locked to a channel.
-    if(model->tuned_channel >= 1 && model->tuned_channel <= 14) {
-        furi_string_printf(pwn->channel, "%d", model->tuned_channel);
+    // CH: the channel the ESP32 is actually on right now (reported on each PWNFRIEND_ADV).
+    // While recon-sweeping this cycles like a real pwnagotchi; targeting an AP pins it. '*'
+    // until the board reports one (or when paused).
+    uint8_t cur_ch = model->adv_channel;
+    if(cur_ch >= 1 && cur_ch <= 14) {
+        furi_string_printf(pwn->channel, "%u", (unsigned)cur_ch);
     } else {
         furi_string_set(pwn->channel, "*");
     }
 
-    // AP: access points seen this session. Session-only keeps the compact top row
-    // (CH/AP/UP) inside 128px even with a 3-digit count; lifetime stays in save data.
-    furi_string_printf(pwn->apStat, "%lu", (unsigned long)p->aps_session);
+    // AP: like a real pwnagotchi, the number of nearby (recent, not-ignored) APs ON THE
+    // CURRENT CHANNEL — not a session total. Falls back to all recent non-ignored APs when
+    // the current channel isn't known yet.
+    uint16_t apc = 0;
+    for(uint16_t i = 0; i < model->ap_count; i++) {
+        if(model->aps[i].whitelisted) continue; // ignored APs don't count
+        if(cur_ch >= 1 && cur_ch <= 14 && model->aps[i].channel != cur_ch) continue;
+        if(!ap_signal_recent(model, i)) continue;
+        apc++;
+    }
+    furi_string_printf(pwn->apStat, "%u", (unsigned)apc);
 
     // BAT: battery %, cached from the 1 Hz tick (more useful at a glance than uptime;
     // full uptime still lives on the Stats screen).
@@ -1950,14 +1960,6 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
             adjustable = true;
             snprintf(value, sizeof(value), "%s", capture_name(model->capture_mode));
             break;
-        case MenuChannel:
-            label = "Channel";
-            adjustable = true;
-            if(model->tuned_channel >= 1 && model->tuned_channel <= 14)
-                snprintf(value, sizeof(value), "%d", model->tuned_channel);
-            else
-                snprintf(value, sizeof(value), "*");
-            break;
         case MenuMinRssi:
             label = "Min RSSI";
             adjustable = true;
@@ -2179,7 +2181,9 @@ static void pwnfriend_draw_friendlist(Canvas* canvas, const PwnfriendModel* mode
 static void pwnfriend_draw_frienddetail(Canvas* canvas, const PwnfriendModel* model) {
     canvas_clear(canvas);
     const FriendRec* fr = &model->friends[model->detail_friend];
-    draw_titlebar(canvas, fr->name[0] ? fr->name : "???", NULL);
+    // Friend's face in the title bar's right slot (ASCII stand-in — real pwngrid faces are
+    // unicode the Flipper can't draw), name on the left.
+    draw_titlebar(canvas, fr->name[0] ? fr->name : "???", "^_^");
     canvas_set_font(canvas, FontSecondary);
     char l[40];
     // Row 1: a short slice of the 64-hex identity (enough to tell buddies apart).
@@ -2604,22 +2608,8 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                 true);
             return true;
         }
-        if(event->key == InputKeyUp || event->key == InputKeyDown) {
-            with_view_model(
-                app->view, PwnfriendModel * model,
-                {
-                    int8_t before = model->tuned_channel;
-                    if(event->key == InputKeyUp) {
-                        if(model->tuned_channel < 14) model->tuned_channel++;
-                    } else {
-                        if(model->tuned_channel > 0) model->tuned_channel--;
-                    }
-                    need_advertise = (model->tuned_channel != before) && model->advertising;
-                },
-                true);
-            if(need_advertise) pwnfriend_send_advertise(app);
-            return true;
-        }
+        // Up/Down: unused on home now — the channel is set by targeting an AP, not by hand.
+        if(event->key == InputKeyUp || event->key == InputKeyDown) return true;
         return true; // Back (exit) is handled above; swallow any other stray key
 
     case ScreenMenu:
@@ -2670,20 +2660,6 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                             need_advertise = model->advertising;
                         }
                         break;
-                    case MenuChannel: {
-                        int v = model->tuned_channel + dir;
-                        if(v < 0) v = 0;
-                        if(v > 14) v = 14;
-                        if(v != model->tuned_channel) {
-                            model->tuned_channel = (int8_t)v;
-                            // A manual channel override drops any target (they'd fight:
-                            // targeting pins a channel, so setting one by hand un-targets).
-                            for(uint16_t i = 0; i < model->ap_count; i++)
-                                model->aps[i].targeted = false;
-                            need_advertise = model->advertising;
-                        }
-                        break;
-                    }
                     case MenuMinRssi: {
                         int v = model->min_rssi + dir * 2;
                         if(v < -90) v = -90;

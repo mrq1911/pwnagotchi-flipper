@@ -1017,9 +1017,12 @@ bool Pwnfriend::reportAP(const uint8_t* payload, int length, int rssi, int chann
     __sync_synchronize();
     _n_recon++;
 
-    // Stream this first beacon to the Flipper so its per-BSSID pcap carries the
-    // ESSID (a mandatory WPA 22000 field hcxpcapngtool/hashcat need to crack).
-    streamFrameHex(bssid, payload, length);
+    // NOTE: we deliberately do NOT stream this first beacon to a per-BSSID pcap anymore —
+    // that created one (uncrackable) ESSID-only file for every AP in range. The ESSID a
+    // real capture needs is spliced in on the Flipper side when a handshake actually
+    // arrives (and streamSyntheticBeacon / the late-ESSID path above cover it too), while
+    // recon ESSIDs for mapping live in wardrive.csv. So a pcap is created only for an AP we
+    // actually capture EAPOL/PMKID from.
 
     char mac[18];
     fmt_mac(mac, bssid);
