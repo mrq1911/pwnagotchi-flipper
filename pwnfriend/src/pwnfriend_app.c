@@ -535,6 +535,7 @@ static void csv_quote(const char* in, char* out, size_t n) {
 }
 
 static bool coord_ok(const char* lat, const char* lon); // defined below (map/log guard)
+static bool gps_outlier(const PwnfriendModel* m, float la, float lo); // defined below
 static float parse_deg(const char* s); // defined below (decimal-degree string -> float)
 static int friend_get(PwnfriendModel* model, const char* identity, bool* is_new); // below
 static bool ap_signal_recent(const PwnfriendModel* m, uint16_t i); // defined below
@@ -588,6 +589,8 @@ static void pwnfriend_handle_peer_line(PwnfriendApp* app, const char* line) {
             uint32_t now = model->tick_secs;
             up = now;
             tri = model->triangulate;
+            // Drop a far-off junk fix on the peer line (fallback to the last good fix below).
+            if(have_gps && gps_outlier(model, parse_deg(lat), parse_deg(lon))) have_gps = false;
             is_new = peers_update(
                 &model->peers, name, identity, pwnd_tot, rssi, channel, now);
             bool bonded = peers_any_bonded(&model->peers, now);
@@ -951,7 +954,31 @@ static float parse_deg(const char* s) {
 // corrupt sample like lon=1.3e14. Belt-and-suspenders with the firmware's fmt_geo check.
 static bool coord_ok(const char* lat, const char* lon) {
     float la = parse_deg(lat), lo = parse_deg(lon);
-    return la >= -90.0f && la <= 90.0f && lo >= -180.0f && lo <= 180.0f;
+    if(la < -90.0f || la > 90.0f || lo < -180.0f || lo > 180.0f) return false;
+    // Reject "null island" (~0,0): the classic no-fix GPS default, never a real location.
+    if(la > -0.5f && la < 0.5f && lo > -0.5f && lo < 0.5f) return false;
+    return true;
+}
+
+// A fix is an outlier if it's implausibly far (>GPS_OUTLIER_KM) from our reference — the set
+// home, else the last good fix. Indoors the GPS module sometimes emits a far-off coordinate
+// (a partial/stale NMEA fix); this keeps that junk out of the map + triangulation. No trusted
+// reference yet -> keep it (can't judge).
+#define GPS_OUTLIER_KM 150.0f
+static bool gps_outlier(const PwnfriendModel* m, float la, float lo) {
+    float rlat = 1e9f, rlon = 1e9f;
+    if(m->home_set) {
+        rlat = m->home_lat;
+        rlon = m->home_lon;
+    } else if(m->last_lat[0]) {
+        rlat = parse_deg(m->last_lat);
+        rlon = parse_deg(m->last_lon);
+    }
+    if(rlat >= 1e8f) return false;
+    float coslat = cosf(rlat * 3.14159265f / 180.0f);
+    float dn = la - rlat, de = (lo - rlon) * coslat;
+    float km = sqrtf(dn * dn + de * de) * 111.0f;
+    return km > GPS_OUTLIER_KM;
 }
 
 // Compact "age" string (Ns / Nm / Nh) for a duration in seconds — the AP's last-seen.
@@ -1026,12 +1053,14 @@ static void pwnfriend_update_place(PwnfriendModel* model) {
         else
             snprintf(model->gps_place, sizeof(model->gps_place), "look up to Mother");
     } else {
-        // Row 1: name + distance. Row 2: direction + course (e.g. "SW 225°").
+        // Row 1: name + distance. Row 2: direction + course (e.g. "SW 225deg"). We spell
+        // "deg" — the ° glyph (UTF-8 0xC2 0xB0) isn't in the Flipper font, so it rendered
+        // as garbage.
         if(km < 1.0f)
             snprintf(model->gps_place, sizeof(model->gps_place), "%s %dm", hn, (int)(km * 1000.0f));
         else
             snprintf(model->gps_place, sizeof(model->gps_place), "%s %dkm", hn, (int)(km + 0.5f));
-        snprintf(model->gps_course, sizeof(model->gps_course), "%s %d\xc2\xb0", dir, brg);
+        snprintf(model->gps_course, sizeof(model->gps_course), "%s %ddeg", dir, brg);
     }
 }
 
@@ -1065,6 +1094,8 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
         PwnfriendModel * model,
         {
             up = model->tick_secs;
+            // Discard an implausible (far-from-home / stale) GPS fix before it geotags loot.
+            if(have_gps && gps_outlier(model, parse_deg(lat), parse_deg(lon))) have_gps = false;
             // Gate the earned count behind the consent + capture opt-in: without
             // it we ignore whatever the firmware happens to report. Dedup by BSSID
             // across the session so a re-emitted PWND (every 15s) counts only once.
@@ -1234,6 +1265,8 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
         PwnfriendModel * model,
         {
             up = model->tick_secs;
+            // Discard an implausible (far-from-home / stale) GPS fix before it geotags this AP.
+            if(have_gps && gps_outlier(model, parse_deg(lat), parse_deg(lon))) have_gps = false;
             // Upsert the AP record (browser + progress). New BSSID -> count it once,
             // so a pause/resume replay of the firmware's recon list can't inflate it.
             int ai = ap_get(model, key, &is_new_ap);
@@ -1752,20 +1785,32 @@ static void ap_flags_str(const ApRec* a, char out[4]) {
 }
 
 // Draw text truncated with the current font to fit `maxw` px at (x,y).
+// Draw `s` at baseline (x, y), clipped to maxw px. Printable ASCII renders normally; every
+// other UTF-8 character (emoji / unicode SSID chars the Flipper bitmap font can't draw) is
+// drawn as one small dot centred in the row height — one dot per source character (not
+// collapsed). Display-only; the raw SSID stays in wardrive.csv / the crackable pcap beacon.
 static void draw_str_trunc(Canvas* c, int x, int y, const char* s, int maxw) {
-    char buf[40];
-    size_t n = 0;
-    buf[0] = '\0';
-    for(const char* p = s; *p && n < sizeof(buf) - 1; p++) {
-        buf[n] = *p;
-        buf[n + 1] = '\0';
-        if((int)canvas_string_width(c, buf) > maxw) {
-            buf[n] = '\0';
-            break;
+    const int xend = x + maxw;
+    const int dot_cell = 5; // px a substituted glyph occupies
+    char one[2] = {0, 0};
+    for(const char* p = s; *p;) {
+        unsigned char ch = (unsigned char)*p;
+        if(ch >= 0x20 && ch < 0x7F) {
+            one[0] = *p;
+            int w = (int)canvas_string_width(c, one);
+            if(x + w > xend) break;
+            canvas_draw_str(c, x, y, one);
+            x += w;
+            p++;
+        } else {
+            // One dot per character: skip the lead byte then any UTF-8 continuation bytes.
+            p++;
+            while(((unsigned char)*p & 0xC0) == 0x80) p++;
+            if(x + dot_cell > xend) break;
+            canvas_draw_box(c, x + 1, y - 4, 2, 2); // centred in the ~8px row
+            x += dot_cell;
         }
-        n++;
     }
-    canvas_draw_str(c, x, y, buf);
 }
 
 // A framed progress bar filled `filled`/`total`.
@@ -1819,9 +1864,11 @@ static void draw_titlebar(Canvas* c, const char* title, const char* right) {
     canvas_draw_box(c, 0, 0, FLIPPER_SCREEN_WIDTH, 11);
     canvas_set_color(c, ColorWhite);
     canvas_set_font(c, FontSecondary);
-    canvas_draw_str(c, 2, 9, title);
-    if(right)
-        canvas_draw_str(c, FLIPPER_SCREEN_WIDTH - 2 - canvas_string_width(c, right), 9, right);
+    int rw = right ? (int)canvas_string_width(c, right) : 0;
+    // Title through the dot renderer (SSID/name may carry unrenderable unicode), clipped so
+    // it can't run into the right-hand text.
+    draw_str_trunc(c, 2, 9, title, FLIPPER_SCREEN_WIDTH - 2 - (right ? rw + 4 : 2));
+    if(right) canvas_draw_str(c, FLIPPER_SCREEN_WIDTH - 2 - rw, 9, right);
     canvas_set_color(c, ColorBlack);
 }
 
