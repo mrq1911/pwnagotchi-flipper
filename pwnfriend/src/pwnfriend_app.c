@@ -72,6 +72,10 @@ typedef enum {
 // (position,rssi) sample per AP every AP_TRACK_MIN_SECS, for offline triangulation.
 #define AP_TRACK_PATH "/ext/apps_data/pwnfriend/ap_track.csv"
 #define AP_TRACK_MIN_SECS 10
+// Per-AP, per-session pcap bookkeeping (ap_pcap_flags): have we filed an EAPOL frame
+// for this AP, and have we spliced its ESSID beacon into the pcap yet.
+#define APF_HS_SEEN 0x01
+#define APF_BEACON_DONE 0x02
 // Cap the centroid sample count so w_sum/wlat_sum/wlon_sum can't grow without bound
 // (float rounding would otherwise slowly drift a long-lived estimate). By this many
 // throttled samples the estimate has long since converged.
@@ -179,6 +183,7 @@ typedef enum {
     MenuAllAps, // OK: AP list (all)
     MenuWhitelist, // OK: AP list (whitelisted)
     MenuFriends, // OK: friends list (pwngrid peers met)
+    MenuTarget, // OK: clear the current focus target (shows its name; no hunting the list)
     MenuStats, // OK: stats
     MenuName, // OK: name editor
     MenuSetHome, // OK: capture GPS home
@@ -219,6 +224,7 @@ typedef struct {
     uint32_t ap_seq; // monotonic counter stamped into ApRec.first_seq on each sighting
     uint32_t ap_seen_tick[AP_MAX]; // tick_secs each AP was last heard (0 = not this session)
     uint32_t ap_track_tick[AP_MAX]; // tick_secs each AP was last written to ap_track.csv (throttle)
+    uint8_t ap_pcap_flags[AP_MAX]; // per-session APF_* bits: HS filed / ESSID beacon spliced
 
     // Every pwngrid friend we've met (the friends browser reads this; persisted).
     FriendRec friends[FRIEND_MAX];
@@ -725,6 +731,7 @@ static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
     model->aps[i].first_seq = ++model->ap_seq; // set once at discovery -> stable ordering
     model->ap_seen_tick[i] = model->tick_secs;
     model->ap_track_tick[i] = 0; // recycled slot: don't inherit the old AP's track throttle
+    model->ap_pcap_flags[i] = 0; // recycled slot: fresh pcap bookkeeping
     model->aps[i].lat = 1e9f; // no location until a geotagged line arrives
     model->aps[i].lon = 1e9f;
     model->aps[i].loc_rssi = -128; // reset for a recycled slot
@@ -1095,6 +1102,41 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
     if(counted) app->got_pwnd = true; // capture blink
 }
 
+// Build a minimal WPA2 beacon carrying `ssid` for `bssidhex` (12 lowercase hex) into `b`
+// (needs ~100 bytes). Splicing this into a handshake pcap gives it the ESSID that hashcat
+// needs (the PBKDF2 salt) — the app knows the name even after the firmware evicts the AP
+// from its recon table, so this rescues captures the firmware's own beacon splice misses.
+// Byte layout mirrors the firmware's streamSyntheticBeacon so the pcap stays uniform.
+static int build_synth_beacon(uint8_t* b, const char* bssidhex, const char* ssid) {
+    if(!ssid || !ssid[0]) return 0;
+    uint8_t mac[6];
+    for(int i = 0; i < 6; i++) {
+        int hi = hexval(bssidhex[i * 2]), lo = hexval(bssidhex[i * 2 + 1]);
+        if(hi < 0 || lo < 0) return 0;
+        mac[i] = (uint8_t)((hi << 4) | lo);
+    }
+    int slen = (int)strlen(ssid);
+    if(slen > 32) slen = 32;
+    int p = 0;
+    static const uint8_t head[10] = {0x80, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    memcpy(b + p, head, 10); p += 10;
+    memcpy(b + p, mac, 6); p += 6; // Addr2 = BSSID
+    memcpy(b + p, mac, 6); p += 6; // Addr3 = BSSID
+    b[p++] = 0x00; b[p++] = 0x00; // seq-ctl
+    memset(b + p, 0, 8); p += 8; // timestamp
+    b[p++] = 0x64; b[p++] = 0x00; // beacon interval
+    b[p++] = 0x11; b[p++] = 0x00; // caps: ESS + Privacy
+    b[p++] = 0x00; b[p++] = (uint8_t)slen; // SSID IE
+    memcpy(b + p, ssid, slen); p += slen;
+    static const uint8_t rates[6] = {0x01, 0x04, 0x82, 0x84, 0x8b, 0x96};
+    memcpy(b + p, rates, 6); p += 6;
+    static const uint8_t rsn[22] = {0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00,
+                                    0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x02,
+                                    0x0c, 0x00};
+    memcpy(b + p, rsn, 22); p += 22;
+    return p;
+}
+
 // "PWNFRIEND_RSSI <mac> <dbm>" — a throttled live-signal refresh for an already-known
 // AP (firmware protocol v3). Updates the stored RSSI so the list/detail bar tracks it.
 static void pwnfriend_handle_rssi_line(PwnfriendApp* app, const char* line) {
@@ -1134,6 +1176,8 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
 
     bool is_new_ap = false;
     bool do_track = false;
+    bool inject = false;
+    char beac_ssid[33] = {0};
     uint32_t up = 0;
     with_view_model(
         app->view,
@@ -1151,6 +1195,14 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
                     strncpy(a->ssid, ssid, sizeof(a->ssid) - 1);
                     a->ssid[sizeof(a->ssid) - 1] = '\0';
                     a->has_essid = true;
+                    // Learned the name for an AP we've already captured EAPOL for this
+                    // session -> splice its ESSID beacon into the pcap now (once).
+                    if((model->ap_pcap_flags[ai] & APF_HS_SEEN) &&
+                       !(model->ap_pcap_flags[ai] & APF_BEACON_DONE)) {
+                        model->ap_pcap_flags[ai] |= APF_BEACON_DONE;
+                        strncpy(beac_ssid, a->ssid, sizeof(beac_ssid) - 1);
+                        inject = true;
+                    }
                 }
                 if(have_gps) {
                     float la = parse_deg(lat);
@@ -1186,6 +1238,13 @@ static void pwnfriend_handle_ap_line(PwnfriendApp* app, const char* line) {
             }
         },
         true);
+
+    // Late-learned name for an already-captured AP: splice the ESSID beacon into its pcap.
+    if(inject) {
+        uint8_t beac[100];
+        int bl = build_synth_beacon(beac, key, beac_ssid);
+        if(bl > 0) pcap_append_frame(app->storage, key, beac, (uint16_t)bl);
+    }
 
     // One geotagged wardrive row per network — only for a first-seen BSSID, so a
     // pause/resume replay doesn't write the same AP again. Encryption is unknown
@@ -1237,12 +1296,30 @@ static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
     if(bi != 12 || *p != ' ') return; // need 12 hex chars then a single space
     p++; // step past the separator to the frame hex
 
-    // Only record if capture is opted in; otherwise silently drop the frame.
+    // Only record if capture is opted in; otherwise silently drop the frame. While we're
+    // under the lock, note we've filed an EAPOL frame for this AP and, if we already know
+    // its name, arrange to splice the ESSID beacon in once (so the pcap is crackable).
     bool record = false;
+    bool inject = false;
+    char beac_ssid[33] = {0};
     with_view_model(
         app->view,
         PwnfriendModel * model,
-        { record = (model->capture_mode != CaptureOff); },
+        {
+            record = (model->capture_mode != CaptureOff);
+            if(record) {
+                int ai = ap_find(model, bssid); // bssid is the 12-hex key
+                if(ai >= 0) {
+                    model->ap_pcap_flags[ai] |= APF_HS_SEEN;
+                    if(model->aps[ai].has_essid &&
+                       !(model->ap_pcap_flags[ai] & APF_BEACON_DONE)) {
+                        model->ap_pcap_flags[ai] |= APF_BEACON_DONE;
+                        strncpy(beac_ssid, model->aps[ai].ssid, sizeof(beac_ssid) - 1);
+                        inject = true;
+                    }
+                }
+            }
+        },
         false);
     if(!record) return;
 
@@ -1256,7 +1333,14 @@ static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
     }
     if(flen == 0) return;
 
-    // bssid is already fs-safe (12 lowercase hex), so it's the pcap filename.
+    // bssid is already fs-safe (12 lowercase hex), so it's the pcap filename. Splice the
+    // ESSID beacon first (once per AP/session) so a name we know reaches the pcap even
+    // when the firmware never had it at capture time.
+    if(inject) {
+        uint8_t beac[100];
+        int bl = build_synth_beacon(beac, bssid, beac_ssid);
+        if(bl > 0) pcap_append_frame(app->storage, bssid, beac, (uint16_t)bl);
+    }
     pcap_append_frame(app->storage, bssid, frame, (uint16_t)flen);
 }
 
@@ -1785,6 +1869,17 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
                 value, sizeof(value), "%u%s", model->friend_count,
                 model->friend_overflow ? "+" : "");
             break;
+        case MenuTarget: {
+            label = "Target";
+            const char* tn = NULL;
+            for(uint16_t i = 0; i < model->ap_count; i++)
+                if(model->aps[i].targeted) {
+                    tn = model->aps[i].ssid[0] ? model->aps[i].ssid : model->aps[i].bssid;
+                    break;
+                }
+            snprintf(value, sizeof(value), "%.14s", tn ? tn : "none"); // clear it with OK
+            break;
+        }
         case MenuStats: label = "Stats"; break;
         case MenuName:
             label = "Name";
@@ -2612,6 +2707,21 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         model->fl_idx = 0;
                         model->fl_top = 0;
                         break;
+                    case MenuTarget: {
+                        // Clear the focus target from here (no hunting the 256-AP list) and
+                        // drop back to the auto (*) channel sweep.
+                        bool had = false;
+                        for(uint16_t i = 0; i < model->ap_count; i++)
+                            if(model->aps[i].targeted) {
+                                model->aps[i].targeted = false;
+                                had = true;
+                            }
+                        if(had) {
+                            model->tuned_channel = 0; // back to the '*' sweep
+                            need_advertise = model->advertising;
+                        }
+                        break;
+                    }
                     case MenuStats: model->screen = ScreenStats; break;
                     case MenuAbout: model->screen = ScreenAbout; break;
                     case MenuSetHome:
@@ -2635,6 +2745,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                     sizeof(app->name_buf), false);
                 view_dispatcher_switch_to_view(app->view_dispatcher, 1);
             }
+            if(need_advertise) pwnfriend_send_advertise(app); // e.g. after clearing the target
             return true;
         }
         return true; // swallow anything else in the menu
@@ -3133,6 +3244,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             for(uint16_t i = 0; i < AP_MAX; i++) {
                 model->ap_seen_tick[i] = 0;
                 model->ap_track_tick[i] = 0;
+                model->ap_pcap_flags[i] = 0;
                 model->aps[i].lat = 1e9f;
                 model->aps[i].lon = 1e9f;
                 model->aps[i].loc_rssi = -128; // weakest, so the first real fix always wins

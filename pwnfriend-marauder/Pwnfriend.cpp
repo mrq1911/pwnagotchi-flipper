@@ -642,19 +642,27 @@ void Pwnfriend::broadcast() {
         }
     }
 
-    esp_wifi_set_channel(_cur_channel, WIFI_SECOND_CHAN_NONE);
-    delay(1);
-
     // Re-emit the frame so updated stats (uptime, pwnd counts, face) propagate.
     rebuild();
 
-    // A few copies per burst — beacons are cheap and lossy. TX on the AP
-    // interface: STA-mode tx did not actually radiate (verified on-air). We keep
-    // beaconing even while dwelling so the mesh still hears us on this channel.
-    for (int i = 0; i < 3; i++) {
+    // Sprinkle the advertisement on EVERY channel this tick, not just the recon channel.
+    // A real pwngrid receiver hops on its own schedule and dwells a long time, so a beacon
+    // confined to our slow 1..13 sweep almost never coincides with the channel it's parked
+    // on — we hear its dense ~300ms stream easily, but it rarely catches our sparse per-
+    // channel burst. (An earlier single-channel build WAS seen; adding the recon hop is
+    // what broke discovery.) A quick all-channel pass — 2 lossy beacons each, ~1ms settle —
+    // guarantees it hears us within a tick. We then drop back to _cur_channel so our own
+    // sniff/attack dwell (and the next tick's attackChannel, which assumes the radio is
+    // already on _cur_channel) is unchanged.
+    for (uint8_t h = 0; h < NUM_HOP_CHANNELS; h++) {
+        esp_wifi_set_channel(HOP_CHANNELS[h], WIFI_SECOND_CHAN_NONE);
+        delay(1);
         esp_wifi_80211_tx(WIFI_IF_AP, _frame, _frame_len, false);
-        _sent++;
+        esp_wifi_80211_tx(WIFI_IF_AP, _frame, _frame_len, false);
+        _sent += 2;
     }
+    esp_wifi_set_channel(_cur_channel, WIFI_SECOND_CHAN_NONE); // back to recon/attack channel
+    delay(1);
 
     // One atomic write so this main-loop line can't interleave with the rx
     // callback's PWNFRIEND_* prints.
