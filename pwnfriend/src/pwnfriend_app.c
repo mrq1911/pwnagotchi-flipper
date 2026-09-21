@@ -1791,21 +1791,44 @@ static void ap_flags_str(const ApRec* a, char out[4]) {
 static void draw_str_trunc(Canvas* c, int x, int y, const char* s, int maxw) {
     const int xend = x + maxw;
     const int dot_cell = 5; // px a substituted glyph occupies
-    char one[2] = {0, 0};
-    for(const char* p = s; *p;) {
+    char run[48]; // buffer consecutive ASCII so a run draws as ONE string (proper kerning)
+    size_t rn = 0;
+    for(const char* p = s;; p++) {
         unsigned char ch = (unsigned char)*p;
-        if(ch >= 0x20 && ch < 0x7F) {
-            one[0] = *p;
-            int w = (int)canvas_string_width(c, one);
-            if(x + w > xend) break;
-            canvas_draw_str(c, x, y, one);
-            x += w;
-            p++;
-        } else {
-            // One dot per character: skip the lead byte then any UTF-8 continuation bytes.
-            p++;
-            while(((unsigned char)*p & 0xC0) == 0x80) p++;
-            if(x + dot_cell > xend) break;
+        bool ascii = (ch >= 0x20 && ch < 0x7F);
+        if(ascii && rn < sizeof(run) - 1) {
+            run[rn++] = *p;
+            continue;
+        }
+        if(rn) { // flush the accumulated ASCII run in one draw call
+            run[rn] = '\0';
+            int w = (int)canvas_string_width(c, run);
+            if(x + w <= xend) {
+                canvas_draw_str(c, x, y, run);
+                x += w;
+                rn = 0;
+            } else {
+                // Tail doesn't fit: grow char-by-char to the widest prefix that does, draw, stop.
+                char tmp[48];
+                size_t k = 0;
+                for(; k < rn; k++) {
+                    tmp[k] = run[k];
+                    tmp[k + 1] = '\0';
+                    if(x + (int)canvas_string_width(c, tmp) > xend) {
+                        tmp[k] = '\0';
+                        break;
+                    }
+                }
+                canvas_draw_str(c, x, y, tmp);
+                return;
+            }
+        }
+        if(ch == '\0') break;
+        if(!ascii) {
+            // One dot per non-ASCII character: skip its UTF-8 continuation bytes (the loop's
+            // p++ then steps past the last one).
+            while(((unsigned char)*(p + 1) & 0xC0) == 0x80) p++;
+            if(x + dot_cell > xend) return;
             canvas_draw_box(c, x + 1, y - 4, 2, 2); // centred in the ~8px row
             x += dot_cell;
         }
