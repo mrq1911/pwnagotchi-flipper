@@ -200,6 +200,7 @@ void Pwnfriend::reset() {
     _sent = 0;
     _last_active_ms = 0;
     _last_sweep_ms = 0;
+    _last_gps_ms = 0;
     _n_recon = 0;
     _n_pwnd_seen = 0;
     _n_sta = 0;
@@ -626,6 +627,22 @@ void Pwnfriend::broadcast() {
     int n = snprintf(line, sizeof(line), "PWNFRIEND_ADV name=%s ch=%u sent=%u ver=%d fw=%s\n",
                      _name, (unsigned)_cur_channel, (unsigned)_sent, PWNFRIEND_PROTO,
                      PWNFRIEND_FW_COMMIT);
+    if (n < 0) return;
+    if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
+    Serial.write((const uint8_t*)line, n);
+}
+
+// periodic fix status so the Flipper can watch acquisition / log TTFF. throttled, and
+// emitted even with no fix (sats climbing from 0 is the useful signal). raw module strings.
+void Pwnfriend::reportGps(bool fix, int sats, float acc_m, const char* lat, const char* lon) {
+    uint32_t now = millis();
+    if (now - _last_gps_ms < PWNFRIEND_GPS_EMIT_MS) return;
+    _last_gps_ms = now;
+    int acc = (int)(acc_m + 0.5f);
+    if (acc < 0) acc = 0;
+    char line[96];
+    int n = snprintf(line, sizeof(line), "PWNFRIEND_GPS fix=%d sats=%d acc=%d lat=%s lon=%s\n",
+                     fix ? 1 : 0, sats, acc, lat ? lat : "", lon ? lon : "");
     if (n < 0) return;
     if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
     Serial.write((const uint8_t*)line, n);

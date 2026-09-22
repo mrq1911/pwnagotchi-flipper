@@ -179,7 +179,8 @@ def main():
         tag="RunPwnfriendScan(scan_mode, color);")
     steps += d
 
-    # broadcast on every main() tick in pwnfriend mode, skip the rest.
+    # broadcast on every main() tick in pwnfriend mode, skip the rest. also feed the GPS
+    # fix status through so the friend can emit PWNFRIEND_GPS (throttled inside reportGps).
     t, d = insert_after(
         t,
         "void WiFiScan::main(uint32_t currentTime)\n{",
@@ -187,6 +188,11 @@ def main():
         "    if (currentTime - initTime >= 500) {\n"
         "      initTime = millis();\n"
         "      pwnfriend_obj.broadcast();\n"
+        "      #ifdef HAS_GPS\n"
+        "        pwnfriend_obj.reportGps(gps_obj.getFixStatus(), gps_obj.getNumSats(),\n"
+        "                                gps_obj.getAccuracy(), gps_obj.getLat().c_str(),\n"
+        "                                gps_obj.getLon().c_str());\n"
+        "      #endif\n"
         "    }\n"
         "    return;\n"
         "  }\n",

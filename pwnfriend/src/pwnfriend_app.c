@@ -66,6 +66,8 @@ typedef enum {
 // per-AP (position,rssi) samples, throttled per AP_TRACK_MIN_SECS
 #define AP_TRACK_PATH "/ext/apps_data/pwnfriend/ap_track.csv"
 #define AP_TRACK_MIN_SECS 10
+// GPS fix-status samples for debugging slow acquisition / time-to-first-fix
+#define GPS_PATH "/ext/apps_data/pwnfriend/gps.csv"
 // per-AP pcap bookkeeping: EAPOL filed? ESSID beacon spliced?
 #define APF_HS_SEEN 0x01
 #define APF_BEACON_DONE 0x02
@@ -235,6 +237,9 @@ typedef struct {
 
     // GPS: last_lat/lon are verbatim decimal-degree strings from the latest fix
     bool gps_seen;
+    int gps_sats; // satellites from the latest PWNFRIEND_GPS (live acquisition readout)
+    bool gps_fix; // module reports a valid fix (leads gps_seen, which also needs coords)
+    int gps_acc; // reported fix accuracy in metres from PWNFRIEND_GPS
     char last_lat[16];
     char last_lon[16];
     char gps_place[32]; // distance+direction to home, e.g. "Home 12km SW"
@@ -1327,6 +1332,44 @@ static void pwnfriend_handle_epoch_line(PwnfriendApp* app, const char* line) {
     storage_file_free(f);
 }
 
+// "PWNFRIEND_GPS fix=.. sats=.. acc=.. lat=.. lon=.." (fw v5) — periodic fix status, emitted
+// even with no fix, so we can watch acquisition on-screen and log TTFF to gps.csv.
+static void pwnfriend_handle_gps_line(PwnfriendApp* app, const char* line) {
+    int fix = 0, sats = 0, acc = 0;
+    char lat[16] = "", lon[16] = "";
+    line_extract_int(line, "fix=", &fix);
+    line_extract_int(line, "sats=", &sats);
+    line_extract_int(line, "acc=", &acc);
+    line_extract_number(line, "lat=", lat, sizeof(lat));
+    line_extract_number(line, "lon=", lon, sizeof(lon));
+
+    uint32_t up = 0;
+    with_view_model(
+        app->view, PwnfriendModel * model,
+        {
+            model->gps_fix = fix != 0;
+            model->gps_sats = sats;
+            model->gps_acc = acc;
+            up = model->tick_secs;
+        },
+        false);
+
+    storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
+    File* f = storage_file_alloc(app->storage);
+    if(storage_file_open(f, GPS_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
+        if(storage_file_size(f) == 0) {
+            const char* h = "uptime_s,fix,sats,acc_m,lat,lon\n";
+            storage_file_write(f, h, strlen(h));
+        }
+        char row[96];
+        snprintf(
+            row, sizeof(row), "%lu,%d,%d,%d,%s,%s\n", (unsigned long)up, fix, sats, acc, lat, lon);
+        storage_file_write(f, row, strlen(row));
+    }
+    storage_file_close(f);
+    storage_file_free(f);
+}
+
 static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
     // PWND and PEER share the PWNFRIEND_P prefix, so compare both fully
     if(strncmp(line, "PWNFRIEND_PEER ", 15) == 0) {
@@ -1341,6 +1384,8 @@ static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
         pwnfriend_handle_rssi_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_EPOCH ", 16) == 0) {
         pwnfriend_handle_epoch_line(app, line);
+    } else if(strncmp(line, "PWNFRIEND_GPS ", 14) == 0) {
+        pwnfriend_handle_gps_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_ADV ", 14) == 0) {
         pwnfriend_handle_adv_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_MISS ", 15) == 0) {
@@ -2263,7 +2308,9 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
                 y += 9;
             }
         } else {
-            HS_ROW("no GPS fix");
+            // no fix yet: show acquisition so a slow fix is visible (sats climbing = working)
+            HS_ROW("%s", model->gps_sats > 0 ? "acquiring" : "no signal");
+            HS_ROW("sats %d", model->gps_sats);
         }
         break;
     }
@@ -3178,6 +3225,9 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->about_speed = ABOUT_SPEED_DEFAULT;
             model->about_infinite = false; // default to bounce
             model->gps_seen = false;
+            model->gps_sats = 0;
+            model->gps_fix = false;
+            model->gps_acc = 0;
             model->last_lat[0] = '\0';
             model->last_lon[0] = '\0';
             model->gps_place[0] = '\0';

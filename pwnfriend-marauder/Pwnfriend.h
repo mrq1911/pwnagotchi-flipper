@@ -10,11 +10,15 @@
 // serial-protocol version, stamped on PWNFRIEND_ADV (ver=N) so the Flipper warns on
 // stale firmware. bump on any protocol change. v2=dwell recon+unicast/repeat deauth+
 // PMKID auth+ESSID embed+flags; v3=live RSSI (PWNFRIEND_RSSI); v4=epoch telemetry+
-// provenance (via=)+floor-free PMKID.
-#define PWNFRIEND_PROTO 4
+// provenance (via=)+floor-free PMKID; v5=PWNFRIEND_GPS fix-status telemetry.
+#define PWNFRIEND_PROTO 5
 
 // min interval between PWNFRIEND_RSSI updates per AP, so re-heard beacons don't flood serial.
 #define PWNFRIEND_RSSI_EMIT_MS 3000
+
+// min interval between PWNFRIEND_GPS status lines (emitted even with no fix) so the Flipper
+// can watch fix acquisition / log time-to-first-fix without flooding serial.
+#define PWNFRIEND_GPS_EMIT_MS 3000
 
 #include <Arduino.h>
 #include <esp_wifi.h>
@@ -42,6 +46,10 @@ class Pwnfriend {
     // geotag the sighting (RSSI + position -> triangulate offline).
     void reportPeer(const uint8_t* payload, int length, int rssi, int channel,
                     bool has_fix, double lat, double lon);
+
+    // periodic GPS fix status (throttled; emitted even with no fix) so the Flipper can
+    // watch acquisition and log time-to-first-fix. lat/lon are the module's raw strings.
+    void reportGps(bool fix, int sats, float acc_m, const char* lat, const char* lon);
 
     // capture path (rx callback, DATA frames). detects EAPOL M2 / RSN PMKID (M1) and
     // emits PWNFRIEND_PWND once per BSSID; streams every EAPOL frame as a self-describing
@@ -114,6 +122,7 @@ class Pwnfriend {
     uint8_t  _cur_channel;     // channel we're parked on right now
     uint32_t _last_hop_ms;     // recon-sweep hop cadence timer
     uint32_t _last_sweep_ms;   // all-channel advertise-sweep cadence timer
+    uint32_t _last_gps_ms;     // PWNFRIEND_GPS status-line cadence timer
     uint8_t  _attack_list[14]; // AP-bearing channels to attack this epoch
     int      _n_attack;        // channels in _attack_list
     int      _attack_idx;      // current channel within _attack_list
