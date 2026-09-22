@@ -2400,7 +2400,7 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
     canvas_set_font(canvas, FontSecondary);
     const Persona* p = model->persona;
     const int x = 61;
-    int y = 17;
+    int y = 20; // start a touch lower so the mode label (y15) sits cleanly above it
     char l[40];
 #define HS_ROW(...)                              \
     do {                                         \
@@ -2461,6 +2461,15 @@ static void pwnfriend_draw_home(Canvas* canvas, PwnfriendModel* model) {
     pwnagotchi_draw_lines(pwn, canvas);
     pwnagotchi_draw_friend(pwn, canvas);
     pwnagotchi_draw_handshakes(pwn, canvas);
+    // current Mode, top-right just under the header line + battery (Up/Down cycles it here)
+    canvas_set_font(canvas, FontSecondary);
+    char ms[16];
+    if(model->capture_mode == CaptureAuto)
+        snprintf(ms, sizeof(ms), "A>%s", capture_name(effective_capture(model)));
+    else
+        snprintf(ms, sizeof(ms), "%s", capture_name(model->capture_mode));
+    int mw = (int)canvas_string_width(canvas, ms);
+    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - mw, 15, ms);
     // Mood page (or paused) speaks; other pages show the stat panel; exit/staying always speaks
     bool reacting = model->confirm_exit || model->tick_secs < model->stayed_until;
     if(!reacting && model->advertising && model->stat_page != StatPageMood)
@@ -2644,8 +2653,24 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                 true);
             return true;
         }
-        // Up/Down unused on home (channel is set by targeting an AP)
-        if(event->key == InputKeyUp || event->key == InputKeyDown) return true;
+        // Up/Down cycle the capture Mode right from home (wardrive/roam/siege/auto)
+        if(event->key == InputKeyUp || event->key == InputKeyDown) {
+            int dir = (event->key == InputKeyUp) ? 1 : -1;
+            bool need_adv = false;
+            with_view_model(
+                app->view, PwnfriendModel * model,
+                {
+                    model->capture_mode = (uint8_t)(((int)model->capture_mode + dir +
+                                                     CaptureModeCount) %
+                                                    CaptureModeCount);
+                    if(!model->consent_given) model->showing_consent = true; // active TX needs it
+                    need_adv = model->advertising;
+                    home_save(app->storage, model);
+                },
+                true);
+            if(need_adv) pwnfriend_send_advertise(app);
+            return true;
+        }
         return true; // Back (exit) is handled above; swallow any other stray key
 
     case ScreenMenu:
