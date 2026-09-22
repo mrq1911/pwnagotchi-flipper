@@ -129,6 +129,10 @@ typedef struct {
 // this long parked (or with no GPS fix).
 #define AUTO_MOVE_KM 0.02f
 #define AUTO_STATIONARY_SECS 45
+// GPS-independent movement fallback: discovering >= this many new APs per window = moving
+// (walking/biking keeps finding new APs; a parked spot's AP set goes stale).
+#define AUTO_AP_WINDOW_SECS 15
+#define AUTO_AP_MOVE_COUNT 4
 
 typedef enum {
     CaptureWardrive = 0, // recon-only fast sweep, record what's heard, no attack (for moving)
@@ -239,7 +243,9 @@ typedef struct {
 
     // Auto mode movement tracking (Auto = wardrive while moving, siege when parked/no-GPS).
     float move_ref_lat, move_ref_lon; // reference fix we measure displacement from (1e9 = none)
-    uint32_t last_move_secs; // tick_secs we last moved past AUTO_MOVE_KM
+    uint32_t last_move_secs; // tick_secs we last moved (GPS displacement OR AP churn)
+    uint32_t ap_rate_ref; // aps_session snapshot for the GPS-independent movement fallback
+    uint32_t ap_rate_ref_secs; // tick of that snapshot
     bool auto_moving; // computed each tick: moving recently (drives Auto's wardrive vs siege)
     uint8_t last_cap_eff; // last effective capture mode pushed to the ESP (change-triggered resend)
     bool confirm_reset; // modal: "reset settings?" confirmation
@@ -3231,7 +3237,9 @@ static void pwnfriend_timer_callback(void* ctx) {
                 model->on_power = furi_hal_power_get_usb_voltage() > 4.0f;
                 model->charging = furi_hal_power_is_charging(); // charging -> "PWR %"; stopped -> "PWR"
 
-                // Auto mode: track GPS movement to pick roam (moving) vs siege (parked/no-fix).
+                // Auto mode: detect movement to pick wardrive (moving) vs siege (parked). two
+                // signals stamp last_move_secs: GPS displacement, and (GPS-independent) a burst
+                // of newly-discovered APs — so it still works when the fix is stuck.
                 if(model->capture_mode == CaptureAuto) {
                     if(model->gps_fix && coord_ok(model->last_lat, model->last_lon)) {
                         float clat = parse_deg(model->last_lat);
@@ -3246,8 +3254,15 @@ static void pwnfriend_timer_callback(void* ctx) {
                             model->last_move_secs = model->tick_secs;
                         }
                     }
-                    // moving = a fix seen AND displacement within the last AUTO_STATIONARY_SECS
-                    model->auto_moving = (model->move_ref_lat < 1e8f) &&
+                    // AP-churn fallback: enough new APs since the last window -> moving
+                    if(model->tick_secs - model->ap_rate_ref_secs >= AUTO_AP_WINDOW_SECS) {
+                        if(model->persona->aps_session - model->ap_rate_ref >= AUTO_AP_MOVE_COUNT)
+                            model->last_move_secs = model->tick_secs;
+                        model->ap_rate_ref = model->persona->aps_session;
+                        model->ap_rate_ref_secs = model->tick_secs;
+                    }
+                    // moving = a move was stamped within the last AUTO_STATIONARY_SECS
+                    model->auto_moving = (model->last_move_secs != 0) &&
                                          (model->tick_secs - model->last_move_secs <
                                           AUTO_STATIONARY_SECS);
                 } else {
@@ -3499,6 +3514,8 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->move_ref_lat = 1e9f; // no reference fix yet
             model->move_ref_lon = 1e9f;
             model->last_move_secs = 0;
+            model->ap_rate_ref = 0;
+            model->ap_rate_ref_secs = 0;
             model->auto_moving = false;
             model->last_cap_eff = 0xFF; // sentinel: forces the first -mode push
             model->confirm_reset = false;
