@@ -1745,14 +1745,6 @@ static bool ap_signal_recent(const PwnfriendModel* m, uint16_t i) {
     return m->ap_seen_tick[i] != 0 && (m->tick_secs - m->ap_seen_tick[i]) <= AP_SIGNAL_TTL_SECS;
 }
 
-// Compact capture flags for a list row: E(SSID)/P(MKID)/H(andshake), '-' if absent.
-static void ap_flags_str(const ApRec* a, char out[4]) {
-    out[0] = a->has_essid ? 'E' : '-';
-    out[1] = a->pmkid ? 'P' : '-';
-    out[2] = a->handshake ? 'H' : '-';
-    out[3] = '\0';
-}
-
 // draw s at baseline (x,y), clipped to maxw. ASCII renders; every other UTF-8 char draws as
 // one centred dot (Flipper font can't). display-only; raw SSID stays in the CSV/pcap.
 static void draw_str_trunc(Canvas* c, int x, int y, const char* s, int maxw) {
@@ -2103,8 +2095,10 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
         char right[8];
         if(pwned_view)
             snprintf(right, sizeof(right), "%s", ap_crackable(a) ? "CRACK" : "cap");
+        else if(model->ap_clients[apidx]) // clients associated -> worth deauthing; blank when none
+            snprintf(right, sizeof(right), "%u", (unsigned)model->ap_clients[apidx]);
         else
-            ap_flags_str(a, right);
+            right[0] = '\0';
         int fw = (int)canvas_string_width(canvas, right);
         int fx = FLIPPER_SCREEN_WIDTH - 2 - fw; // right element hugs the right edge
         int marker_x = pwned_view ? fx - 10 : 0;
