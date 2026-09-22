@@ -1409,6 +1409,7 @@ static void pwnfriend_handle_gps_line(PwnfriendApp* app, const char* line) {
     line_extract_number(line, "lon=", lon, sizeof(lon));
 
     uint32_t up = 0;
+    int em = 0; // effective capture mode, to correlate fix behaviour with the mode
     with_view_model(
         app->view, PwnfriendModel * model,
         {
@@ -1416,19 +1417,23 @@ static void pwnfriend_handle_gps_line(PwnfriendApp* app, const char* line) {
             model->gps_sats = sats;
             model->gps_acc = acc;
             up = model->tick_secs;
+            em = (int)effective_capture(model);
         },
         false);
+    // effective_capture resolves Auto -> roam/siege, so em is one of wardrive/roam/siege
+    const char* mode = em == CaptureRoam ? "roam" : em == CaptureSiege ? "siege" : "wardrive";
 
     storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
     File* f = storage_file_alloc(app->storage);
     if(storage_file_open(f, GPS_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
         if(storage_file_size(f) == 0) {
-            const char* h = "uptime_s,fix,sats,acc_m,lat,lon\n";
+            const char* h = "uptime_s,fix,sats,acc_m,lat,lon,mode\n";
             storage_file_write(f, h, strlen(h));
         }
         char row[96];
         snprintf(
-            row, sizeof(row), "%lu,%d,%d,%d,%s,%s\n", (unsigned long)up, fix, sats, acc, lat, lon);
+            row, sizeof(row), "%lu,%d,%d,%d,%s,%s,%s\n", (unsigned long)up, fix, sats, acc, lat,
+            lon, mode);
         storage_file_write(f, row, strlen(row));
     }
     storage_file_close(f);
