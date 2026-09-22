@@ -163,6 +163,7 @@ def main():
   this->changeChannel(this->set_channel);
   this->wifi_initialized = true;
   initTime = millis();
+  esp_wifi_set_max_tx_power(pwnfriend_obj.saverLevel() ? 40 : 78);  // battery-saver TX cut
 }
 
 '''
@@ -185,6 +186,18 @@ def main():
         t,
         "void WiFiScan::main(uint32_t currentTime)\n{",
         "  if (currentScanMode == WIFI_SCAN_PWNFRIEND) {\n"
+        "    int pf_sv = pwnfriend_obj.saverTick(currentTime);  // deep saver: duty-cycle radio\n"
+        "    if (pf_sv == 1) { esp_wifi_set_promiscuous(false); esp_wifi_stop(); }  // doze off\n"
+        "    else if (pf_sv == 2) {  // wake: bring the radio back up (no beginSession, keep state)\n"
+        "      esp_wifi_start();\n"
+        "      esp_wifi_set_promiscuous(true);\n"
+        "      esp_wifi_set_promiscuous_filter(&filt);\n"
+        "      esp_wifi_set_promiscuous_rx_cb(&beaconSnifferCallback);\n"
+        "      this->changeChannel(this->set_channel);\n"
+        "      esp_wifi_set_max_tx_power(pwnfriend_obj.saverLevel() ? 40 : 78);\n"
+        "      initTime = currentTime;\n"
+        "    }\n"
+        "    if (pf_sv == 1 || pf_sv == 3) return;  // dozing: skip broadcast\n"
         "    if (currentTime - initTime >= 500) {\n"
         "      initTime = millis();\n"
         "      pwnfriend_obj.broadcast();\n"

@@ -120,6 +120,14 @@ static const uint32_t ADVERTISE_SWEEP_MS  = 1500;
 static const uint8_t  MAX_INACTIVE_SCALE  = 2;     // personality.max_inactive_scale
 static const uint8_t  RECON_INACTIVE_MULT = 2;     // personality.recon_inactive_multiplier
 
+// battery saver. light/deep slow the advert sweep + drop TX power; deep also duty-cycles the
+// radio (scan SAVER_ON_MS, then stop it for SAVER_OFF_MS). TX power is 0.25 dBm units.
+static const uint32_t ADVERTISE_SWEEP_SAVER_MS = 5000;
+static const uint32_t SAVER_ON_MS   = 25000;
+static const uint32_t SAVER_OFF_MS  = 25000;
+static const int8_t   SAVER_TX_POWER = 40;  // ~10 dBm
+static const int8_t   FULL_TX_POWER  = 78;  // ~19.5 dBm (near max)
+
 // re-kick clients across the dwell: clients reconnect at random offsets, so one
 // burst at t=0 misses most 4-way replays.
 static const uint32_t DEAUTH_REPEAT_MS = 2000;     // deauth pass every 2s while dwelling
@@ -201,6 +209,10 @@ void Pwnfriend::reset() {
     _last_active_ms = 0;
     _last_sweep_ms = 0;
     _last_gps_ms = 0;
+    _saver = 0;
+    _saver_idle = false;
+    _saver_phase_ms = 0;
+    _saver_hb_ms = 0;
     _n_recon = 0;
     _n_pwnd_seen = 0;
     _n_sta = 0;
@@ -420,6 +432,7 @@ bool Pwnfriend::configureFromArgs(LinkedList<String>* args) {
     int prev_n_wl = _n_wl;
     uint8_t prev_wl[MAX_WL][6]; memcpy(prev_wl, _wl, sizeof(_wl));
     uint32_t prev_recon = _recon_time_ms;
+    uint8_t prev_saver = _saver;
     for (int i = 1; i < args->size() - 1; i++) {
         String flag = args->get(i);
         String val = args->get(i + 1);
@@ -462,6 +475,9 @@ bool Pwnfriend::configureFromArgs(LinkedList<String>* args) {
         } else if (flag == "-recon") {
             int s = val.toInt();
             if (s >= 5 && s <= 600) _recon_time_ms = (uint32_t)s * 1000;
+        } else if (flag == "-saver") {
+            int lv = val.toInt();
+            _saver = (uint8_t)(lv < 0 ? 0 : (lv > 2 ? 2 : lv));
         } else if (flag == "-target") {
             // 12-hex BSSID to focus on; "0"/empty/malformed clears the target.
             uint8_t b[6];
@@ -490,6 +506,9 @@ bool Pwnfriend::configureFromArgs(LinkedList<String>* args) {
                        (_n_wl != prev_n_wl) || memcmp(_wl, prev_wl, sizeof(_wl)) != 0 ||
                        (_recon_time_ms != prev_recon);
     if (cfg_changed) resetPhase();
+    // saver level changed: nudge TX power now (harmless no-op if WiFi isn't up yet).
+    if (_saver != prev_saver)
+        esp_wifi_set_max_tx_power(_saver ? SAVER_TX_POWER : FULL_TX_POWER);
     rebuild();
     _ready = true;
     return true;
@@ -601,7 +620,8 @@ void Pwnfriend::broadcast() {
 
     // every ADVERTISE_SWEEP_MS spray the advert across ALL channels (2 beacons each, ~1ms
     // settle) then return to _cur_channel; between sweeps just beacon on _cur_channel.
-    if (now - _last_sweep_ms >= ADVERTISE_SWEEP_MS) {
+    uint32_t sweep_ms = _saver ? ADVERTISE_SWEEP_SAVER_MS : ADVERTISE_SWEEP_MS;
+    if (now - _last_sweep_ms >= sweep_ms) {
         _last_sweep_ms = now;
         for (uint8_t h = 0; h < NUM_HOP_CHANNELS; h++) {
             esp_wifi_set_channel(HOP_CHANNELS[h], WIFI_SECOND_CHAN_NONE);
@@ -630,6 +650,39 @@ void Pwnfriend::broadcast() {
     if (n < 0) return;
     if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
     Serial.write((const uint8_t*)line, n);
+}
+
+// deep-saver duty cycle. the pump acts on the return: 0 keep scanning, 1 doze now (stop
+// radio), 2 wake now (restart radio), 3 stay dozing. emits PWNFRIEND_DOZE while dozing so the
+// Flipper link watchdog doesn't cry "no ESP32".
+int Pwnfriend::saverTick(uint32_t now) {
+    if (_saver < 2) {
+        if (_saver_idle) { _saver_idle = false; return 2; }  // left deep mid-doze -> wake radio
+        return 0;
+    }
+    if (_saver_phase_ms == 0) _saver_phase_ms = now;
+    if (!_saver_idle) {
+        if (now - _saver_phase_ms >= SAVER_ON_MS) {
+            _saver_idle = true;
+            _saver_phase_ms = now;
+            _saver_hb_ms = now;
+            const char* d = "PWNFRIEND_DOZE\n";
+            Serial.write((const uint8_t*)d, 15);
+            return 1;
+        }
+        return 0;
+    }
+    if (now - _saver_phase_ms >= SAVER_OFF_MS) {
+        _saver_idle = false;
+        _saver_phase_ms = now;
+        return 2;
+    }
+    if (now - _saver_hb_ms >= 3000) {  // < the Flipper's 5s link-timeout so it never cries
+        _saver_hb_ms = now;
+        const char* d = "PWNFRIEND_DOZE\n";
+        Serial.write((const uint8_t*)d, 15);
+    }
+    return 3;
 }
 
 // periodic fix status so the Flipper can watch acquisition / log TTFF. throttled, and

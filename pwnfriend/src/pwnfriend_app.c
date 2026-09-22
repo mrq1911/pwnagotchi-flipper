@@ -178,6 +178,7 @@ typedef enum {
     MenuRecon, // adjust
     MenuQuiet, // toggle
     MenuTriangulate, // toggle: on-device location estimate + sample logging
+    MenuBattery, // cycle: off / light / deep battery saver
     MenuAbout, // OK: about (pinned last)
     MenuCount,
 } MenuItem;
@@ -223,6 +224,7 @@ typedef struct {
     uint8_t battery_pct; // cached battery %, refreshed once/sec (shown in the BAT slot)
     int8_t min_rssi; // attack floor sent as -minrssi (default -78)
     uint16_t recon_secs; // recon_time sent as -recon (default 30)
+    uint8_t saver; // battery saver sent as -saver: 0 off, 1 light, 2 deep (persisted)
 
     // View state.
     Screen screen;
@@ -383,7 +385,7 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
                 cmd,
                 sizeof(cmd),
                 "pwnfriend -n %s -id %s -f %d -pr %lu -pt %lu -u %lu -e %lu -cap %d "
-                "-deauth %d -assoc %d -ch %d -minrssi %d -recon %u -target %s -wl %s\n",
+                "-deauth %d -assoc %d -ch %d -minrssi %d -recon %u -saver %d -target %s -wl %s\n",
                 safe_name,
                 p->s.identity,
                 (int)persona_face(p),
@@ -397,6 +399,7 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
                 ch,
                 (int)model->min_rssi,
                 (unsigned)model->recon_secs,
+                (int)model->saver,
                 target,
                 wl);
             model->last_adv_sent = model->tick_secs;
@@ -793,6 +796,7 @@ typedef struct {
     uint8_t quiet;
     uint8_t home_set; // v3: user set a home (vs default Prague)
     uint8_t triangulate; // v4: on-device triangulation enabled
+    uint8_t saver; // v5: battery saver 0/1/2
 } HomeDb;
 
 static void home_load(Storage* storage, PwnfriendModel* model) {
@@ -807,7 +811,9 @@ static void home_load(Storage* storage, PwnfriendModel* model) {
             model->quiet = h.quiet != 0;
             model->home_set = h.home_set != 0;
             // triangulate present only from v4; older records keep the alloc default (on).
-            if(got >= sizeof(HomeDb) && h.version >= 4) model->triangulate = h.triangulate != 0;
+            if(got >= offsetof(HomeDb, saver) && h.version >= 4) model->triangulate = h.triangulate != 0;
+            // saver present only from v5; older records keep the alloc default (off).
+            if(got >= sizeof(HomeDb) && h.version >= 5) model->saver = h.saver;
         }
     }
     storage_file_close(f);
@@ -818,9 +824,9 @@ static void home_save(Storage* storage, PwnfriendModel* model) {
     storage_common_mkdir(storage, "/ext/apps_data/pwnfriend");
     File* f = storage_file_alloc(storage);
     if(storage_file_open(f, HOME_DB_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        HomeDb h = {HOME_DB_MAGIC, 4, model->home_lat, model->home_lon,
+        HomeDb h = {HOME_DB_MAGIC, 5, model->home_lat, model->home_lon,
                     (uint8_t)(model->quiet ? 1 : 0), (uint8_t)(model->home_set ? 1 : 0),
-                    (uint8_t)(model->triangulate ? 1 : 0)};
+                    (uint8_t)(model->triangulate ? 1 : 0), model->saver};
         storage_file_write(f, &h, sizeof(h));
     }
     storage_file_close(f);
@@ -1878,6 +1884,13 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
             adjustable = true;
             snprintf(value, sizeof(value), "%s", model->triangulate ? "on" : "off");
             break;
+        case MenuBattery:
+            label = "Battery";
+            adjustable = true;
+            snprintf(
+                value, sizeof(value), "%s",
+                model->saver == 2 ? "deep" : model->saver == 1 ? "light" : "off");
+            break;
         case MenuAbout: label = "About"; break;
         default: break;
         }
@@ -2562,6 +2575,11 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         model->triangulate = !model->triangulate;
                         home_save(app->storage, model);
                         break;
+                    case MenuBattery:
+                        model->saver = (uint8_t)(((int)model->saver + dir + 3) % 3);
+                        need_advertise = model->advertising; // push -saver to the ESP
+                        home_save(app->storage, model);
+                        break;
                     default: break; // nav rows act on OK
                     }
                 },
@@ -3218,6 +3236,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->pwn_passive = 0;
             model->quiet = false;
             model->triangulate = true; // on by default; home_load may turn it off
+            model->saver = 0; // battery saver off by default; home_load may restore it
             model->confirm_exit = false;
             model->confirm_secs = 0;
             model->stayed_until = 0;

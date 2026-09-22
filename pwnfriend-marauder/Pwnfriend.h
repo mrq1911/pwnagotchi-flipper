@@ -81,8 +81,18 @@ class Pwnfriend {
         _epoch_seq = 0;
         _ep_assoc = _ep_deauth = _ep_unicast = _ep_hs = _ep_pmkid = _ep_miss = 0;
         _ep_dpmf = _ep_dnocli = 0;
+        _saver_idle = false;       // duty-cycle state; _saver level itself is kept (set by args)
+        _saver_phase_ms = 0;
+        _saver_hb_ms = 0;
         resetPhase();
     }
+
+    // battery-saver level: 0 off, 1 light (lower TX power + slower advert), 2 deep (+ radio
+    // duty-cycle). set from the -saver arg.
+    uint8_t saverLevel() const { return _saver; }
+    // advance the deep-saver duty cycle; returns 0 keep scanning, 1 doze now (stop radio),
+    // 2 wake now (restart radio), 3 stay dozing (skip broadcast). also emits a doze heartbeat.
+    int saverTick(uint32_t now);
 
     void reset();
 
@@ -123,6 +133,10 @@ class Pwnfriend {
     uint32_t _last_hop_ms;     // recon-sweep hop cadence timer
     uint32_t _last_sweep_ms;   // all-channel advertise-sweep cadence timer
     uint32_t _last_gps_ms;     // PWNFRIEND_GPS status-line cadence timer
+    uint8_t  _saver;           // battery-saver level (0/1/2), from -saver
+    bool     _saver_idle;      // deep saver: radio currently dozed off
+    uint32_t _saver_phase_ms;  // millis() the current doze/scan phase began
+    uint32_t _saver_hb_ms;     // last PWNFRIEND_DOZE heartbeat while dozing
     uint8_t  _attack_list[14]; // AP-bearing channels to attack this epoch
     int      _n_attack;        // channels in _attack_list
     int      _attack_idx;      // current channel within _attack_list
