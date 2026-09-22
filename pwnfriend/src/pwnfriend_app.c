@@ -2408,7 +2408,7 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
     canvas_set_font(canvas, FontSecondary);
     const Persona* p = model->persona;
     const int x = 61;
-    int y = 20; // start a touch lower so the mode label (y15) sits cleanly above it
+    int y = 17;
     char l[40];
 #define HS_ROW(...)                              \
     do {                                         \
@@ -2469,7 +2469,7 @@ static void pwnfriend_draw_home(Canvas* canvas, PwnfriendModel* model) {
     pwnagotchi_draw_lines(pwn, canvas);
     pwnagotchi_draw_friend(pwn, canvas);
     pwnagotchi_draw_handshakes(pwn, canvas);
-    // current Mode, top-right just under the header line + battery (Up/Down cycles it here)
+    // current Mode, bottom-right just above the lower separator line (Up/Down cycles it here)
     canvas_set_font(canvas, FontSecondary);
     char ms[16];
     if(model->capture_mode == CaptureAuto)
@@ -2477,7 +2477,7 @@ static void pwnfriend_draw_home(Canvas* canvas, PwnfriendModel* model) {
     else
         snprintf(ms, sizeof(ms), "%s", capture_name(model->capture_mode));
     int mw = (int)canvas_string_width(canvas, ms);
-    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - mw, 15, ms);
+    canvas_draw_str(canvas, FLIPPER_SCREEN_WIDTH - mw, 52, ms);
     // Mood page (or paused) speaks; other pages show the stat panel; exit/staying always speaks
     bool reacting = model->confirm_exit || model->tick_secs < model->stayed_until;
     if(!reacting && model->advertising && model->stat_page != StatPageMood)
