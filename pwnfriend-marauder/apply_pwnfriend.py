@@ -279,6 +279,25 @@ def main():
     steps += d
     _write(p, t)
 
+    # 3d. GPS: drop the per-boot $PSTMSRR reset in GpsInterface::begin(). resetting the
+    # Teseo GNSS engine on every power-up throws away a backup-powered hot start and slows
+    # TTFF; the constellation mask still persists via SAVEPAR, so the reset is redundant.
+    # tolerant: some Marauder bases don't send PSTM commands at all.
+    p = src / "GpsInterface.cpp"
+    if p.exists():
+        t = _read(p)
+        try:
+            t, d = replace_once(
+                t,
+                '  MicroNMEA::sendSentence(Serial2, "$PSTMSRR");',
+                "  // pwnfriend: no per-boot $PSTMSRR reset -- restarting the GNSS engine every\n"
+                "  // boot discards a backup-powered hot start and slows TTFF. the mask set above\n"
+                "  // persists in NVM via SAVEPAR; a reset is only needed to *change* it.",
+                tag="pwnfriend: no per-boot $PSTMSRR")
+            _write(p, t); steps += d
+        except AnchorError:
+            print("  note: $PSTMSRR absent in GpsInterface.cpp; skipped GPS-reset patch")
+
     # 4. CommandLine.h — the command string.
     p = src / "CommandLine.h"
     t = _read(p)
