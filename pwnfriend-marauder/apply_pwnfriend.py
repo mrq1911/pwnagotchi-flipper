@@ -294,12 +294,27 @@ def main():
                 t,
                 '  MicroNMEA::sendSentence(Serial2, "$PSTMSRR");',
                 "  // pwnfriend: no per-boot $PSTMSRR reset -- restarting the GNSS engine every\n"
-                "  // boot discards a backup-powered hot start and slows TTFF. the mask set above\n"
-                "  // persists in NVM via SAVEPAR; a reset is only needed to *change* it.",
+                "  // boot discards a backup-powered hot start and slows TTFF (Teseo only; a\n"
+                "  // reset is only needed to *change* the mask, which SAVEPAR already persisted).",
                 tag="pwnfriend: no per-boot $PSTMSRR")
             _write(p, t); steps += d
         except AnchorError:
             print("  note: $PSTMSRR absent in GpsInterface.cpp; skipped GPS-reset patch")
+
+        # the FEBERIS module is a CASIC 'URANUS' (AT6558-class), which ignores $PSTM and
+        # defaults to GPS+BeiDou. enable GLONASS too (mask 7 = GPS+BDS+GLONASS) for more
+        # birds / faster locks. runtime only (no $PCAS00 save) so it reverts on power-cycle.
+        t = _read(p)
+        try:
+            t, d = replace_once(
+                t,
+                '  MicroNMEA::sendSentence(Serial2, "$PSTMSAVEPAR");',
+                '  MicroNMEA::sendSentence(Serial2, "$PSTMSAVEPAR");\n'
+                '  MicroNMEA::sendSentence(Serial2, "$PCAS04,7");  // pwnfriend: GPS+BDS+GLONASS (CASIC)',
+                tag='"$PCAS04,7"')
+            _write(p, t); steps += d
+        except AnchorError:
+            print("  note: $PSTMSAVEPAR absent; skipped CASIC constellation enable")
 
     # 3e. GPS: read-only capability probe. sends $PSTMGETSWVER/$PSTMGETPAR (queries, never a
     # write) and collects the module's $PSTM replies for ~1.4s so we can see which Teseo
