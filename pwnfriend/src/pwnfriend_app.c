@@ -222,7 +222,8 @@ typedef struct {
     uint8_t stat_page; // home stat panel, cycled Left/Right (0 = persona voice)
     uint32_t stat_touch_secs; // tick of the last Left/Right on home (for auto-revert)
     uint8_t battery_pct; // cached battery %, refreshed once/sec (shown in the BAT slot)
-    bool on_power; // external power connected (charging) -> saver forced off; slot shows PWR
+    bool on_power; // external power connected (VBUS) -> saver forced off; slot shows PWR
+    bool charge_done; // fully charged on power -> slot shows "PWR" without a %
     int8_t min_rssi; // attack floor sent as -minrssi (default -78)
     uint16_t recon_secs; // recon_time sent as -recon (default 30)
     uint8_t saver; // user's battery-saver choice: 0 off, 1 light, 2 deep, 3 auto (persisted)
@@ -1459,11 +1460,16 @@ static void pwnfriend_populate(PwnfriendModel* model) {
     }
     furi_string_printf(pwn->apStat, "%u", (unsigned)apc);
 
-    // BAT slot: power/saver-aware label + %. PWR on external power; else BAT / BAT L / BAT D
-    // per the effective saver level (uptime itself lives on the Stats screen).
-    uint8_t eff_sv = effective_saver(model);
-    const char* slot = model->on_power ? "PWR" : (eff_sv == 2 ? "BAT D" : (eff_sv == 1 ? "BAT L" : "BAT"));
-    furi_string_printf(pwn->uptime, "%s %u%%", slot, (unsigned)model->battery_pct);
+    // BAT slot: power/saver-aware label + %. on power: "PWR" alone when full, "PWR 85%" while
+    // charging; on battery: BAT / BAT L / BAT D per the effective saver level, + %.
+    if(model->on_power && model->charge_done) {
+        furi_string_set_str(pwn->uptime, "PWR");
+    } else {
+        uint8_t eff_sv = effective_saver(model);
+        const char* slot = model->on_power ? "PWR" :
+                           (eff_sv == 2 ? "BAT D" : (eff_sv == 1 ? "BAT L" : "BAT"));
+        furi_string_printf(pwn->uptime, "%s %u%%", slot, (unsigned)model->battery_pct);
+    }
 
     // PWND: real handshakes captured, this session (lifetime).
     furi_string_printf(
@@ -3063,6 +3069,7 @@ static void pwnfriend_timer_callback(void* ctx) {
                 // even data-only USB) -> saver forced off, slot shows PWR. is_charging() alone
                 // misses the full-battery case.
                 model->on_power = furi_hal_power_get_usb_voltage() > 4.0f;
+                model->charge_done = furi_hal_power_is_charging_done(); // full -> "PWR" (no %)
                 // Home stat panel auto-reverts to the persona voice after a quiet spell.
                 if(model->stat_page != StatPageMood &&
                    model->tick_secs - model->stat_touch_secs >= HOME_STATS_TIMEOUT_SECS)
@@ -3084,8 +3091,11 @@ static void pwnfriend_timer_callback(void* ctx) {
                 if(model->advertising) {
                     uint32_t since_rx = model->tick_secs - model->last_rx_secs;
                     uint32_t since_adv = model->tick_secs - model->advertising_since;
-                    model->link_down = (since_rx >= PWNFRIEND_LINK_TIMEOUT_SECS) &&
-                                       (since_adv >= PWNFRIEND_LINK_GRACE_SECS);
+                    // deep saver dozes the radio ~25s at a time (near-silent) — don't flash the
+                    // "no ESP32" screen then; only warn after a much longer real silence.
+                    uint32_t link_to = (effective_saver(model) == 2) ? 40 : PWNFRIEND_LINK_TIMEOUT_SECS;
+                    model->link_down =
+                        (since_rx >= link_to) && (since_adv >= PWNFRIEND_LINK_GRACE_SECS);
                 } else {
                     model->link_down = false; // paused never warns
                 }
