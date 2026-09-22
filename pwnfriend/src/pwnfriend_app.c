@@ -1913,7 +1913,7 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
     draw_titlebar(canvas, "pwnfriend menu", NULL);
     canvas_set_font(canvas, FontSecondary);
 
-    uint16_t wl = 0; // "Ignore" count (whitelisted); pwned/recent counters use session totals
+    uint16_t wl = 0; // "Ignore" count (whitelisted)
     for(uint16_t i = 0; i < model->ap_count; i++) {
         if(model->aps[i].whitelisted) wl++;
     }
@@ -1929,9 +1929,9 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
         bool adjustable = false; // draws ◄ value ► instead of a plain right-aligned value
         switch(it) {
         // OK-activated rows: a plain right-aligned value (count / name / hint).
-        case MenuPwnedAps: // session total pwned (deduped), not the capped list count
+        case MenuPwnedAps: // lifetime total pwned (persists across sessions)
             label = "Pwned APs";
-            snprintf(value, sizeof(value), "%lu", (unsigned long)model->persona->pwnd_run);
+            snprintf(value, sizeof(value), "%lu", (unsigned long)model->persona->s.pwnd_tot);
             break;
         case MenuAllAps:
             label = "Recent APs";
@@ -2042,12 +2042,12 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
                                                 "RECENT APS");
     uint16_t idx[AP_MAX];
     uint16_t n = ap_filtered(model, idx);
-    // hint = session total (can exceed the rolling 256-entry list), matching the menu counters;
-    // ignored stays the live filtered count.
+    // hint matches the menu counters: recent = session tally, pwned = lifetime total (both can
+    // exceed the rolling 256-entry list); ignored stays the live filtered count.
     const Persona* pp = model->persona;
     char hint[10];
     if(model->list_filter == FilterPwned)
-        snprintf(hint, sizeof(hint), "%lu", (unsigned long)pp->pwnd_run);
+        snprintf(hint, sizeof(hint), "%lu", (unsigned long)pp->s.pwnd_tot);
     else if(model->list_filter == FilterWhitelist)
         snprintf(hint, sizeof(hint), "%u", n);
     else
