@@ -152,13 +152,12 @@ void pwnagotchi_draw_aps(Pwnagotchi* pwn, Canvas* canvas) {
 }
 
 void pwnagotchi_draw_uptime(Pwnagotchi* pwn, Canvas* canvas) {
-    // right-aligned so a full hh:mm:ss can't overrun the edge or hit the AP count
-    FuriString* tmp = furi_string_alloc_printf("BAT %s", furi_string_get_cstr(pwn->uptime));
+    // right-aligned so the full label (BAT / BAT L / BAT D / PWR + %) can't overrun the edge
+    // or hit the AP count. the caller sets the whole string (power/saver-aware).
     canvas_set_font(canvas, PWNAGOTCHI_FONT);
-    uint16_t w = canvas_string_width(canvas, furi_string_get_cstr(tmp));
+    uint16_t w = canvas_string_width(canvas, furi_string_get_cstr(pwn->uptime));
     canvas_draw_str(
-        canvas, FLIPPER_SCREEN_WIDTH - w, PWNAGOTCHI_UPTIME_I, furi_string_get_cstr(tmp));
-    furi_string_free(tmp);
+        canvas, FLIPPER_SCREEN_WIDTH - w, PWNAGOTCHI_UPTIME_I, furi_string_get_cstr(pwn->uptime));
 }
 
 void pwnagotchi_draw_lines(Pwnagotchi* pwn, Canvas* canvas) {

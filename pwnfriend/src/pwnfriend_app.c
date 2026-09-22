@@ -222,9 +222,11 @@ typedef struct {
     uint8_t stat_page; // home stat panel, cycled Left/Right (0 = persona voice)
     uint32_t stat_touch_secs; // tick of the last Left/Right on home (for auto-revert)
     uint8_t battery_pct; // cached battery %, refreshed once/sec (shown in the BAT slot)
+    bool on_power; // external power connected (charging) -> saver forced off; slot shows PWR
     int8_t min_rssi; // attack floor sent as -minrssi (default -78)
     uint16_t recon_secs; // recon_time sent as -recon (default 30)
-    uint8_t saver; // battery saver sent as -saver: 0 off, 1 light, 2 deep (persisted)
+    uint8_t saver; // user's battery-saver choice: 0 off, 1 light, 2 deep, 3 auto (persisted)
+    uint8_t last_saver_eff; // last effective level pushed to the ESP (for change-triggered resend)
 
     // View state.
     Screen screen;
@@ -336,6 +338,14 @@ static const NotificationSequence sequence_pwnd = {
     NULL,
 };
 
+// resolve the user's saver choice into the level actually sent to the ESP (0 off, 1 light,
+// 2 deep). external power forces it off; AUTO (3) engages deep only below 20% battery.
+static uint8_t effective_saver(const PwnfriendModel* model) {
+    if(model->on_power) return 0;
+    if(model->saver == 3) return model->battery_pct < 20 ? 2 : 0;
+    return model->saver;
+}
+
 // ---------------------------------------------------------------------------
 // Serial: build + send the advertise command, and stop.
 // ---------------------------------------------------------------------------
@@ -399,10 +409,11 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
                 ch,
                 (int)model->min_rssi,
                 (unsigned)model->recon_secs,
-                (int)model->saver,
+                (int)effective_saver(model),
                 target,
                 wl);
             model->last_adv_sent = model->tick_secs;
+            model->last_saver_eff = effective_saver(model);
         },
         false);
 
@@ -1448,8 +1459,11 @@ static void pwnfriend_populate(PwnfriendModel* model) {
     }
     furi_string_printf(pwn->apStat, "%u", (unsigned)apc);
 
-    // BAT: cached battery % (uptime lives on the Stats screen)
-    furi_string_printf(pwn->uptime, "%u%%", (unsigned)model->battery_pct);
+    // BAT slot: power/saver-aware label + %. PWR on external power; else BAT / BAT L / BAT D
+    // per the effective saver level (uptime itself lives on the Stats screen).
+    uint8_t eff_sv = effective_saver(model);
+    const char* slot = model->on_power ? "PWR" : (eff_sv == 2 ? "BAT D" : (eff_sv == 1 ? "BAT L" : "BAT"));
+    furi_string_printf(pwn->uptime, "%s %u%%", slot, (unsigned)model->battery_pct);
 
     // PWND: real handshakes captured, this session (lifetime).
     furi_string_printf(
@@ -1889,7 +1903,10 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
             adjustable = true;
             snprintf(
                 value, sizeof(value), "%s",
-                model->saver == 2 ? "deep" : model->saver == 1 ? "light" : "off");
+                model->saver == 3 ? "auto" :
+                model->saver == 2 ? "deep" :
+                model->saver == 1 ? "light" :
+                                    "off");
             break;
         case MenuAbout: label = "About"; break;
         default: break;
@@ -2576,8 +2593,9 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         home_save(app->storage, model);
                         break;
                     case MenuBattery:
-                        model->saver = (uint8_t)(((int)model->saver + dir + 3) % 3);
-                        need_advertise = model->advertising; // push -saver to the ESP
+                        // cycle off / light / deep / auto
+                        model->saver = (uint8_t)(((int)model->saver + dir + 4) % 4);
+                        need_advertise = model->advertising; // push effective -saver to the ESP
                         home_save(app->storage, model);
                         break;
                     default: break; // nav rows act on OK
@@ -3041,6 +3059,7 @@ static void pwnfriend_timer_callback(void* ctx) {
             if(second) {
                 model->tick_secs++;
                 model->battery_pct = furi_hal_power_get_pct(); // for the home BAT slot
+                model->on_power = furi_hal_power_is_charging(); // external power -> saver off, PWR slot
                 // Home stat panel auto-reverts to the persona voice after a quiet spell.
                 if(model->stat_page != StatPageMood &&
                    model->tick_secs - model->stat_touch_secs >= HOME_STATS_TIMEOUT_SECS)
@@ -3068,6 +3087,10 @@ static void pwnfriend_timer_callback(void* ctx) {
                     model->link_down = false; // paused never warns
                 }
 
+                // push a fresh -saver promptly when the effective level flips (power
+                // plugged/unplugged, or AUTO crossing 20%), not just on the 15s cadence.
+                if(model->advertising && effective_saver(model) != model->last_saver_eff)
+                    resend = true;
                 if(model->advertising &&
                    (model->tick_secs - model->last_adv_sent >= PWNFRIEND_ADV_RESEND_SECS)) {
                     resend = true;
@@ -3237,6 +3260,8 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->quiet = false;
             model->triangulate = true; // on by default; home_load may turn it off
             model->saver = 0; // battery saver off by default; home_load may restore it
+            model->on_power = false;
+            model->last_saver_eff = 0xFF; // sentinel: forces the first -saver push
             model->confirm_exit = false;
             model->confirm_secs = 0;
             model->stayed_until = 0;
