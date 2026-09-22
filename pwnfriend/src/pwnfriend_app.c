@@ -1848,7 +1848,8 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
         case MenuPwnedAps: label = "Pwned APs"; snprintf(value, sizeof(value), "%u", pwned); break;
         case MenuAllAps:
             label = "Recent APs";
-            snprintf(value, sizeof(value), "%u", model->ap_count);
+            // APs seen this session (can exceed the rolling list's 256-entry cap)
+            snprintf(value, sizeof(value), "%lu", (unsigned long)model->persona->aps_session);
             break;
         case MenuWhitelist: label = "Ignore"; snprintf(value, sizeof(value), "%u", wl); break;
         case MenuFriends:
