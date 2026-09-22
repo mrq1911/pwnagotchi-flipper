@@ -128,6 +128,10 @@ static const uint32_t SAVER_OFF_MS  = 25000;
 static const int8_t   SAVER_TX_POWER = 40;  // ~10 dBm
 static const int8_t   FULL_TX_POWER  = 78;  // ~19.5 dBm (near max)
 
+// how long a dropped fix's last-known position stays usable for geotagging. covers a walk's
+// fix gaps; beyond this we emit no position rather than a wildly stale one.
+static const uint32_t LASTFIX_TTL_MS = 600000;  // 10 min
+
 // re-kick clients across the dwell: clients reconnect at random offsets, so one
 // burst at t=0 misses most 4-way replays.
 static const uint32_t DEAUTH_REPEAT_MS = 2000;     // deauth pass every 2s while dwelling
@@ -213,6 +217,10 @@ void Pwnfriend::reset() {
     _saver_idle = false;
     _saver_phase_ms = 0;
     _saver_hb_ms = 0;
+    _have_lastfix = false;
+    _lastfix_lat = 0.0;
+    _lastfix_lon = 0.0;
+    _lastfix_ms = 0;
     _n_recon = 0;
     _n_pwnd_seen = 0;
     _n_sta = 0;
@@ -701,6 +709,24 @@ void Pwnfriend::reportGps(bool fix, int sats, float acc_m, const char* lat, cons
     Serial.write((const uint8_t*)line, n);
 }
 
+// cache the live fix; when it's gone, hand back the last-known one if it's still fresh enough.
+// keeps geotagging APs/captures/peers through a walk's fix gaps (rough, refined later).
+bool Pwnfriend::geoResolve(bool has_fix, double* lat, double* lon) {
+    if (has_fix) {
+        _have_lastfix = true;
+        _lastfix_lat = *lat;
+        _lastfix_lon = *lon;
+        _lastfix_ms = millis();
+        return true;
+    }
+    if (_have_lastfix && (millis() - _lastfix_ms) <= LASTFIX_TTL_MS) {
+        *lat = _lastfix_lat;
+        *lon = _lastfix_lon;
+        return true;
+    }
+    return false;
+}
+
 void Pwnfriend::reportPeer(const uint8_t* payload, int length, int rssi, int channel,
                            bool has_fix, double lat, double lon) {
     // locate the JSON like Marauder's processPwnagotchiBeacon.
@@ -727,6 +753,7 @@ void Pwnfriend::reportPeer(const uint8_t* payload, int length, int rssi, int cha
     sanitize(name, safe_name, sizeof(safe_name));
     sanitize(ident, safe_ident, sizeof(safe_ident));
 
+    has_fix = geoResolve(has_fix, &lat, &lon); // live fix, else recent last-known
     char geo[48];
     fmt_geo(geo, sizeof(geo), has_fix, lat, lon);
 
@@ -953,6 +980,7 @@ bool Pwnfriend::reportAP(const uint8_t* payload, int length, int rssi, int chann
     if (length < 38 || (payload[0] != 0x80 && payload[0] != 0x50)) return false;
     const uint8_t* bssid = payload + 10;                    // Addr2 = BSSID
     int8_t r = (rssi < -128 || rssi > 0) ? 0 : (int8_t)rssi;
+    has_fix = geoResolve(has_fix, &lat, &lon); // live fix, else recent last-known
 
     // SSID IE (tag 0x00) is the first tagged param, at offset 36.
     char ssid[33] = {0};
@@ -1039,6 +1067,8 @@ bool Pwnfriend::reportHandshake(const uint8_t* payload, int length, int rssi, in
     if (length > 31 && payload[30] == 0x88 && payload[31] == 0x8e) eo = 32;
     else if (length > 33 && payload[32] == 0x88 && payload[33] == 0x8e) eo = 34;
     else return false;                                   // not EAPOL
+
+    has_fix = geoResolve(has_fix, &lat, &lon); // live fix, else recent last-known
 
     // BSSID from the DS bits: derived up front so the streamed frame self-describes its
     // pcap (no dependence on a preceding PWND).

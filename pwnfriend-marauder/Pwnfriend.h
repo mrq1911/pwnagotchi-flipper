@@ -51,6 +51,10 @@ class Pwnfriend {
     // watch acquisition and log time-to-first-fix. lat/lon are the module's raw strings.
     void reportGps(bool fix, int sats, float acc_m, const char* lat, const char* lon);
 
+    // resolve the position to geotag with: the live fix (cached) if present, else a recent
+    // last-known fix. rewrites *lat/*lon; returns whether a usable position was produced.
+    bool geoResolve(bool has_fix, double* lat, double* lon);
+
     // capture path (rx callback, DATA frames). detects EAPOL M2 / RSN PMKID (M1) and
     // emits PWNFRIEND_PWND once per BSSID; streams every EAPOL frame as a self-describing
     // PWNFRIEND_HS line. returns true if EAPOL (caller appends to pcap).
@@ -137,6 +141,13 @@ class Pwnfriend {
     bool     _saver_idle;      // deep saver: radio currently dozed off
     uint32_t _saver_phase_ms;  // millis() the current doze/scan phase began
     uint32_t _saver_hb_ms;     // last PWNFRIEND_DOZE heartbeat while dozing
+
+    // last known good fix — geotag APs/captures/peers with a rough position when the live fix
+    // has dropped (a moving walk loses fix in gaps; better a stale point than none — later
+    // samples + triangulation refine it).
+    bool     _have_lastfix;
+    double   _lastfix_lat, _lastfix_lon;
+    uint32_t _lastfix_ms;
     uint8_t  _attack_list[14]; // AP-bearing channels to attack this epoch
     int      _n_attack;        // channels in _attack_list
     int      _attack_idx;      // current channel within _attack_list

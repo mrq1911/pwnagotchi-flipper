@@ -326,6 +326,21 @@ def main():
         except AnchorError:
             print("  note: $PSTMSAVEPAR absent; skipped CASIC constellation enable")
 
+        # GPS UART: enlarge the RX ring. the default 256B overflows in ~22ms @115200, and
+        # broadcast()'s per-channel delay(1) sweep + attack bursts block the loop longer than
+        # that -> corrupted NMEA -> the fix drops while scanning/walking. 4KB buffers ~350ms.
+        t = _read(p)
+        try:
+            t, d = replace_once(
+                t,
+                "  Serial2.begin(9600, SERIAL_8N1, GPS_TX, GPS_RX);",
+                "  Serial2.setRxBufferSize(4096);  // pwnfriend: survive loop stalls during WiFi bursts\n"
+                "  Serial2.begin(9600, SERIAL_8N1, GPS_TX, GPS_RX);",
+                tag="Serial2.setRxBufferSize(4096)")
+            _write(p, t); steps += d
+        except AnchorError:
+            print("  note: Serial2.begin(9600 ...) not found; skipped GPS RX-buffer bump")
+
     # 4. CommandLine.h — the command string.
     p = src / "CommandLine.h"
     t = _read(p)
