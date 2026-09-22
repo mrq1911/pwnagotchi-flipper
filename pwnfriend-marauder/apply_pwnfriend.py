@@ -99,7 +99,7 @@ def main():
 
     steps = 0
 
-    # 1. esp32_marauder.ino — declare the global object.
+    # 1. esp32_marauder.ino — declare the global object + enlarge the command RX buffer.
     p = src / "esp32_marauder.ino"
     t = _read(p)
     t, done = insert_after(
@@ -108,7 +108,17 @@ def main():
         '#include "Pwnfriend.h"\nPwnfriend pwnfriend_obj;\n',
         tag="Pwnfriend pwnfriend_obj;",
     )
-    _write(p, t); steps += done
+    steps += done
+    # the pwnfriend advertise command grows with the whitelist + target (~370B); the default
+    # 256B UART RX buffer overflows mid-WiFi-burst, dropping the trailing '\n' -> -ch/-target
+    # lost and the channel never pins. bigger buffer survives the loop stall (cf. Serial2 GPS fix).
+    t, dbuf = insert_before(
+        t,
+        "Serial.begin(115200);",
+        "  Serial.setRxBufferSize(1024);  // pwnfriend: hold the full advertise command\n",
+        tag="Serial.setRxBufferSize(1024)",
+    )
+    _write(p, t); steps += dbuf
 
     # 2. WiFiScan.h — scan-mode id + runner declaration.
     p = src / "WiFiScan.h"
