@@ -2322,24 +2322,28 @@ static void pwnfriend_draw_stats(Canvas* canvas, const PwnfriendModel* model) {
         l, sizeof(l), "epoch %lu   up %02lu:%02lu:%02lu", (unsigned long)p->epoch,
         (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60), (unsigned long)(up % 60));
     canvas_draw_str(canvas, 2, 21, l);
+    uint16_t np = 0, nh = 0; // captures split by type (pmkid / handshake)
+    for(uint16_t i = 0; i < model->ap_count; i++) {
+        if(model->aps[i].pmkid) np++;
+        if(model->aps[i].handshake) nh++;
+    }
     snprintf(
-        l, sizeof(l), "pwnd %lu (%lu)   aps %lu", (unsigned long)p->pwnd_run,
-        (unsigned long)p->s.pwnd_tot, (unsigned long)p->aps_session);
+        l, sizeof(l), "pwnd %lu (%lu)   aps %u", (unsigned long)p->pwnd_run,
+        (unsigned long)p->s.pwnd_tot, aps_seen_session(model));
     canvas_draw_str(canvas, 2, 31, l);
-    snprintf(
-        l, sizeof(l), "friends %lu   cap %s", (unsigned long)p->s.friends_met,
-        capture_name(model->capture_mode));
+    snprintf(l, sizeof(l), "sats %d   cap %s", model->gps_sats, capture_name(model->capture_mode));
     canvas_draw_str(canvas, 2, 41, l);
+    // coords get the whole row (no prefix/comma) so a full lat+lon fits at this font
     if(model->gps_seen) {
-        snprintf(l, sizeof(l), "GPS %s, %s", model->last_lat, model->last_lon);
+        snprintf(l, sizeof(l), "%s %s", model->last_lat, model->last_lon);
         canvas_draw_str(canvas, 2, 51, l);
     } else {
-        canvas_draw_str(canvas, 2, 51, "GPS: no fix");
+        canvas_draw_str(canvas, 2, 51, "no fix");
     }
-    // tx beacons + capture provenance split (active = our attack, passive = sniffed)
+    // tx beacons + captures by type (P=pmkid, H=handshake)
     snprintf(
-        l, sizeof(l), "tx %lu  pwn a%lu/p%lu", (unsigned long)model->adv_sent_count,
-        (unsigned long)model->pwn_active, (unsigned long)model->pwn_passive);
+        l, sizeof(l), "tx %lu  caps P%u/H%u", (unsigned long)model->adv_sent_count, (unsigned)np,
+        (unsigned)nh);
     canvas_draw_str(canvas, 2, 61, l);
 }
 
@@ -2431,8 +2435,8 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
         uint16_t crack = 0;
         for(uint16_t i = 0; i < model->ap_count; i++)
             if(model->aps[i].has_essid && (model->aps[i].pmkid || model->aps[i].handshake)) crack++;
-        HS_ROW("pwnd %lu/%lu", (unsigned long)p->pwnd_run, (unsigned long)p->s.pwnd_tot);
-        HS_ROW("aps %lu", (unsigned long)p->aps_session);
+        HS_ROW("pwnd %lu (%lu)", (unsigned long)p->pwnd_run, (unsigned long)p->s.pwnd_tot);
+        HS_ROW("aps %u", aps_seen_session(model));
         HS_ROW("crack %u", (unsigned)crack);
         HS_ROW("epoch %lu", (unsigned long)p->epoch);
         break;
@@ -2441,8 +2445,13 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
         int near = 0;
         for(int i = 0; i < MAX_PEERS; i++)
             if(model->peers.items[i].used) near++;
-        HS_ROW("friends %lu", (unsigned long)p->s.friends_met);
-        HS_ROW("won a%lu p%lu", (unsigned long)model->pwn_active, (unsigned long)model->pwn_passive);
+        uint16_t np = 0, nh = 0; // captures split by type (pmkid / handshake)
+        for(uint16_t i = 0; i < model->ap_count; i++) {
+            if(model->aps[i].pmkid) np++;
+            if(model->aps[i].handshake) nh++;
+        }
+        HS_ROW("caps P%u/H%u", (unsigned)np, (unsigned)nh);
+        HS_ROW("sats %d", model->gps_sats);
         HS_ROW("near %d", near);
         break;
     }
