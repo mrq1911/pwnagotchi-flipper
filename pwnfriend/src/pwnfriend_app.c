@@ -1874,6 +1874,16 @@ static uint16_t ap_filtered(const PwnfriendModel* m, uint16_t* out) {
     return n;
 }
 
+// distinct APs actually heard this session (ap_seen_tick != 0). counts persisted APs re-heard
+// this run, unlike aps_session which only fires on first-ever discovery -> stays >0 while the
+// list has live items.
+static uint16_t aps_seen_session(const PwnfriendModel* m) {
+    uint16_t n = 0;
+    for(uint16_t i = 0; i < m->ap_count; i++)
+        if(m->ap_seen_tick[i]) n++;
+    return n;
+}
+
 #define APLIST_ROWS 5
 
 // True if this friend's RSSI is fresh enough to show a live meter (heard within the TTL).
@@ -1935,8 +1945,8 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
             break;
         case MenuAllAps:
             label = "Recent APs";
-            // APs seen this session (can exceed the rolling list's 256-entry cap)
-            snprintf(value, sizeof(value), "%lu", (unsigned long)model->persona->aps_session);
+            // APs heard this session (includes persisted APs re-heard, so it tracks the live list)
+            snprintf(value, sizeof(value), "%u", aps_seen_session(model));
             break;
         case MenuWhitelist: label = "Ignore"; snprintf(value, sizeof(value), "%u", wl); break;
         case MenuFriends:
@@ -2042,8 +2052,8 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
                                                 "RECENT APS");
     uint16_t idx[AP_MAX];
     uint16_t n = ap_filtered(model, idx);
-    // hint matches the menu counters: recent = session tally, pwned = lifetime total (both can
-    // exceed the rolling 256-entry list); ignored stays the live filtered count.
+    // hint matches the menu counters: recent = APs heard this session, pwned = lifetime total;
+    // ignored stays the live filtered count.
     const Persona* pp = model->persona;
     char hint[10];
     if(model->list_filter == FilterPwned)
@@ -2051,7 +2061,7 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
     else if(model->list_filter == FilterWhitelist)
         snprintf(hint, sizeof(hint), "%u", n);
     else
-        snprintf(hint, sizeof(hint), "%lu", (unsigned long)pp->aps_session);
+        snprintf(hint, sizeof(hint), "%u", aps_seen_session(model));
     draw_titlebar(canvas, title, hint);
     canvas_set_font(canvas, FontSecondary);
     if(n == 0) {
