@@ -648,6 +648,23 @@ void Pwnfriend::reportGps(bool fix, int sats, float acc_m, const char* lat, cons
     Serial.write((const uint8_t*)line, n);
 }
 
+// emit each '|'-separated $PSTM reply from probeReport() as its own PWNFRIEND_GPSCAP line.
+void Pwnfriend::reportGpsCaps(const char* report) {
+    const char* seg = report ? report : "";
+    char line[176];
+    for (;;) {
+        const char* bar = strchr(seg, '|');
+        int len = bar ? (int)(bar - seg) : (int)strlen(seg);
+        if (len > 0) {
+            int n = snprintf(line, sizeof(line), "PWNFRIEND_GPSCAP %.*s\n", len, seg);
+            if (n > 0) Serial.write((const uint8_t*)line,
+                                    n >= (int)sizeof(line) ? sizeof(line) - 1 : n);
+        }
+        if (!bar) break;
+        seg = bar + 1;
+    }
+}
+
 void Pwnfriend::reportPeer(const uint8_t* payload, int length, int rssi, int channel,
                            bool has_fix, double lat, double lon) {
     // locate the JSON like Marauder's processPwnagotchiBeacon.

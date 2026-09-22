@@ -185,6 +185,13 @@ def main():
         t,
         "void WiFiScan::main(uint32_t currentTime)\n{",
         "  if (currentScanMode == WIFI_SCAN_PWNFRIEND) {\n"
+        "    #ifdef HAS_GPS\n"
+        "      static bool pf_gps_probed = false;\n"
+        "      if (!pf_gps_probed) {\n"
+        "        pf_gps_probed = true;  // one read-only capability probe per boot\n"
+        "        pwnfriend_obj.reportGpsCaps(gps_obj.probeReport().c_str());\n"
+        "      }\n"
+        "    #endif\n"
         "    if (currentTime - initTime >= 500) {\n"
         "      initTime = millis();\n"
         "      pwnfriend_obj.broadcast();\n"
@@ -297,6 +304,53 @@ def main():
             _write(p, t); steps += d
         except AnchorError:
             print("  note: $PSTMSRR absent in GpsInterface.cpp; skipped GPS-reset patch")
+
+    # 3e. GPS: read-only capability probe. sends $PSTMGETSWVER/$PSTMGETPAR (queries, never a
+    # write) and collects the module's $PSTM replies for ~1.4s so we can see which Teseo
+    # firmware / STAGPS support / constellation mask it has. tolerant of Marauder bases.
+    ph = src / "GpsInterface.h"
+    if p.exists() and ph.exists():
+        th = _read(ph)
+        th, dh = insert_after(
+            th, "String getNmeaNotparsed();",
+            "    String probeReport();  // pwnfriend: read-only $PSTM capability query\n",
+            tag="String probeReport();")
+        _write(ph, th); steps += dh
+
+        t = _read(p)
+        probe = '''
+// pwnfriend: read-only GPS capability probe. sends version/param QUERIES only (no SETPAR/
+// SAVEPAR, so nothing is written to the module) and gathers the $PSTM replies for a short
+// window. returns them '|'-joined, or a marker when the module is silent/absent.
+String GpsInterface::probeReport() {
+  if (!this->gps_enabled) return String("no-gps-module");
+  uint32_t t0 = millis();
+  while (Serial2.available() && millis() - t0 < 200) Serial2.read();  // drop backlog
+  const char* queries[] = { "$PSTMGETSWVER,255", "$PSTMGETPAR,1201" };
+  String out, cur;
+  for (unsigned q = 0; q < 2; q++) {
+    MicroNMEA::sendSentence(Serial2, queries[q]);
+    uint32_t start = millis();
+    while (millis() - start < 700) {
+      while (Serial2.available()) {
+        char c = (char)Serial2.read();
+        if (c == '\\r' || c == '\\n') {
+          if (cur.startsWith("$PSTM")) { if (out.length()) out += '|'; out += cur; }
+          cur = "";
+        } else if (cur.length() < 140) cur += c;
+      }
+    }
+  }
+  return out.length() ? out : String("no-pstm-reply");
+}
+'''
+        t, dc = insert_after(
+            t,
+            "String GpsInterface::getNmeaNotparsed() {\n"
+            "  return this->notparsed_nmea_sentence;\n"
+            "}",
+            probe, tag="String GpsInterface::probeReport()")
+        _write(p, t); steps += dc
 
     # 4. CommandLine.h — the command string.
     p = src / "CommandLine.h"
