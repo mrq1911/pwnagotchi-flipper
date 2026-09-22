@@ -1900,9 +1900,8 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
     draw_titlebar(canvas, "pwnfriend menu", NULL);
     canvas_set_font(canvas, FontSecondary);
 
-    uint16_t pwned = 0, wl = 0;
+    uint16_t wl = 0; // "Ignore" count (whitelisted); pwned/recent counters use session totals
     for(uint16_t i = 0; i < model->ap_count; i++) {
-        if(model->aps[i].pmkid || model->aps[i].handshake) pwned++;
         if(model->aps[i].whitelisted) wl++;
     }
 
@@ -1917,7 +1916,10 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
         bool adjustable = false; // draws ◄ value ► instead of a plain right-aligned value
         switch(it) {
         // OK-activated rows: a plain right-aligned value (count / name / hint).
-        case MenuPwnedAps: label = "Pwned APs"; snprintf(value, sizeof(value), "%u", pwned); break;
+        case MenuPwnedAps: // session total pwned (deduped), not the capped list count
+            label = "Pwned APs";
+            snprintf(value, sizeof(value), "%lu", (unsigned long)model->persona->pwnd_run);
+            break;
         case MenuAllAps:
             label = "Recent APs";
             // APs seen this session (can exceed the rolling list's 256-entry cap)
@@ -2027,8 +2029,16 @@ static void pwnfriend_draw_aplist(Canvas* canvas, const PwnfriendModel* model) {
                                                 "RECENT APS");
     uint16_t idx[AP_MAX];
     uint16_t n = ap_filtered(model, idx);
+    // hint = session total (can exceed the rolling 256-entry list), matching the menu counters;
+    // ignored stays the live filtered count.
+    const Persona* pp = model->persona;
     char hint[10];
-    snprintf(hint, sizeof(hint), "%u", n);
+    if(model->list_filter == FilterPwned)
+        snprintf(hint, sizeof(hint), "%lu", (unsigned long)pp->pwnd_run);
+    else if(model->list_filter == FilterWhitelist)
+        snprintf(hint, sizeof(hint), "%u", n);
+    else
+        snprintf(hint, sizeof(hint), "%lu", (unsigned long)pp->aps_session);
     draw_titlebar(canvas, title, hint);
     canvas_set_font(canvas, FontSecondary);
     if(n == 0) {
