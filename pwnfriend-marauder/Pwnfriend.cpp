@@ -338,6 +338,15 @@ bool Pwnfriend::hasClient(int ap_idx) const {
     return false;
 }
 
+int Pwnfriend::clientCount(int ap_idx) const {
+    uint32_t now = millis();
+    int n = 0;
+    for (int s = 0; s < _n_sta; s++)
+        if (_sta[s].ap_idx == (uint8_t)ap_idx && (uint32_t)(now - _sta[s].last_seen) < STA_TTL_MS)
+            n++;
+    return n;
+}
+
 // directed wildcard-SSID probe so a nameless AP replies with its ESSID (reportAP
 // adopts it), making a keymat-only capture crackable.
 void Pwnfriend::probeAP(const uint8_t* bssid) {
@@ -1032,8 +1041,10 @@ bool Pwnfriend::reportAP(const uint8_t* payload, int length, int rssi, int chann
             _recon[known].last_rssi_ms = now;
             char mac[18];
             fmt_mac(mac, bssid);
-            char line[40];
-            int n = snprintf(line, sizeof(line), "PWNFRIEND_RSSI %s %d\n", mac, (int)r);
+            char line[56];
+            // append live clients + attack bursts aimed at this AP (Flipper AP-detail view)
+            int n = snprintf(line, sizeof(line), "PWNFRIEND_RSSI %s %d %d %d\n", mac, (int)r,
+                             clientCount(known), (int)_recon[known].attacks);
             if (n > 0) Serial.write((const uint8_t*)line, (size_t)n);
         }
         return false;                                      // not a new AP

@@ -22,6 +22,6 @@
 
 // serial-proto version this app expects (mirrors firmware PWNFRIEND_PROTO). firmware stamps
 // ver=N on each PWNFRIEND_ADV; non-zero but below this -> board too old, warn the user
-#define PWNFRIEND_FW_PROTO 5
+#define PWNFRIEND_FW_PROTO 6
 
 // FLIPPER_SCREEN_WIDTH / _HEIGHT come from pwn_constants.h (via pwnagotchi.h).

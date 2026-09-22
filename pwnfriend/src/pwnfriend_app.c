@@ -220,6 +220,8 @@ typedef struct {
     uint32_t ap_seen_tick[AP_MAX]; // tick_secs each AP was last heard (0 = not this session)
     uint32_t ap_track_tick[AP_MAX]; // tick each AP last wrote ap_track.csv (throttle)
     uint8_t ap_pcap_flags[AP_MAX]; // per-session APF_* bits: HS filed / ESSID beacon spliced
+    uint8_t ap_clients[AP_MAX]; // associated clients the ESP tracks for this AP (live, fw>=6)
+    uint8_t ap_attacks[AP_MAX]; // assoc/deauth bursts the ESP aimed at this AP (live, fw>=6)
 
     // every friend met (the browser reads this; persisted)
     FriendRec friends[FRIEND_MAX];
@@ -727,6 +729,8 @@ static int ap_get(PwnfriendModel* model, const char* key, bool* is_new) {
     model->ap_seen_tick[i] = model->tick_secs;
     model->ap_track_tick[i] = 0; // recycled slot: don't inherit the old AP's track throttle
     model->ap_pcap_flags[i] = 0; // recycled slot: fresh pcap bookkeeping
+    model->ap_clients[i] = 0; // recycled slot: fresh client/attack counters
+    model->ap_attacks[i] = 0;
     model->aps[i].lat = 1e9f; // no location until a geotagged line arrives
     model->aps[i].lon = 1e9f;
     model->aps[i].loc_rssi = -128; // reset for a recycled slot
@@ -1140,13 +1144,21 @@ static int build_synth_beacon(uint8_t* b, const char* bssidhex, const char* ssid
     return p;
 }
 
-// "PWNFRIEND_RSSI <mac> <dbm>" — throttled live-signal refresh for a known AP (fw v3)
+// "PWNFRIEND_RSSI <mac> <dbm> [clients] [attacks]" — throttled live-signal refresh for a known
+// AP (fw v3; clients/attacks appended in fw v6, absent on older builds)
 static void pwnfriend_handle_rssi_line(PwnfriendApp* app, const char* line) {
     char key[13];
     bssid_key(key, line + 15); // hex of the mac, colons skipped, stops at 12
     const char* sp = strchr(line + 15, ' ');
     if(!sp) return;
     int rssi = (int)strtol(sp + 1, NULL, 10);
+    int clients = -1, attacks = -1; // -1 = not reported (old fw) -> leave the stored value alone
+    const char* p2 = strchr(sp + 1, ' ');
+    if(p2) {
+        clients = (int)strtol(p2 + 1, NULL, 10);
+        const char* p3 = strchr(p2 + 1, ' ');
+        if(p3) attacks = (int)strtol(p3 + 1, NULL, 10);
+    }
     with_view_model(
         app->view, PwnfriendModel * model,
         {
@@ -1154,6 +1166,8 @@ static void pwnfriend_handle_rssi_line(PwnfriendApp* app, const char* line) {
             if(ai >= 0) {
                 model->aps[ai].rssi = (int16_t)rssi;
                 model->ap_seen_tick[ai] = model->tick_secs; // refresh last-seen, keep order
+                if(clients >= 0) model->ap_clients[ai] = (uint8_t)(clients > 255 ? 255 : clients);
+                if(attacks >= 0) model->ap_attacks[ai] = (uint8_t)(attacks > 255 ? 255 : attacks);
             }
         },
         true);
@@ -2156,6 +2170,11 @@ static void pwnfriend_draw_apdetail(Canvas* canvas, const PwnfriendModel* model)
     if(dist[0])
         canvas_draw_str(
             canvas, FLIPPER_SCREEN_WIDTH - 2 - (int)canvas_string_width(canvas, dist), 37, dist);
+    // live from the ESP (fw>=6): associated clients + assoc/deauth bursts aimed at this AP
+    snprintf(
+        l, sizeof(l), "clients %u   atk %u", (unsigned)model->ap_clients[model->detail_ap],
+        (unsigned)model->ap_attacks[model->detail_ap]);
+    canvas_draw_str(canvas, 2, 45, l);
     // Crackability as a plain-language formula (what we have -> whether it cracks).
     const char* key = a->pmkid ? "PMKID" : a->handshake ? "HS" : NULL;
     if(a->has_essid && key)

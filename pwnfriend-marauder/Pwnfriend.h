@@ -11,7 +11,7 @@
 // stale firmware. bump on any protocol change. v2=dwell recon+unicast/repeat deauth+
 // PMKID auth+ESSID embed+flags; v3=live RSSI (PWNFRIEND_RSSI); v4=epoch telemetry+
 // provenance (via=)+floor-free PMKID; v5=PWNFRIEND_GPS fix-status telemetry.
-#define PWNFRIEND_PROTO 5
+#define PWNFRIEND_PROTO 6
 
 // min interval between PWNFRIEND_RSSI updates per AP, so re-heard beacons don't flood serial.
 #define PWNFRIEND_RSSI_EMIT_MS 3000
@@ -216,6 +216,7 @@ class Pwnfriend {
     bool attackable(const ReconAP& ap) const; // eligible for assoc: not pwned/whitelisted/off-target
     bool deauthable(const ReconAP& ap) const;  // + strong enough to bother deauthing (RSSI floor)
     bool hasClient(int ap_idx) const;           // a fresh associated client -> deauth can work
+    int  clientCount(int ap_idx) const;         // count of fresh clients tracked for this AP
     bool isWhitelisted(const uint8_t* bssid) const;
     // directed wildcard-SSID probe to make a nameless AP reveal its ESSID.
     void probeAP(const uint8_t* bssid);
