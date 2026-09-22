@@ -3059,7 +3059,10 @@ static void pwnfriend_timer_callback(void* ctx) {
             if(second) {
                 model->tick_secs++;
                 model->battery_pct = furi_hal_power_get_pct(); // for the home BAT slot
-                model->on_power = furi_hal_power_is_charging(); // external power -> saver off, PWR slot
+                // VBUS present = on external power (true when charging, full-and-plugged, or
+                // even data-only USB) -> saver forced off, slot shows PWR. is_charging() alone
+                // misses the full-battery case.
+                model->on_power = furi_hal_power_get_usb_voltage() > 4.0f;
                 // Home stat panel auto-reverts to the persona voice after a quiet spell.
                 if(model->stat_page != StatPageMood &&
                    model->tick_secs - model->stat_touch_secs >= HOME_STATS_TIMEOUT_SECS)
