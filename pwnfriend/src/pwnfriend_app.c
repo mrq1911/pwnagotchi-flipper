@@ -1905,7 +1905,7 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
             snprintf(value, sizeof(value), "%s", model->triangulate ? "on" : "off");
             break;
         case MenuBattery:
-            label = "Battery";
+            label = "Battery saver";
             adjustable = true;
             snprintf(
                 value, sizeof(value), "%s",
