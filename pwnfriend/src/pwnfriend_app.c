@@ -68,6 +68,8 @@ typedef enum {
 #define AP_TRACK_MIN_SECS 10
 // GPS fix-status samples for debugging slow acquisition / time-to-first-fix
 #define GPS_PATH "/ext/apps_data/pwnfriend/gps.csv"
+// link-watchdog transitions, to debug spurious "no ESP32" flashes
+#define LINKDBG_PATH "/ext/apps_data/pwnfriend/linkdbg.csv"
 // per-AP pcap bookkeeping: EAPOL filed? ESSID beacon spliced?
 #define APF_HS_SEEN 0x01
 #define APF_BEACON_DONE 0x02
@@ -3050,6 +3052,10 @@ static void pwnfriend_timer_callback(void* ctx) {
     PwnfriendApp* app = ctx;
     bool resend = false;
     bool save = false;
+    // link-watchdog debug: capture the context of any link_down flip (see LINKDBG_PATH)
+    bool link_dbg = false, d_down = false, d_pwr = false, d_chg = false;
+    uint32_t d_tick = 0, d_srx = 0, d_to = 0, d_sadv = 0;
+    uint8_t d_eff = 0, d_saver = 0;
 
     app->anim_tick++;
     bool second = (app->anim_tick % ANIM_HZ) == 0; // one real second has elapsed
@@ -3096,8 +3102,21 @@ static void pwnfriend_timer_callback(void* ctx) {
                     // deep saver dozes the radio ~25s at a time (near-silent) — don't flash the
                     // "no ESP32" screen then; only warn after a much longer real silence.
                     uint32_t link_to = (effective_saver(model) == 2) ? 40 : PWNFRIEND_LINK_TIMEOUT_SECS;
+                    bool was_down = model->link_down;
                     model->link_down =
                         (since_rx >= link_to) && (since_adv >= PWNFRIEND_LINK_GRACE_SECS);
+                    if(model->link_down != was_down) { // log the flip with its context
+                        link_dbg = true;
+                        d_down = model->link_down;
+                        d_tick = model->tick_secs;
+                        d_srx = since_rx;
+                        d_to = link_to;
+                        d_sadv = since_adv;
+                        d_eff = effective_saver(model);
+                        d_saver = model->saver;
+                        d_pwr = model->on_power;
+                        d_chg = model->charging;
+                    }
                 } else {
                     model->link_down = false; // paused never warns
                 }
@@ -3116,6 +3135,28 @@ static void pwnfriend_timer_callback(void* ctx) {
             }
         },
         true);
+
+    // record any link_down flip so we can see WHY the "no ESP32" screen appears (silence gap,
+    // which timeout was in effect, saver/power state at the moment).
+    if(link_dbg) {
+        storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
+        File* f = storage_file_alloc(app->storage);
+        if(storage_file_open(f, LINKDBG_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
+            if(storage_file_size(f) == 0) {
+                const char* h = "tick,event,since_rx,timeout,since_adv,eff,saver,pwr,chg\n";
+                storage_file_write(f, h, strlen(h));
+            }
+            // heap-based (furi_string) to keep the 1KB timer stack clear of a big snprintf
+            FuriString* row = furi_string_alloc_printf(
+                "%lu,%s,%lu,%lu,%lu,%u,%u,%u,%u\n", (unsigned long)d_tick, d_down ? "down" : "up",
+                (unsigned long)d_srx, (unsigned long)d_to, (unsigned long)d_sadv, d_eff, d_saver,
+                d_pwr ? 1 : 0, d_chg ? 1 : 0);
+            storage_file_write(f, furi_string_get_cstr(row), furi_string_size(row));
+            furi_string_free(row);
+        }
+        storage_file_close(f);
+        storage_file_free(f);
+    }
 
     // send_advertise needs ~760B of buffers, too much for the 1KB timer stack; kick the 2KB worker
     if(resend) furi_thread_flags_set(furi_thread_get_id(app->worker_thread), WorkerEventResend);
