@@ -362,10 +362,12 @@ static uint8_t effective_saver(const PwnfriendModel* model) {
     return model->saver;
 }
 
-// resolve Auto to a concrete mode: roam while moving, siege when parked / no GPS. others pass
-// through. (consent gating happens in the flag mapping: no consent -> assoc/deauth stripped.)
+// resolve Auto to a concrete mode: wardrive (PMKID drive-by) while moving, siege when parked /
+// no GPS. Roam (moving + deauth) stays a manual choice. others pass through. (consent gating
+// happens in the flag mapping: no consent -> assoc/deauth stripped.)
 static CaptureMode effective_capture(const PwnfriendModel* model) {
-    if(model->capture_mode == CaptureAuto) return model->auto_moving ? CaptureRoam : CaptureSiege;
+    if(model->capture_mode == CaptureAuto)
+        return model->auto_moving ? CaptureWardrive : CaptureSiege;
     return (CaptureMode)model->capture_mode;
 }
 
@@ -1420,7 +1422,7 @@ static void pwnfriend_handle_gps_line(PwnfriendApp* app, const char* line) {
             em = (int)effective_capture(model);
         },
         false);
-    // effective_capture resolves Auto -> roam/siege, so em is one of wardrive/roam/siege
+    // em is the concrete effective mode (Auto resolves to wardrive/siege; manual can be roam)
     const char* mode = em == CaptureRoam ? "roam" : em == CaptureSiege ? "siege" : "wardrive";
 
     storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
