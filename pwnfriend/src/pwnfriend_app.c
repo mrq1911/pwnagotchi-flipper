@@ -223,7 +223,7 @@ typedef struct {
     uint32_t stat_touch_secs; // tick of the last Left/Right on home (for auto-revert)
     uint8_t battery_pct; // cached battery %, refreshed once/sec (shown in the BAT slot)
     bool on_power; // external power connected (VBUS) -> saver forced off; slot shows PWR
-    bool charge_done; // fully charged on power -> slot shows "PWR" without a %
+    bool charging; // actively charging -> slot shows "PWR %"; stopped (full or charge-limit) -> bare "PWR"
     int8_t min_rssi; // attack floor sent as -minrssi (default -78)
     uint16_t recon_secs; // recon_time sent as -recon (default 30)
     uint8_t saver; // user's battery-saver choice: 0 off, 1 light, 2 deep, 3 auto (persisted)
@@ -1460,14 +1460,16 @@ static void pwnfriend_populate(PwnfriendModel* model) {
     }
     furi_string_printf(pwn->apStat, "%u", (unsigned)apc);
 
-    // BAT slot: power/saver-aware label + %. on power: "PWR" alone when full, "PWR 85%" while
-    // charging; on battery: BAT / BAT L / BAT D per the effective saver level, + %.
-    if(model->on_power && model->charge_done) {
+    // BAT slot: power/saver-aware label + %. on power: "PWR 85%" while actively charging, bare
+    // "PWR" once charging stops (full or hit the charge-limit); on battery: BAT / BAT L / BAT D
+    // per the effective saver level, + %.
+    if(model->on_power && !model->charging) {
         furi_string_set_str(pwn->uptime, "PWR");
+    } else if(model->on_power) {
+        furi_string_printf(pwn->uptime, "PWR %u%%", (unsigned)model->battery_pct);
     } else {
         uint8_t eff_sv = effective_saver(model);
-        const char* slot = model->on_power ? "PWR" :
-                           (eff_sv == 2 ? "BAT D" : (eff_sv == 1 ? "BAT L" : "BAT"));
+        const char* slot = eff_sv == 2 ? "BAT D" : (eff_sv == 1 ? "BAT L" : "BAT");
         furi_string_printf(pwn->uptime, "%s %u%%", slot, (unsigned)model->battery_pct);
     }
 
@@ -3069,7 +3071,7 @@ static void pwnfriend_timer_callback(void* ctx) {
                 // even data-only USB) -> saver forced off, slot shows PWR. is_charging() alone
                 // misses the full-battery case.
                 model->on_power = furi_hal_power_get_usb_voltage() > 4.0f;
-                model->charge_done = furi_hal_power_is_charging_done(); // full -> "PWR" (no %)
+                model->charging = furi_hal_power_is_charging(); // charging -> "PWR %"; stopped -> "PWR"
                 // Home stat panel auto-reverts to the persona voice after a quiet spell.
                 if(model->stat_page != StatPageMood &&
                    model->tick_secs - model->stat_touch_secs >= HOME_STATS_TIMEOUT_SECS)
@@ -3274,6 +3276,7 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->triangulate = true; // on by default; home_load may turn it off
             model->saver = 0; // battery saver off by default; home_load may restore it
             model->on_power = false;
+            model->charging = false;
             model->last_saver_eff = 0xFF; // sentinel: forces the first -saver push
             model->confirm_exit = false;
             model->confirm_secs = 0;
