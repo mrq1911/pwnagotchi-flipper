@@ -163,9 +163,6 @@ def main():
   this->changeChannel(this->set_channel);
   this->wifi_initialized = true;
   initTime = millis();
-  #ifdef HAS_GPS
-    pwnfriend_obj.reportGpsCaps(gps_obj.probeReport().c_str());  // capability dump per scan start
-  #endif
 }
 
 '''
@@ -315,61 +312,6 @@ def main():
             _write(p, t); steps += d
         except AnchorError:
             print("  note: $PSTMSAVEPAR absent; skipped CASIC constellation enable")
-
-    # 3e. GPS: read-only capability probe. sends $PSTMGETSWVER/$PSTMGETPAR (queries, never a
-    # write) and collects the module's $PSTM replies for ~1.4s so we can see which Teseo
-    # firmware / STAGPS support / constellation mask it has. tolerant of Marauder bases.
-    ph = src / "GpsInterface.h"
-    if p.exists() and ph.exists():
-        th = _read(ph)
-        th, dh = insert_after(
-            th, "String getNmeaNotparsed();",
-            "    String probeReport();  // pwnfriend: read-only $PSTM capability query\n",
-            tag="String probeReport();")
-        _write(ph, th); steps += dh
-
-        t = _read(p)
-        probe = '''
-// pwnfriend: read-only GPS capability probe. asks BOTH command families for a version
-// (Teseo ignores $PCAS, CASIC/AT6558 ignores $PSTM), then samples the live NMEA for ~1.5s
-// keeping one example of each distinct sentence type. talker IDs ($GP/$GL/$BD/$GN/$GA) show
-// which constellations are active; a $..TXT banner / $PSTM|$PCAS reply IDs the chip. QUERIES
-// only -- nothing is written to the module. returns the lines '|'-joined.
-String GpsInterface::probeReport() {
-  if (!this->gps_enabled) return String("no-gps-module");
-  MicroNMEA::sendSentence(Serial2, "$PSTMGETSWVER,255");
-  MicroNMEA::sendSentence(Serial2, "$PCAS06,0");
-  String out, cur, ids;  // ids = ,tag, ... of sentence types already captured (dedup)
-  int kept = 0;
-  uint32_t start = millis();
-  while (millis() - start < 1500 && kept < 16) {
-    while (Serial2.available()) {
-      char c = (char)Serial2.read();
-      if (c == '\\r' || c == '\\n') {
-        if (cur.length() > 3 && cur[0] == '$') {
-          int comma = cur.indexOf(',');
-          String tag = (comma > 0) ? cur.substring(1, comma) : cur.substring(1);
-          if (ids.indexOf("," + tag + ",") < 0) {
-            ids += "," + tag + ",";
-            if (out.length()) out += '|';
-            out += cur;
-            kept++;
-          }
-        }
-        cur = "";
-      } else if (cur.length() < 100) cur += c;
-    }
-  }
-  return out.length() ? out : String("no-nmea");
-}
-'''
-        t, dc = insert_after(
-            t,
-            "String GpsInterface::getNmeaNotparsed() {\n"
-            "  return this->notparsed_nmea_sentence;\n"
-            "}",
-            probe, tag="String GpsInterface::probeReport()")
-        _write(p, t); steps += dc
 
     # 4. CommandLine.h — the command string.
     p = src / "CommandLine.h"

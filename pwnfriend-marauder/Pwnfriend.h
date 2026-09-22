@@ -51,10 +51,6 @@ class Pwnfriend {
     // watch acquisition and log time-to-first-fix. lat/lon are the module's raw strings.
     void reportGps(bool fix, int sats, float acc_m, const char* lat, const char* lon);
 
-    // one-shot: split a '|'-joined read-only GPS capability report into PWNFRIEND_GPSCAP
-    // lines for the Flipper to log (which firmware, STAGPS present?, constellation mask).
-    void reportGpsCaps(const char* report);
-
     // capture path (rx callback, DATA frames). detects EAPOL M2 / RSN PMKID (M1) and
     // emits PWNFRIEND_PWND once per BSSID; streams every EAPOL frame as a self-describing
     // PWNFRIEND_HS line. returns true if EAPOL (caller appends to pcap).

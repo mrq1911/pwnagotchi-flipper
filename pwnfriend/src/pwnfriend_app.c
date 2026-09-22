@@ -68,8 +68,6 @@ typedef enum {
 #define AP_TRACK_MIN_SECS 10
 // GPS fix-status samples for debugging slow acquisition / time-to-first-fix
 #define GPS_PATH "/ext/apps_data/pwnfriend/gps.csv"
-// read-only GPS module capability dump (one probe per ESP32 boot)
-#define GPS_CAP_PATH "/ext/apps_data/pwnfriend/gpscap.txt"
 // per-AP pcap bookkeeping: EAPOL filed? ESSID beacon spliced?
 #define APF_HS_SEEN 0x01
 #define APF_BEACON_DONE 0x02
@@ -1372,24 +1370,6 @@ static void pwnfriend_handle_gps_line(PwnfriendApp* app, const char* line) {
     storage_file_free(f);
 }
 
-// "PWNFRIEND_GPSCAP <raw $PSTM reply>" (fw v5) — one read-only GPS capability line per boot;
-// append verbatim to gpscap.txt so we can read the module's firmware / STAGPS / mask offline.
-static void pwnfriend_handle_gpscap_line(PwnfriendApp* app, const char* line) {
-    const char* body = line + 17; // past "PWNFRIEND_GPSCAP "
-    uint32_t up = 0;
-    with_view_model(
-        app->view, PwnfriendModel * model, { up = model->tick_secs; }, false);
-    storage_common_mkdir(app->storage, "/ext/apps_data/pwnfriend");
-    File* f = storage_file_alloc(app->storage);
-    if(storage_file_open(f, GPS_CAP_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
-        char row[192];
-        snprintf(row, sizeof(row), "%lu\t%s\n", (unsigned long)up, body);
-        storage_file_write(f, row, strlen(row));
-    }
-    storage_file_close(f);
-    storage_file_free(f);
-}
-
 static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
     // PWND and PEER share the PWNFRIEND_P prefix, so compare both fully
     if(strncmp(line, "PWNFRIEND_PEER ", 15) == 0) {
@@ -1404,8 +1384,6 @@ static void pwnfriend_process_line(PwnfriendApp* app, const char* line) {
         pwnfriend_handle_rssi_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_EPOCH ", 16) == 0) {
         pwnfriend_handle_epoch_line(app, line);
-    } else if(strncmp(line, "PWNFRIEND_GPSCAP ", 17) == 0) {
-        pwnfriend_handle_gpscap_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_GPS ", 14) == 0) {
         pwnfriend_handle_gps_line(app, line);
     } else if(strncmp(line, "PWNFRIEND_ADV ", 14) == 0) {
