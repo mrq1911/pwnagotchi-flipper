@@ -125,11 +125,16 @@ typedef struct {
 
 // capture escalation, cycled from the menu; default Deauth, gated behind consent.
 // Passive = record sniffed handshakes; Deauth = also associate + deauth (-deauth 1)
+// Auto mode: switch to wardrive once we've moved ~this far recently; fall back to siege after
+// this long parked (or with no GPS fix).
+#define AUTO_MOVE_KM 0.02f
+#define AUTO_STATIONARY_SECS 45
+
 typedef enum {
-    CaptureOff = 0,
-    CapturePassive, // listen only, no TX
-    CapturePmkid, // associate (solicit PMKID) but no deauth — quieter
-    CaptureDeauth, // associate + deauth (full pwnagotchi)
+    CaptureWardrive = 0, // recon-only fast sweep, record what's heard, no attack (for moving)
+    CaptureRoam, // fast sweep + a quick assoc+deauth at each AP as you pass (no dwell). needs consent
+    CaptureSiege, // associate + deauth + dwell (full pwnagotchi; stationary attack). needs consent
+    CaptureAuto, // roam while moving; siege when parked a while or GPS is lost (default)
     CaptureModeCount,
 } CaptureMode;
 
@@ -163,24 +168,25 @@ typedef enum {
     ScreenAbout,
 } Screen;
 
-// menu rows: OK-activated first, then Left/Right-adjustable; About pinned last
+// menu rows. order is display order; OK-activated vs Left/Right-adjustable is decided per-row
+// in the handlers (by name, not position), so the list can be ordered for use, not by kind.
 typedef enum {
-    MenuPwnedAps = 0, // OK: AP list (pwned)
-    MenuAllAps, // OK: AP list (all)
-    MenuWhitelist, // OK: AP list (whitelisted)
+    MenuAllAps = 0, // OK: Recent APs list (1st)
+    MenuPwnedAps, // OK: pwned AP list
+    MenuCapture, // cycle: Mode (3rd)
+    MenuAdvertise, // toggle: say hi
+    MenuWhitelist, // OK: ignored AP list
     MenuFriends, // OK: friends list (pwngrid peers met)
     MenuTarget, // OK: clear the focus target
     MenuStats, // OK: stats
-    MenuName, // OK: name editor
-    MenuSetHome, // OK: capture GPS home
-    // --- below: Left/Right adjusts the value ---
-    MenuAdvertise, // toggle
-    MenuCapture, // cycle
     MenuMinRssi, // adjust
     MenuRecon, // adjust
+    MenuName, // OK: name editor
+    MenuSetHome, // OK: capture GPS home
     MenuQuiet, // toggle
     MenuTriangulate, // toggle: on-device location estimate + sample logging
     MenuBattery, // cycle: off / light / deep battery saver
+    MenuReset, // OK: reset settings to defaults (with confirmation)
     MenuAbout, // OK: about (pinned last)
     MenuCount,
 } MenuItem;
@@ -230,6 +236,13 @@ typedef struct {
     uint16_t recon_secs; // recon_time sent as -recon (default 30)
     uint8_t saver; // user's battery-saver choice: 0 off, 1 light, 2 deep, 3 auto (persisted)
     uint8_t last_saver_eff; // last effective level pushed to the ESP (for change-triggered resend)
+
+    // Auto mode movement tracking (Auto = wardrive while moving, siege when parked/no-GPS).
+    float move_ref_lat, move_ref_lon; // reference fix we measure displacement from (1e9 = none)
+    uint32_t last_move_secs; // tick_secs we last moved past AUTO_MOVE_KM
+    bool auto_moving; // computed each tick: moving recently (drives Auto's wardrive vs siege)
+    uint8_t last_cap_eff; // last effective capture mode pushed to the ESP (change-triggered resend)
+    bool confirm_reset; // modal: "reset settings?" confirmation
 
     // View state.
     Screen screen;
@@ -349,6 +362,13 @@ static uint8_t effective_saver(const PwnfriendModel* model) {
     return model->saver;
 }
 
+// resolve Auto to a concrete mode: roam while moving, siege when parked / no GPS. others pass
+// through. (consent gating happens in the flag mapping: no consent -> assoc/deauth stripped.)
+static CaptureMode effective_capture(const PwnfriendModel* model) {
+    if(model->capture_mode == CaptureAuto) return model->auto_moving ? CaptureRoam : CaptureSiege;
+    return (CaptureMode)model->capture_mode;
+}
+
 // ---------------------------------------------------------------------------
 // Serial: build + send the advertise command, and stop.
 // ---------------------------------------------------------------------------
@@ -366,12 +386,18 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
             for(char* c = safe_name; *c; c++) {
                 if(*c == ' ') *c = '_';
             }
-            // -cap/-deauth sent as explicit 0/1 every advertise so a previously-armed radio disarms.
-            // -cap=1 in Passive/Deauth, -deauth=1 only in Deauth; firmware mirrors -deauth into the beacon.
-            int cap = (model->capture_mode != CaptureOff) ? 1 : 0;
-            int deauth = (model->capture_mode == CaptureDeauth) ? 1 : 0;
-            // -assoc: solicit PMKID (associate) in both PMKID and Deauth modes.
-            int assoc = (model->capture_mode == CapturePmkid || model->capture_mode == CaptureDeauth) ? 1 : 0;
+            // resolve Auto -> wardrive/siege (consent-gated) and map to flags. sent explicitly
+            // every advertise so a previously-armed radio disarms. all modes capture (cap=1);
+            // siege attacks (deauth+assoc); wardrive sweeps fast without attacking (-wardrive 1).
+            // escalation ladder (all capture, cap=1): wardrive = assoc-only (PMKID) + fast sweep;
+            // roam = assoc+deauth + fast sweep, no dwell; siege = assoc+deauth + dwell (stationary).
+            // assoc/deauth are active TX, so they're gated on consent -> no consent = pure recon.
+            CaptureMode em = effective_capture(model);
+            bool tx = model->consent_given;
+            int cap = 1;
+            int assoc = tx ? 1 : 0; // every active mode solicits PMKID
+            int deauth = (tx && (em == CaptureRoam || em == CaptureSiege)) ? 1 : 0;
+            int wardrive = (em == CaptureWardrive || em == CaptureRoam) ? 1 : 0;
             // -ch: 0 = auto-hop ('*' sweep); 1..14 pins the tuned channel
             int ch = (model->tuned_channel >= 1 && model->tuned_channel <= 14) ?
                          model->tuned_channel : 0;
@@ -398,7 +424,8 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
                 cmd,
                 sizeof(cmd),
                 "pwnfriend -n %s -id %s -f %d -pr %lu -pt %lu -u %lu -e %lu -cap %d "
-                "-deauth %d -assoc %d -ch %d -minrssi %d -recon %u -saver %d -target %s -wl %s\n",
+                "-deauth %d -assoc %d -wardrive %d -ch %d -minrssi %d -recon %u -saver %d "
+                "-target %s -wl %s\n",
                 safe_name,
                 p->s.identity,
                 (int)persona_face(p),
@@ -409,6 +436,7 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
                 cap,
                 deauth,
                 assoc,
+                wardrive,
                 ch,
                 (int)model->min_rssi,
                 (unsigned)model->recon_secs,
@@ -417,6 +445,7 @@ static void pwnfriend_send_advertise(PwnfriendApp* app) {
                 wl);
             model->last_adv_sent = model->tick_secs;
             model->last_saver_eff = effective_saver(model);
+            model->last_cap_eff = (uint8_t)em;
         },
         false);
 
@@ -810,7 +839,11 @@ typedef struct {
     uint8_t quiet;
     uint8_t home_set; // v3: user set a home (vs default Prague)
     uint8_t triangulate; // v4: on-device triangulation enabled
-    uint8_t saver; // v5: battery saver 0/1/2
+    uint8_t saver; // v5: battery saver 0/1/2/3
+    uint16_t recon_secs; // v6: recon_time (u16 first so it stays 2-byte aligned)
+    uint8_t capture_mode; // v6: Mode selector
+    int8_t min_rssi; // v6: attack RSSI floor
+    // (tuned_channel is target-driven/transient, deliberately not persisted)
 } HomeDb;
 
 static void home_load(Storage* storage, PwnfriendModel* model) {
@@ -818,16 +851,20 @@ static void home_load(Storage* storage, PwnfriendModel* model) {
     if(storage_file_open(f, HOME_DB_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
         HomeDb h = {0}; // zero-init: fields absent from an older, shorter record read as 0
         size_t got = storage_file_read(f, &h, sizeof(h));
-        // accept magic + at least v3 layout so growing the struct (v4) doesn't wipe saved home/quiet
+        // accept magic + at least v3 layout so growing the struct doesn't wipe saved home/quiet.
+        // version gates each newer field group (the file is zero-extended into the struct).
         if(got >= offsetof(HomeDb, triangulate) && h.magic == HOME_DB_MAGIC) {
             model->home_lat = h.lat;
             model->home_lon = h.lon;
             model->quiet = h.quiet != 0;
             model->home_set = h.home_set != 0;
-            // triangulate present only from v4; older records keep the alloc default (on).
-            if(got >= offsetof(HomeDb, saver) && h.version >= 4) model->triangulate = h.triangulate != 0;
-            // saver present only from v5; older records keep the alloc default (off).
-            if(got >= sizeof(HomeDb) && h.version >= 5) model->saver = h.saver;
+            if(h.version >= 4) model->triangulate = h.triangulate != 0;
+            if(h.version >= 5) model->saver = h.saver;
+            if(h.version >= 6) {
+                if(h.capture_mode < CaptureModeCount) model->capture_mode = h.capture_mode;
+                model->min_rssi = h.min_rssi;
+                model->recon_secs = h.recon_secs;
+            }
         }
     }
     storage_file_close(f);
@@ -838,9 +875,18 @@ static void home_save(Storage* storage, PwnfriendModel* model) {
     storage_common_mkdir(storage, "/ext/apps_data/pwnfriend");
     File* f = storage_file_alloc(storage);
     if(storage_file_open(f, HOME_DB_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        HomeDb h = {HOME_DB_MAGIC, 5, model->home_lat, model->home_lon,
-                    (uint8_t)(model->quiet ? 1 : 0), (uint8_t)(model->home_set ? 1 : 0),
-                    (uint8_t)(model->triangulate ? 1 : 0), model->saver};
+        HomeDb h = {0};
+        h.magic = HOME_DB_MAGIC;
+        h.version = 6;
+        h.lat = model->home_lat;
+        h.lon = model->home_lon;
+        h.quiet = model->quiet ? 1 : 0;
+        h.home_set = model->home_set ? 1 : 0;
+        h.triangulate = model->triangulate ? 1 : 0;
+        h.saver = model->saver;
+        h.recon_secs = model->recon_secs;
+        h.capture_mode = model->capture_mode;
+        h.min_rssi = model->min_rssi;
         storage_file_write(f, &h, sizeof(h));
     }
     storage_file_close(f);
@@ -970,8 +1016,8 @@ static void pwnfriend_handle_pwnd_line(PwnfriendApp* app, const char* line) {
             up = model->tick_secs;
             // gps-outlier guard before it geotags loot
             if(have_gps && gps_outlier(model, parse_deg(lat), parse_deg(lon))) have_gps = false;
-            // gate the count behind consent+capture opt-in; dedup by BSSID so a 15s re-emit counts once
-            if(model->capture_mode != CaptureOff && pwnd_seen_insert(model, key)) {
+            // dedup by BSSID so a 15s re-emit counts once (all modes capture now)
+            if(pwnd_seen_insert(model, key)) {
                 persona_note_pwnd(model->persona);
                 strncpy(model->last_pwnd_ssid, label, sizeof(model->last_pwnd_ssid) - 1);
                 model->last_pwnd_ssid[sizeof(model->last_pwnd_ssid) - 1] = '\0';
@@ -1243,7 +1289,7 @@ static void pwnfriend_handle_hs_line(PwnfriendApp* app, const char* line) {
         app->view,
         PwnfriendModel * model,
         {
-            record = (model->capture_mode != CaptureOff);
+            record = true; // all modes capture handshakes we hear
             if(record) {
                 int ai = ap_find(model, bssid); // bssid is the 12-hex key
                 if(ai >= 0) {
@@ -1288,14 +1334,13 @@ static void pwnfriend_handle_miss_line(PwnfriendApp* app, const char* line) {
         app->view,
         PwnfriendModel * model,
         {
-            if(model->capture_mode != CaptureOff) {
-                persona_note_miss(model->persona);
-                bool ap_new = false;
-                int ai = ap_get(model, key, &ap_new);
-                if(ai >= 0) {
-                    if(ap_new) persona_note_ap(model->persona);
-                    model->aps[ai].missed = true;
-                }
+            // a MISS only arrives from an attack mode (wardrive never attacks), so always record
+            persona_note_miss(model->persona);
+            bool ap_new = false;
+            int ai = ap_get(model, key, &ap_new);
+            if(ai >= 0) {
+                if(ap_new) persona_note_ap(model->persona);
+                model->aps[ai].missed = true;
             }
         },
         true);
@@ -1534,6 +1579,29 @@ static void pwnfriend_draw_consent(Canvas* canvas) {
     canvas_draw_str(canvas, 2, 62, "Hold OK=accept  Back=no");
 }
 
+// confirm modal for "Reset settings"
+static void pwnfriend_draw_reset_confirm(Canvas* canvas) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 9, "Reset settings?");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 24, "Mode, RSSI, recon, quiet,");
+    canvas_draw_str(canvas, 2, 33, "triangulate, saver back");
+    canvas_draw_str(canvas, 2, 42, "to defaults. Home & name");
+    canvas_draw_str(canvas, 2, 51, "kept.");
+    canvas_draw_str(canvas, 2, 62, "Hold OK=reset  Back=no");
+}
+
+// restore the tunable options to defaults (keeps home, consent, persona/name and captures)
+static void pwnfriend_reset_settings(PwnfriendModel* model) {
+    model->capture_mode = CaptureAuto;
+    model->min_rssi = -78;
+    model->recon_secs = 30;
+    model->quiet = false;
+    model->triangulate = true;
+    model->saver = 0;
+}
+
 // encode the setup URL once, on the app thread (not the draw callback); maxVersion capped
 // at 4 so the buffers stay ~138B and don't blow the stack.
 static void pwnfriend_qr_encode(PwnfriendModel* model) {
@@ -1726,9 +1794,13 @@ static void fmt_bssid_colons(const char* k, char out[18]) {
 }
 
 static const char* capture_name(CaptureMode m) {
-    return m == CaptureDeauth ? "DEAUTH" : m == CapturePmkid ? "PMKID" :
-           m == CapturePassive ? "CAP" :
-                                 "off";
+    switch(m) {
+    case CaptureWardrive: return "WDRV";
+    case CaptureRoam: return "ROAM";
+    case CaptureSiege: return "SIEGE";
+    case CaptureAuto: return "AUTO";
+    default: return "?";
+    }
 }
 
 // tiny inline d-pad glyphs (no firmware icons); x = left edge, yc = vertical centre
@@ -1885,9 +1957,12 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
             snprintf(value, sizeof(value), "%s", model->advertising ? "ON" : "off");
             break;
         case MenuCapture:
-            label = "Capture";
+            label = "Mode";
             adjustable = true;
-            snprintf(value, sizeof(value), "%s", capture_name(model->capture_mode));
+            if(model->capture_mode == CaptureAuto) // show what Auto is currently doing
+                snprintf(value, sizeof(value), "auto>%s", capture_name(effective_capture(model)));
+            else
+                snprintf(value, sizeof(value), "%s", capture_name(model->capture_mode));
             break;
         case MenuMinRssi:
             label = "Min RSSI";
@@ -1919,6 +1994,7 @@ static void pwnfriend_draw_menu(Canvas* canvas, const PwnfriendModel* model) {
                 model->saver == 1 ? "light" :
                                     "off");
             break;
+        case MenuReset: label = "Reset settings"; break;
         case MenuAbout: label = "About"; break;
         default: break;
         }
@@ -2386,6 +2462,10 @@ static void pwnfriend_draw_callback(Canvas* canvas, void* ctx) {
         pwnfriend_draw_consent(canvas);
         return;
     }
+    if(model->confirm_reset) {
+        pwnfriend_draw_reset_confirm(canvas);
+        return;
+    }
     // "no ESP32" only takes over the home screen; menu/browser stay usable
     if(model->link_down && model->screen == ScreenHome) {
         pwnfriend_draw_link_down(canvas, model);
@@ -2449,8 +2529,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                 PwnfriendModel * model,
                 {
                     model->showing_consent = false;
-                    model->consent_given = true;
-                    model->capture_mode = CaptureDeauth; // default is a full pwnagotchi
+                    model->consent_given = true; // unlocks active TX for the current mode (default Auto)
                     advertising = model->advertising;
                 },
                 true);
@@ -2461,6 +2540,33 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
             with_view_model(
                 app->view, PwnfriendModel * model, { model->showing_consent = false; }, true);
             return true; // consume so Back doesn't exit the app
+        }
+        return true; // modal swallows all other input
+    }
+
+    // reset-settings confirm modal: long-OK resets + saves, Back cancels
+    bool reset_modal = false;
+    with_view_model(
+        app->view, PwnfriendModel * model, { reset_modal = model->confirm_reset; }, false);
+    if(reset_modal) {
+        if(event->key == InputKeyOk && event->type == InputTypeLong) {
+            bool advertising = false;
+            with_view_model(
+                app->view, PwnfriendModel * model,
+                {
+                    pwnfriend_reset_settings(model);
+                    home_save(app->storage, model); // persist the defaults
+                    model->confirm_reset = false;
+                    advertising = model->advertising;
+                },
+                true);
+            if(advertising) pwnfriend_send_advertise(app);
+            return true;
+        }
+        if(event->key == InputKeyBack && event->type == InputTypeShort) {
+            with_view_model(
+                app->view, PwnfriendModel * model, { model->confirm_reset = false; }, true);
+            return true;
         }
         return true; // modal swallows all other input
     }
@@ -2564,17 +2670,17 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                             model->link_down = false;
                         }
                         break;
-                    case MenuCapture:
-                        if(model->capture_mode == CaptureOff && !model->consent_given) {
-                            model->showing_consent = true;
-                            prompted = true;
-                        } else {
-                            int v = ((int)model->capture_mode + dir + CaptureModeCount) %
-                                    CaptureModeCount;
-                            model->capture_mode = (uint8_t)v;
-                            need_advertise = model->advertising;
-                        }
+                    case MenuCapture: {
+                        // cycle wardrive/roam/siege/auto. active TX stays gated on consent in
+                        // the flag mapping; if consent was declined, re-raise the prompt here.
+                        int v = ((int)model->capture_mode + dir + CaptureModeCount) %
+                                CaptureModeCount;
+                        model->capture_mode = (uint8_t)v;
+                        if(!model->consent_given) model->showing_consent = true;
+                        need_advertise = model->advertising;
+                        home_save(app->storage, model);
                         break;
+                    }
                     case MenuMinRssi: {
                         int v = model->min_rssi + dir * 2;
                         if(v < -90) v = -90;
@@ -2582,6 +2688,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         if(v != model->min_rssi) {
                             model->min_rssi = (int8_t)v;
                             need_advertise = model->advertising;
+                            home_save(app->storage, model);
                         }
                         break;
                     }
@@ -2592,6 +2699,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         if(v != (int)model->recon_secs) {
                             model->recon_secs = (uint16_t)v;
                             need_advertise = model->advertising;
+                            home_save(app->storage, model);
                         }
                         break;
                     }
@@ -2673,6 +2781,7 @@ static bool pwnfriend_input_callback(InputEvent* event, void* ctx) {
                         break;
                     }
                     case MenuStats: model->screen = ScreenStats; break;
+                    case MenuReset: model->confirm_reset = true; break; // raise the confirm modal
                     case MenuAbout: model->screen = ScreenAbout; break;
                     case MenuSetHome:
                         // Capture the current fix as home (persisted). Needs a fix.
@@ -3079,6 +3188,29 @@ static void pwnfriend_timer_callback(void* ctx) {
                 // misses the full-battery case.
                 model->on_power = furi_hal_power_get_usb_voltage() > 4.0f;
                 model->charging = furi_hal_power_is_charging(); // charging -> "PWR %"; stopped -> "PWR"
+
+                // Auto mode: track GPS movement to pick roam (moving) vs siege (parked/no-fix).
+                if(model->capture_mode == CaptureAuto) {
+                    if(model->gps_fix && coord_ok(model->last_lat, model->last_lon)) {
+                        float clat = parse_deg(model->last_lat);
+                        float clon = parse_deg(model->last_lon);
+                        if(model->move_ref_lat > 1e8f) { // seed reference on the first fix
+                            model->move_ref_lat = clat;
+                            model->move_ref_lon = clon;
+                        } else if(geo_km(model->move_ref_lat, model->move_ref_lon, clat, clon) >
+                                  AUTO_MOVE_KM) {
+                            model->move_ref_lat = clat; // moved far enough -> "moving"
+                            model->move_ref_lon = clon;
+                            model->last_move_secs = model->tick_secs;
+                        }
+                    }
+                    // moving = a fix seen AND displacement within the last AUTO_STATIONARY_SECS
+                    model->auto_moving = (model->move_ref_lat < 1e8f) &&
+                                         (model->tick_secs - model->last_move_secs <
+                                          AUTO_STATIONARY_SECS);
+                } else {
+                    model->auto_moving = false;
+                }
                 // Home stat panel auto-reverts to the persona voice after a quiet spell.
                 if(model->stat_page != StatPageMood &&
                    model->tick_secs - model->stat_touch_secs >= HOME_STATS_TIMEOUT_SECS)
@@ -3091,9 +3223,7 @@ static void pwnfriend_timer_callback(void* ctx) {
                 bool bonded = peers_any_bonded(&model->peers, model->tick_secs);
                 model->persona->friend_near = bonded;
                 // "engaged" = advertising + capture armed + APs around; keeps it content mid-hunt (each AP reported once)
-                model->persona->hunting = model->advertising &&
-                                          model->capture_mode != CaptureOff &&
-                                          model->ap_count > 0;
+                model->persona->hunting = model->advertising && model->ap_count > 0;
                 persona_tick(model->persona, 1);
 
                 // link watchdog: warn only while advertising, past boot grace + silence timeout. unsigned sub is safe (stamps <= tick_secs)
@@ -3125,6 +3255,9 @@ static void pwnfriend_timer_callback(void* ctx) {
                 // push a fresh -saver promptly when the effective level flips (power
                 // plugged/unplugged, or AUTO crossing 20%), not just on the 15s cadence.
                 if(model->advertising && effective_saver(model) != model->last_saver_eff)
+                    resend = true;
+                // likewise push the mode when Auto flips roam<->siege (started/stopped moving).
+                if(model->advertising && (uint8_t)effective_capture(model) != model->last_cap_eff)
                     resend = true;
                 if(model->advertising &&
                    (model->tick_secs - model->last_adv_sent >= PWNFRIEND_ADV_RESEND_SECS)) {
@@ -3270,9 +3403,10 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             peers_init(&model->peers);
             model->tick_secs = 0;
             model->advertising = true; // say hi on launch; OK toggles pause/resume
-            // default full pwnagotchi (capture+deauth), gated by consent: returning user arms Deauth now, else start Off and raise the consent screen
+            // default mode Auto (home_load overrides with the saved mode). active TX is gated by
+            // consent in the flag mapping; first launch without consent raises the consent screen.
             model->consent_given = consent_is_given();
-            model->capture_mode = model->consent_given ? CaptureDeauth : CaptureOff;
+            model->capture_mode = CaptureAuto;
             model->showing_consent = !model->consent_given;
             model->last_pwnd_ssid[0] = '\0';
             model->pwnd_seen_count = 0;
@@ -3320,6 +3454,12 @@ static PwnfriendApp* pwnfriend_app_alloc(void) {
             model->on_power = false;
             model->charging = false;
             model->last_saver_eff = 0xFF; // sentinel: forces the first -saver push
+            model->move_ref_lat = 1e9f; // no reference fix yet
+            model->move_ref_lon = 1e9f;
+            model->last_move_secs = 0;
+            model->auto_moving = false;
+            model->last_cap_eff = 0xFF; // sentinel: forces the first -mode push
+            model->confirm_reset = false;
             model->confirm_exit = false;
             model->confirm_secs = 0;
             model->stayed_until = 0;

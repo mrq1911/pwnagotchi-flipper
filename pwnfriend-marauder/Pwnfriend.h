@@ -113,6 +113,7 @@ class Pwnfriend {
     uint32_t _epoch;
     bool     _deauth_policy;
     bool     _assoc_policy;   // associate (solicit PMKID) without deauth — "PMKID-only"
+    bool     _wardrive;       // recon-only fast sweep for moving capture (no attack dwell)
     uint8_t  _session_id[6];  // Addr3, stable per persona
 
     // Channel hopping

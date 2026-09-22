@@ -114,6 +114,7 @@ static const uint8_t ASSOC_TEMPLATE[28] = {
 static const uint32_t RECON_TIME_MS       = 30000; // personality.recon_time = 30
 static const uint32_t HOP_RECON_TIME_MS   = 10000; // personality.hop_recon_time = 10
 static const uint32_t RECON_HOP_MS        = 1200;  // sweep cadence during recon
+static const uint32_t WARDRIVE_HOP_MS     = 400;   // faster sweep in wardrive mode (catch APs at walking pace)
 // all-channel advert-sweep cadence. every-tick starved recon rx (AP stuck at 0);
 // throttled — a neighbour still catches us, recon keeps clean rx on _cur_channel between.
 static const uint32_t ADVERTISE_SWEEP_MS  = 1500;
@@ -217,6 +218,7 @@ void Pwnfriend::reset() {
     _saver_idle = false;
     _saver_phase_ms = 0;
     _saver_hb_ms = 0;
+    _wardrive = false;
     _have_lastfix = false;
     _lastfix_lat = 0.0;
     _lastfix_lon = 0.0;
@@ -435,6 +437,7 @@ bool Pwnfriend::configureFromArgs(LinkedList<String>* args) {
     int prev_pinned = _pinned_channel;   // detect an actual channel-tune change below
     bool prev_deauth = _deauth_policy;   // ...and an actual capture-policy change
     bool prev_assoc = _assoc_policy;
+    bool prev_wardrive = _wardrive;
     bool prev_target_set = _target_set;  // ...target / whitelist / recon changes
     uint8_t prev_target[6]; memcpy(prev_target, _target, 6);
     int prev_n_wl = _n_wl;
@@ -474,6 +477,8 @@ bool Pwnfriend::configureFromArgs(LinkedList<String>* args) {
             _deauth_policy = (val == "1" || val == "true");
         } else if (flag == "-assoc") {
             _assoc_policy = (val == "1" || val == "true");
+        } else if (flag == "-wardrive") {
+            _wardrive = (val == "1" || val == "true");
         } else if (flag == "-minrssi") {
             // Attack-targeting floor in dBm (e.g. -78). -128 disables the gate.
             int r = val.toInt();
@@ -508,7 +513,7 @@ bool Pwnfriend::configureFromArgs(LinkedList<String>* args) {
     // a real channel/policy/target/whitelist/recon change restarts the sweep so no stale
     // attack plan runs. the 15s same-value resend changes none of these.
     bool cfg_changed = (_pinned_channel != prev_pinned) || (_deauth_policy != prev_deauth) ||
-                       (_assoc_policy != prev_assoc) ||
+                       (_assoc_policy != prev_assoc) || (_wardrive != prev_wardrive) ||
                        (_target_set != prev_target_set) ||
                        (_target_set && memcmp(_target, prev_target, 6) != 0) ||
                        (_n_wl != prev_n_wl) || memcmp(_wl, prev_wl, sizeof(_wl)) != 0 ||
@@ -577,15 +582,21 @@ void Pwnfriend::broadcast() {
         }
     } else if (_phase == PHASE_RECON) {
         // sweep every channel gathering APs and being heard. recon_time doubles while inactive.
-        if (now - _last_hop_ms >= RECON_HOP_MS) {
+        // wardrive hops faster so a walk catches APs before you pass them.
+        if (now - _last_hop_ms >= (_wardrive ? WARDRIVE_HOP_MS : RECON_HOP_MS)) {
             _last_hop_ms = now;
             _cur_channel = HOP_CHANNELS[_hop_idx];
             _hop_idx = (_hop_idx + 1) % NUM_HOP_CHANNELS;
+            // roam: one opportunistic assoc/deauth on each channel as we pass (no dwell). the
+            // policies decide what fires (assoc-only = wardrive/PMKID, +deauth = roam).
+            if (_wardrive && (_assoc_policy || _deauth_policy)) attackChannel(_cur_channel);
         }
         uint32_t recon_ms = _recon_time_ms;
         if (_inactive_epochs >= MAX_INACTIVE_SCALE) recon_ms *= RECON_INACTIVE_MULT;
         if (now - _phase_ms >= recon_ms) {
-            if (_assoc_policy || _deauth_policy) {
+            // wardrive/roam never dwell: stay in the perpetual fast sweep. only siege
+            // (attacks, not wardrive) drops into the parked ATTACK phase.
+            if (!_wardrive && (_assoc_policy || _deauth_policy)) {
                 buildAttackList();
                 if (_n_attack > 0) {
                     _phase = PHASE_ATTACK;
@@ -596,7 +607,7 @@ void Pwnfriend::broadcast() {
                     endEpoch(now);   // nothing worth attacking -> next recon epoch
                 }
             } else {
-                endEpoch(now);       // passive: perpetual all-channel listen
+                endEpoch(now);       // wardrive/roam/passive: perpetual all-channel sweep
             }
         }
     } else { // PHASE_ATTACK
