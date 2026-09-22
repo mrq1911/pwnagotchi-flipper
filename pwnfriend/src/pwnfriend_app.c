@@ -977,11 +977,11 @@ static void pwnfriend_update_place(PwnfriendModel* model) {
     const char* hn = model->home_set ? HOME_NAME : "Mother";
     // distance+direction on gps_place, bearing on gps_course (own row; combined was too wide)
     model->gps_course[0] = '\0';
-    if(km < 0.03f) { // only the "we're here" line within ~30m; otherwise keep showing distance
+    if(km < 0.09f) { // only the "we're here" line within ~90m; otherwise keep showing distance
         if(model->home_set)
             snprintf(model->gps_place, sizeof(model->gps_place), "At %s!", hn);
         else
-            snprintf(model->gps_place, sizeof(model->gps_place), "look up to Mother");
+            snprintf(model->gps_place, sizeof(model->gps_place), "Look up!");
     } else {
         // row1 name+distance; row2 dir+bearing (° ring drawn at render time; no ° glyph in the font)
         if(km < 1.0f)
@@ -1547,6 +1547,8 @@ static void pwnfriend_populate(PwnfriendModel* model) {
         furi_string_set(pwn->message, "yay, staying!");
     } else if(!model->advertising) {
         furi_string_set(pwn->message, "paused - OK for menu");
+    } else if(strcmp(model->gps_place, "Look up!") == 0) {
+        furi_string_set(pwn->message, "Look up!"); // at Mother, no home set -> persona says it too
     } else if((p->mood == MoodHappy || p->mood == MoodCool) && model->last_pwnd_ssid[0]) {
         furi_string_printf(pwn->message, "pwnd %s!", model->last_pwnd_ssid);
     } else {
@@ -2435,7 +2437,7 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
         uint16_t crack = 0;
         for(uint16_t i = 0; i < model->ap_count; i++)
             if(model->aps[i].has_essid && (model->aps[i].pmkid || model->aps[i].handshake)) crack++;
-        HS_ROW("pwnd %lu (%lu)", (unsigned long)p->pwnd_run, (unsigned long)p->s.pwnd_tot);
+        // pwnd omitted here: the persistent bottom bar already shows it on every home page
         HS_ROW("aps %u", aps_seen_session(model));
         HS_ROW("crack %u", (unsigned)crack);
         HS_ROW("epoch %lu", (unsigned long)p->epoch);
@@ -2451,7 +2453,6 @@ static void pwnfriend_draw_home_stats(Canvas* canvas, const PwnfriendModel* mode
             if(model->aps[i].handshake) nh++;
         }
         HS_ROW("caps P%u/H%u", (unsigned)np, (unsigned)nh);
-        HS_ROW("sats %d", model->gps_sats);
         HS_ROW("near %d", near);
         break;
     }
